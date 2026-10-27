@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "КриптоЛайт",
+  "version": "0.1.0",
+  "identifier": "ru.cryptolite.desktop",
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "app": { "windows": [{ "title": "КриптоЛайт", "width": 1100, "height": 780, "minWidth": 1024, "minHeight": 768, "center": true, "dragDropEnabled": true }], "security": { "csp": null } },
+  "bundle": { "active": true, "targets": "all", "shortDescription": "Подписание и шифрование документов через КриптоПро CSP", "category": "Utility" }
+}
