@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import logoUrl from './assets/logo.png';
 
 type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
 type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
@@ -387,7 +388,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
   <div class="app-shell" :class="{'drag-hover':dragHover}">
     <div v-if="dragHover" class="drop-overlay"><span>＋</span><b>{{ page==='verify'?t('dropOverlay.verify'):page==='encrypt'?t('dropOverlay.encrypt'):t('dropOverlay.sign') }}</b></div>
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark">К</div><div><div class="brand-name">КриптоЛайт</div><div class="brand-caption">{{ t('subtitle') }}</div></div></div>
+      <div class="brand"><img class="brand-mark" :src="logoUrl" alt="КриптоЛайт"/><div><div class="brand-name">КриптоЛайт</div><div class="brand-caption">{{ t('subtitle') }}</div></div></div>
       <div class="menu-label">{{ t('workspace') }}</div>
       <nav class="nav-list">
         <button v-for="item in ['sign','encrypt','verify']" :key="item" class="nav-item" :class="{active:page===item}" @click="page=item"><span class="nav-icon">{{ item==='sign'?'✳':item==='encrypt'?'◇':'✓' }}</span>{{ t(`nav.${item}`) }}<span v-if="page===item" class="active-dot"></span></button>
@@ -453,7 +454,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view about-view">
         <div class="page-heading"><div><div class="eyebrow">CRYPTOLITE · PROJECT</div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div class="brand-mark about-mark">К</div><div><h2>КриптоЛайт</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.1.0</span></div></section>
+        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" alt="КриптоЛайт"/><div><h2>КриптоЛайт</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.1.0</span></div></section>
         <div class="about-grid"><section class="settings-card"><div class="card-heading"><div><h2>{{ t('about.provider') }}</h2><p>{{ status.available ? status.message : t('about.providerMissing') }}</p></div></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div></dl></section><section class="settings-card"><div class="card-heading"><div><h2>{{ t('about.technologies') }}</h2><p>{{ t('about.technologiesHelp') }}</p></div></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section></div>
         <section class="settings-card about-license"><div class="card-heading"><div><h2>{{ t('about.licenseTitle') }}</h2><p>{{ t('about.licenseIntro') }}</p></div></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
       </section>

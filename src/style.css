@@ -11,7 +11,7 @@ button:disabled{cursor:not-allowed}
 .app-shell{display:flex;height:100vh;overflow:hidden;background:#f5f6f8;color:#27303b}
 .sidebar{width:248px;flex:none;display:flex;flex-direction:column;padding:25px 15px 16px;background:#fff;border-right:1px solid #e9ebef;overflow-y:auto}
 .brand{display:flex;align-items:center;gap:11px;padding:0 9px 31px}
-.brand-mark{width:37px;height:37px;display:grid;place-items:center;border-radius:11px;background:#e87558;color:white;font-size:23px;font-weight:700;box-shadow:0 5px 12px #e8755833}
+.brand-mark{width:37px;height:37px;display:block;border-radius:11px;object-fit:contain;flex:none}
 .brand-name{font-weight:700;letter-spacing:-.3px;font-size:18px;color:#252c35}
 .brand-caption{margin-top:3px;color:#939aa5;font-size:13px}
 .menu-label{padding:0 10px;margin:0 0 9px;color:#a1a7b0;font-weight:700;font-size:12px;letter-spacing:1.1px}
@@ -213,7 +213,7 @@ button:disabled{cursor:not-allowed}
 .settings-cert-option.expired b,.settings-cert-option.expired small{color:#aeb3bb}
 .settings-cert-option.expired input{cursor:not-allowed}
 .about-hero{display:flex;align-items:flex-start;gap:18px;padding:22px;margin-bottom:14px;border:1px solid #e9ebef;border-radius:9px;background:#fff}
-.about-mark{width:50px;height:50px;flex:none;font-size:26px}
+.about-mark{width:50px;height:50px;flex:none;object-fit:contain}
 .about-hero h2{margin:0 0 6px;color:#303844;font-size:21px}
 .about-hero p{max-width:740px;color:#7e8792;font-size:13px;line-height:1.55}
 .about-hero span{display:inline-block;margin-top:10px;color:#9aa1aa;font-size:11px}
