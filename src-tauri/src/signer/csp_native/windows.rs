@@ -811,9 +811,9 @@ mod ffi {
             output = encode_base64(&output).into_bytes();
         }
 
-        write_result(&request.output_path, &output, "шифрования", false)?;
+        let final_path = write_result(&request.output_path, &output, "шифрования", false)?;
         Ok(crate::signer::EncryptResult {
-            output_path: request.output_path,
+            output_path: final_path,
             bytes_written: output.len(),
         })
     }
@@ -836,9 +836,9 @@ mod ffi {
             crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
         })?;
         let output = decrypt_message(&store, &input)?;
-        write_result(&request.output_path, &output, "расшифрования", true)?;
+        let final_path = write_result(&request.output_path, &output, "расшифрования", true)?;
         Ok(crate::signer::DecryptResult {
-            output_path: request.output_path,
+            output_path: final_path,
             bytes_written: output.len(),
         })
     }
@@ -1005,7 +1005,7 @@ mod ffi {
         output: &[u8],
         action: &str,
         is_decryption: bool,
-    ) -> Result<(), crate::signer::SignerError> {
+    ) -> Result<String, crate::signer::SignerError> {
         let make_error = |message: String| {
             if is_decryption {
                 crate::signer::SignerError::Decryption(message)
@@ -1013,25 +1013,58 @@ mod ffi {
                 crate::signer::SignerError::Encryption(message)
             }
         };
-        let output_path = std::path::PathBuf::from(output_path);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-            .map_err(|error| {
-                make_error(format!(
-                    "не удалось создать файл результата {action} без перезаписи ({}): {error}",
-                    output_path.display()
-                ))
-            })?;
+        let requested = std::path::PathBuf::from(output_path);
+        let mut candidate = requested.clone();
+        let mut attempt = 0u32;
+        let (final_path, mut file) = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error)
+                    if is_decryption && error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    attempt += 1;
+                    candidate = suffixed_path(&requested, attempt);
+                }
+                Err(error) => {
+                    return Err(make_error(format!(
+                        "не удалось создать файл результата {action} без перезаписи ({}): {error}",
+                        candidate.display()
+                    )));
+                }
+            }
+        };
         if let Err(error) = file.write_all(output) {
             drop(file);
-            let _ = std::fs::remove_file(&output_path);
+            let _ = std::fs::remove_file(&final_path);
             return Err(make_error(format!(
                 "не удалось записать файл результата {action}: {error}"
             )));
         }
-        Ok(())
+        Ok(final_path.display().to_string())
+    }
+
+    fn suffixed_path(path: &std::path::Path, attempt: u32) -> std::path::PathBuf {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let (stem, ext) = match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) => {
+                let end = file_name.len() - ext.len() - 1;
+                (file_name[..end].to_string(), Some(ext.to_string()))
+            }
+            None => (file_name.to_string(), None),
+        };
+        let name = match ext {
+            Some(ext) => format!("{stem} ({attempt}).{ext}"),
+            None => format!("{stem} ({attempt})"),
+        };
+        parent.join(name)
     }
 
     fn encode_base64(bytes: &[u8]) -> String {
