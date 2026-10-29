@@ -5,8 +5,8 @@ mod model;
 pub mod native;
 pub use error::SignerError;
 pub use model::{
-    AppSettings, CertInfo, CspStatus, SignBatchItemResult, SignRequest, SignResult, VerifyRequest,
-    VerifyResult, VerifySignerInfo,
+    AppSettings, CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
+    SignBatchItemResult, SignRequest, SignResult, VerifyRequest, VerifyResult, VerifySignerInfo,
 };
 
 pub trait Signer: Send + Sync {

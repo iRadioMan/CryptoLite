@@ -13,6 +13,10 @@ pub enum SignerError {
     CertificateStore(String),
     #[error("Не удалось подписать файл: {0}")]
     Signing(String),
+    #[error("Не удалось зашифровать файл: {0}")]
+    Encryption(String),
+    #[error("Не удалось расшифровать файл: {0}")]
+    Decryption(String),
     #[error("Перечисление сертификатов пока не поддерживается на этой платформе")]
     CertificateEnumerationUnsupported,
 }

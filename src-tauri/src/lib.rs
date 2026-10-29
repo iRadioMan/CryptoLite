@@ -16,7 +16,9 @@ pub fn run() {
             commands::list_certs,
             commands::sign_file,
             commands::sign_files,
-            commands::verify_signature
+            commands::verify_signature,
+            commands::encrypt_file,
+            commands::decrypt_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to run CryptoLite");

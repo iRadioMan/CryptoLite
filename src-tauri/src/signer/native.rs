@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 use crate::signer::{
-    CspStatus, SignRequest, SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
+    CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult, SignRequest,
+    SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
 };
 
 pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerError> {
@@ -13,6 +14,34 @@ pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerEr
         let _ = request;
         Err(SignerError::Signing(
             "Проверка CMS пока реализована только для Windows".to_owned(),
+        ))
+    }
+}
+
+pub fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, SignerError> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::encrypt_file(request);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = request;
+        Err(SignerError::Encryption(
+            "Шифрование пока реализовано только для Windows".to_owned(),
+        ))
+    }
+}
+
+pub fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, SignerError> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::decrypt_file(request);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = request;
+        Err(SignerError::Decryption(
+            "Расшифрование пока реализовано только для Windows".to_owned(),
         ))
     }
 }

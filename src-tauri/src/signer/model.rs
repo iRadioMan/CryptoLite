@@ -30,7 +30,7 @@ pub struct SignRequest {
     pub standard: String,
     pub input_path: String,
     pub output_path: String,
-    pub certificate_id: String,
+    pub certificate_ids: Vec<String>,
     pub detached: bool,
     pub base64: bool,
 }
@@ -78,6 +78,37 @@ pub struct VerifyResult {
     pub content_path: Option<String>,
     pub signers: Vec<VerifySignerInfo>,
     pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub certificate_ids: Vec<String>,
+    pub base64: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptResult {
+    pub output_path: String,
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecryptRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub base64: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecryptResult {
+    pub output_path: String,
+    pub bytes_written: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,12 +4,12 @@
 
 :root{font-family:Inter,"Segoe UI",Arial,sans-serif;font-size:16px;font-synthesis:none;text-rendering:optimizeLegibility;color:#27303b;background:#f5f6f8;font-weight:400;font-feature-settings:"cv11","ss01"}
 *{box-sizing:border-box}
-body{margin:0;min-width:1024px;min-height:100vh}
+body{margin:0;min-height:100vh;overflow:hidden}
 button,input,select{font:inherit}
 button{cursor:pointer}
 button:disabled{cursor:not-allowed}
-.app-shell{display:flex;min-height:100vh;background:#f5f6f8;color:#27303b}
-.sidebar{width:248px;flex:none;display:flex;flex-direction:column;padding:25px 15px 16px;background:#fff;border-right:1px solid #e9ebef}
+.app-shell{display:flex;height:100vh;overflow:hidden;background:#f5f6f8;color:#27303b}
+.sidebar{width:248px;flex:none;display:flex;flex-direction:column;padding:25px 15px 16px;background:#fff;border-right:1px solid #e9ebef;overflow-y:auto}
 .brand{display:flex;align-items:center;gap:11px;padding:0 9px 31px}
 .brand-mark{width:37px;height:37px;display:grid;place-items:center;border-radius:11px;background:#e87558;color:white;font-size:23px;font-weight:700;box-shadow:0 5px 12px #e8755833}
 .brand-name{font-weight:700;letter-spacing:-.3px;font-size:18px;color:#252c35}
@@ -31,23 +31,16 @@ button:disabled{cursor:not-allowed}
 .status-dot{width:7px;height:7px;margin-top:4px;display:inline-block;flex:none;border-radius:50%;background:#c8cbd0}
 .status-dot.connected{background:#68a98a;box-shadow:0 0 0 3px #68a98a20}
 .refresh{color:#a3a7ad;font-size:18px}
-.profile{display:flex;align-items:center;gap:9px;padding:8px 7px}
-.avatar{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#f0eee9;color:#6c625a;font-weight:650}
-.profile-text b,.profile-text small{display:block}
-.profile-text b{font-size:13px;color:#505762}
-.profile-text small{margin-top:3px;color:#9da3ac;font-size:12px}
-.main-area{min-width:0;flex:1;display:flex;flex-direction:column}
+.main-area{min-width:0;flex:1;display:flex;flex-direction:column;overflow:hidden}
 .topbar{height:62px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 37px;background:#fff;border-bottom:1px solid #e9ebef}
 .breadcrumb{display:flex;align-items:center;gap:10px;font-size:14px;color:#8b929d}
 .breadcrumb span{color:#c6c9ce}
 .breadcrumb b{color:#39414c;font-weight:600}
 .top-actions{display:flex;align-items:center;gap:13px}
-.secure-label{display:flex;align-items:center;gap:6px;margin-right:10px;color:#89919c;font-size:13px}
-.secure-label span{color:#64a487;font-size:16px}
 .language-button,.icon-button{height:31px;border:1px solid #e7e9ed;border-radius:6px;background:#fff;color:#67707b}
 .language-button{padding:0 9px;font-size:12px}
 .icon-button{width:32px;font-size:17px}
-.content-view{width:min(1040px,calc(100% - 74px));margin:0 auto;padding:27px 0 23px}
+.content-view{width:min(1040px,calc(100% - 74px));margin:0 auto;padding:27px 0 23px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden}
 .page-heading{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px}
 .eyebrow{color:#a2a8b0;font-size:10px;font-weight:700;letter-spacing:1.25px}
 .page-heading h1{margin:6px 0 5px;color:#252d37;font-size:28px;letter-spacing:-.6px;line-height:1.2}
@@ -171,7 +164,7 @@ button:disabled{cursor:not-allowed}
 .dark .app-shell{background:#171a20;color:#e4e6eb}
 .dark .sidebar,.dark .topbar,.dark .settings-card,.dark .documents-card,.dark .picker-button,.dark .outline-button,.dark .alert-modal,.dark .certificate-modal{background:#20242c;border-color:#30353f;color:#e4e6eb}
 .dark .brand-name,.dark .card-heading h2,.dark .page-heading h1,.dark .placeholder-view h1,.dark .file-info b,.dark .alert-modal h2,.dark .certificate-header h2{color:#e8eaf0}
-.dark .brand-caption,.dark .menu-label,.dark .profile-text small,.dark .page-heading p,.dark .card-heading p,.dark .field>span,.dark .breadcrumb,.dark .secure-label,.dark .picker-copy small,.dark .documents-footer,.dark .file-info small,.dark .action-note small{color:#929aa7}
+.dark .brand-caption,.dark .menu-label,.dark .page-heading p,.dark .card-heading p,.dark .field>span,.dark .breadcrumb,.dark .picker-copy small,.dark .documents-footer,.dark .file-info small,.dark .action-note small{color:#929aa7}
 .dark .nav-item{color:#adb2bc}
 .dark .nav-item:hover{background:#292e37;color:#e4e6eb}
 .dark .nav-item.active{background:#382924;color:#f0987e}
@@ -193,7 +186,6 @@ button:disabled{cursor:not-allowed}
 .dark .certificate-empty p{color:#9aa2ad}
 .dark .certificate-avatar,.dark .empty-certificate-icon{background:#382924;color:#f0987e}
 .dark .action-note .lock-icon{background:#26352c;color:#92bd9f}
-.dark .profile-text b{color:#daddE4}
 .dark .placeholder-view p{color:#9aa2ad}
 @media(max-width:1100px){.sidebar{width:218px}.topbar{padding:0 25px}.content-view{width:calc(100% - 50px)}.settings-card,.documents-card{padding-left:17px;padding-right:17px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}

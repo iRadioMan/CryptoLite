@@ -1,6 +1,6 @@
 use crate::signer::{
-    CertInfo, CspStatus, SignBatchItemResult, SignRequest, SignResult, Signer, SignerError,
-    VerifyRequest, VerifyResult,
+    CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
+    SignBatchItemResult, SignRequest, SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
 };
 use std::path::PathBuf;
 use tauri::Manager;
@@ -220,5 +220,21 @@ pub async fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, St
     tokio::task::spawn_blocking(move || crate::signer::native::verify_signature(request))
         .await
         .map_err(|error| format!("Не удалось запустить проверку подписи: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, String> {
+    tokio::task::spawn_blocking(move || crate::signer::native::encrypt_file(request))
+        .await
+        .map_err(|error| format!("Не удалось запустить шифрование: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, String> {
+    tokio::task::spawn_blocking(move || crate::signer::native::decrypt_file(request))
+        .await
+        .map_err(|error| format!("Не удалось запустить расшифрование: {error}"))?
         .map_err(|error| error.to_string())
 }

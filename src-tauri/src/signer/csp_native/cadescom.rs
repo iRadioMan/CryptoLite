@@ -239,13 +239,23 @@ mod ffi {
     fn sign_inner(
         request: crate::signer::SignRequest,
     ) -> Result<crate::signer::SignResult, String> {
+        if request.certificate_ids.len() != 1 {
+            return Err(
+                "CAdES-BES пока поддерживает подпись ровно одним сертификатом; для нескольких подписантов выберите CMS / PKCS#7".to_owned(),
+            );
+        }
+        let certificate_id = request
+            .certificate_ids
+            .first()
+            .cloned()
+            .ok_or_else(|| "не выбран сертификат подписи".to_owned())?;
         let _apartment = Apartment::initialize()?;
         let content = std::fs::read(&request.input_path)
             .map_err(|error| format!("Не удалось прочитать исходный файл: {error}"))?;
         let store = create("CAdESCOM.Store")?;
         // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
         invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
-        let certificate = select_certificate(&store, &request.certificate_id)?;
+        let certificate = select_certificate(&store, &certificate_id)?;
         let signer = create("CAdESCOM.CPSigner")?;
         put(&signer, "Certificate", VARIANT::from(certificate), true)?;
         let signed_data = create("CAdESCOM.CadesSignedData")?;

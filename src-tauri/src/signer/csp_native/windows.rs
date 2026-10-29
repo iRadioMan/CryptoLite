@@ -58,11 +58,16 @@ mod ffi {
         CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChain,
         CertFreeCertificateContext, CertGetCertificateChain, CertGetCertificateContextProperty,
         CertGetNameStringW, CertOpenSystemStoreW, CertVerifyCertificateChainPolicy,
-        CryptSignMessage, CryptVerifyDetachedMessageSignature, CryptVerifyMessageSignature,
-        CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
+        CryptDecryptMessage, CryptDestroyKey, CryptEncryptMessage, CryptGetUserKey, CryptMsgClose,
+        CryptMsgGetParam, CryptMsgOpenToEncode, CryptMsgUpdate,
+        CryptVerifyDetachedMessageSignature, CryptVerifyMessageSignature, AT_KEYEXCHANGE,
+        AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
         CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT,
-        CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-        CRYPT_ALGORITHM_IDENTIFIER, CRYPT_SIGN_MESSAGE_PARA, CRYPT_VERIFY_MESSAGE_PARA, HCERTSTORE,
+        CERT_INFO, CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CMSG_CONTENT_PARAM, CMSG_DETACHED_FLAG, CMSG_SIGNED,
+        CMSG_SIGNED_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO_0,
+        CRYPT_ALGORITHM_IDENTIFIER, CRYPT_DECRYPT_MESSAGE_PARA, CRYPT_ENCRYPT_MESSAGE_PARA,
+        CRYPT_INTEGER_BLOB, CRYPT_KEY_PROV_INFO, CRYPT_VERIFY_MESSAGE_PARA, HCERTSTORE,
         PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
 
@@ -186,13 +191,26 @@ mod ffi {
                 "не удалось прочитать исходный файл: {error}"
             ))
         })?;
+        if request.certificate_ids.is_empty() {
+            return Err(crate::signer::SignerError::Signing(
+                "выберите хотя бы один сертификат для подписания".to_owned(),
+            ));
+        }
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
             crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
         })?;
-        let certificate = find_certificate(&store, &request.certificate_id)?;
-        let hash_oid = hash_oid_for_certificate(certificate.as_ptr())?;
-        let mut output = sign_message(certificate.as_ptr(), &hash_oid, &input, request.detached)?;
+        // Resolve every selected certificate; all sign the same content into one CMS.
+        let certificates = request
+            .certificate_ids
+            .iter()
+            .map(|id| find_certificate(&store, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let hash_oids = certificates
+            .iter()
+            .map(|certificate| hash_oid_for_certificate(certificate.as_ptr()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output = sign_message(&certificates, &hash_oids, &input, request.detached)?;
         if request.base64 {
             output = encode_base64(&output).into_bytes();
         }
@@ -551,65 +569,469 @@ mod ffi {
     }
 
     fn sign_message(
-        certificate: *const CERT_CONTEXT,
-        hash_oid: &[u8],
+        certificates: &[CertificateContext],
+        hash_oids: &[Vec<u8>],
         content: &[u8],
         detached: bool,
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
-        let mut certificate_pointer = certificate as *mut CERT_CONTEXT;
-        let mut parameters = CRYPT_SIGN_MESSAGE_PARA::default();
-        parameters.cbSize = std::mem::size_of::<CRYPT_SIGN_MESSAGE_PARA>() as u32;
-        parameters.dwMsgEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
-        parameters.pSigningCert = certificate;
-        parameters.HashAlgorithm = CRYPT_ALGORITHM_IDENTIFIER {
-            pszObjId: hash_oid.as_ptr() as *mut u8,
-            ..Default::default()
+        // Build one CMS SignedData with a separate SignerInfo for every selected certificate.
+        // Key resolution mirrors CryptSignMessage: read CERT_KEY_PROV_INFO_PROP_ID, acquire the
+        // CSP context for that container, then determine the key spec by probing AT_SIGNATURE
+        // first and falling back to AT_KEYEXCHANGE.
+        let mut providers = Vec::with_capacity(certificates.len());
+        let mut signer_infos = Vec::with_capacity(certificates.len());
+        let mut cert_blobs = Vec::with_capacity(certificates.len());
+
+        for (index, certificate) in certificates.iter().enumerate() {
+            let context = certificate.as_ptr();
+            let cert_info = unsafe { context.as_ref() }
+                .and_then(|ctx| unsafe { ctx.pCertInfo.as_ref() })
+                .ok_or_else(|| {
+                    crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+                })?;
+
+            // Embed this certificate's DER encoding into the signed message so verifiers can
+            // locate the signer's certificate.
+            let cert_context = unsafe { context.as_ref() }.ok_or_else(|| {
+                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+            })?;
+            cert_blobs.push(CRYPT_INTEGER_BLOB {
+                cbData: cert_context.cbCertEncoded,
+                pbData: cert_context.pbCertEncoded,
+            });
+
+            let mut key_info_len = 0u32;
+            let ok = unsafe {
+                CertGetCertificateContextProperty(
+                    context,
+                    CERT_KEY_PROV_INFO_PROP_ID,
+                    ptr::null_mut(),
+                    &mut key_info_len,
+                )
+            };
+            if ok == 0 || key_info_len == 0 {
+                return Err(crate::signer::SignerError::Signing(format!(
+                    "у сертификата подписанта нет сведений о закрытом ключе (код Windows 0x{:08X})",
+                    unsafe { GetLastError() }
+                )));
+            }
+            let mut key_info_bytes = vec![0u8; key_info_len as usize];
+            let ok = unsafe {
+                CertGetCertificateContextProperty(
+                    context,
+                    CERT_KEY_PROV_INFO_PROP_ID,
+                    key_info_bytes.as_mut_ptr() as *mut c_void,
+                    &mut key_info_len,
+                )
+            };
+            if ok == 0 {
+                return Err(crate::signer::SignerError::Signing(format!(
+                    "не удалось прочитать сведения о закрытом ключе (код Windows 0x{:08X})",
+                    unsafe { GetLastError() }
+                )));
+            }
+            let key_info = key_info_bytes.as_ptr() as *const CRYPT_KEY_PROV_INFO;
+
+            let mut provider = 0usize;
+            let acquired = unsafe {
+                CryptAcquireContextW(
+                    &mut provider,
+                    (*key_info).pwszContainerName,
+                    (*key_info).pwszProvName,
+                    (*key_info).dwProvType,
+                    0,
+                )
+            };
+            if acquired == 0 {
+                return Err(crate::signer::SignerError::Signing(format!(
+                    "не удалось открыть контейнер закрытого ключа подписанта (код Windows 0x{:08X})",
+                    unsafe { GetLastError() }
+                )));
+            }
+            providers.push(ProviderContext(provider));
+
+            // Determine the key spec by probing the actual keys in the container, exactly as
+            // CryptSignMessage does: prefer AT_SIGNATURE, fall back to AT_KEYEXCHANGE.
+            let mut signature_key = 0usize;
+            let has_signature =
+                unsafe { CryptGetUserKey(provider, AT_SIGNATURE, &mut signature_key) };
+            let key_spec = if has_signature != 0 {
+                unsafe { CryptDestroyKey(signature_key) };
+                AT_SIGNATURE
+            } else {
+                let mut exchange_key = 0usize;
+                let has_exchange =
+                    unsafe { CryptGetUserKey(provider, AT_KEYEXCHANGE, &mut exchange_key) };
+                if has_exchange == 0 {
+                    return Err(crate::signer::SignerError::Signing(format!(
+                        "в контейнере закрытого ключа не найден ни ключ подписи, ни ключ обмена (код Windows 0x{:08X})",
+                        unsafe { GetLastError() }
+                    )));
+                }
+                unsafe { CryptDestroyKey(exchange_key) };
+                AT_KEYEXCHANGE
+            };
+
+            let hash_oid = &hash_oids[index];
+            let signer_info = CMSG_SIGNER_ENCODE_INFO {
+                cbSize: std::mem::size_of::<CMSG_SIGNER_ENCODE_INFO>() as u32,
+                pCertInfo: cert_info as *const CERT_INFO as *mut CERT_INFO,
+                Anonymous: CMSG_SIGNER_ENCODE_INFO_0 {
+                    hCryptProv: provider,
+                },
+                dwKeySpec: key_spec,
+                HashAlgorithm: CRYPT_ALGORITHM_IDENTIFIER {
+                    pszObjId: hash_oid.as_ptr() as *mut u8,
+                    ..Default::default()
+                },
+                pvHashAuxInfo: ptr::null_mut(),
+                cAuthAttr: 0,
+                rgAuthAttr: ptr::null_mut(),
+                cUnauthAttr: 0,
+                rgUnauthAttr: ptr::null_mut(),
+            };
+            signer_infos.push(signer_info);
+        }
+
+        let signer_count = u32::try_from(signer_infos.len()).map_err(|_| {
+            crate::signer::SignerError::Signing("слишком много сертификатов подписантов".to_owned())
+        })?;
+        let cert_count = u32::try_from(cert_blobs.len()).map_err(|_| {
+            crate::signer::SignerError::Signing("слишком много сертификатов подписантов".to_owned())
+        })?;
+        let signed_encode_info = CMSG_SIGNED_ENCODE_INFO {
+            cbSize: std::mem::size_of::<CMSG_SIGNED_ENCODE_INFO>() as u32,
+            cSigners: signer_count,
+            rgSigners: signer_infos.as_mut_ptr(),
+            cCertEncoded: cert_count,
+            rgCertEncoded: cert_blobs.as_mut_ptr(),
+            cCrlEncoded: 0,
+            rgCrlEncoded: ptr::null_mut(),
         };
-        parameters.cMsgCert = 1;
-        parameters.rgpMsgCert = &mut certificate_pointer;
-        let content_pointer = content.as_ptr();
+
+        let mut flags = 0u32;
+        if detached {
+            flags |= CMSG_DETACHED_FLAG;
+        }
+        let message = unsafe {
+            CryptMsgOpenToEncode(
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                flags,
+                CMSG_SIGNED,
+                &signed_encode_info as *const CMSG_SIGNED_ENCODE_INFO as *const c_void,
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        if message.is_null() {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось открыть CMS-сообщение для подписания (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+
         let content_length = u32::try_from(content.len()).map_err(|_| {
             crate::signer::SignerError::Signing(
                 "исходный файл превышает лимит CryptoAPI".to_owned(),
             )
         })?;
-        let mut signed_length = 0u32;
-        let measured = unsafe {
-            CryptSignMessage(
-                &parameters,
-                i32::from(detached),
-                1,
-                &content_pointer,
-                &content_length,
+        let updated = unsafe { CryptMsgUpdate(message, content.as_ptr(), content_length, 1) };
+        if updated == 0 {
+            unsafe { CryptMsgClose(message) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось добавить данные в CMS-сообщение (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+
+        let mut encoded_length = 0u32;
+        let sized = unsafe {
+            CryptMsgGetParam(
+                message,
+                CMSG_CONTENT_PARAM,
+                0,
                 ptr::null_mut(),
-                &mut signed_length,
+                &mut encoded_length,
+            )
+        };
+        if sized == 0 || encoded_length == 0 {
+            unsafe { CryptMsgClose(message) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось определить размер CMS-подписи (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let mut encoded = vec![0u8; encoded_length as usize];
+        let got = unsafe {
+            CryptMsgGetParam(
+                message,
+                CMSG_CONTENT_PARAM,
+                0,
+                encoded.as_mut_ptr() as *mut c_void,
+                &mut encoded_length,
+            )
+        };
+        unsafe { CryptMsgClose(message) };
+        if got == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось получить закодированную CMS-подпись (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        encoded.truncate(encoded_length as usize);
+        Ok(encoded)
+    }
+
+    pub(super) fn encrypt_cms(
+        request: crate::signer::EncryptRequest,
+    ) -> Result<crate::signer::EncryptResult, crate::signer::SignerError> {
+        let input = std::fs::read(&request.input_path).map_err(|error| {
+            crate::signer::SignerError::Encryption(format!(
+                "не удалось прочитать исходный файл: {error}"
+            ))
+        })?;
+        if request.certificate_ids.is_empty() {
+            return Err(crate::signer::SignerError::Encryption(
+                "выберите хотя бы один сертификат получателя".to_owned(),
+            ));
+        }
+        let store = unsafe { open_personal_store() }.ok_or_else(|| {
+            let code = unsafe { GetLastError() };
+            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+        })?;
+        // Resolve each recipient certificate and keep them alive for the CryptoAPI call.
+        let recipients = request
+            .certificate_ids
+            .iter()
+            .map(|id| find_certificate(&store, id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let content_encryption_oid = content_encryption_oid_for_certificates(&recipients)?;
+        let mut output = encrypt_message(&recipients, &content_encryption_oid, &input)?;
+        if request.base64 {
+            output = encode_base64(&output).into_bytes();
+        }
+
+        write_result(&request.output_path, &output, "шифрования", false)?;
+        Ok(crate::signer::EncryptResult {
+            output_path: request.output_path,
+            bytes_written: output.len(),
+        })
+    }
+
+    pub(super) fn decrypt_cms(
+        request: crate::signer::DecryptRequest,
+    ) -> Result<crate::signer::DecryptResult, crate::signer::SignerError> {
+        let input = std::fs::read(&request.input_path).map_err(|error| {
+            crate::signer::SignerError::Decryption(format!(
+                "не удалось прочитать зашифрованный файл: {error}"
+            ))
+        })?;
+        let input = if request.base64 {
+            decode_base64(&input)?
+        } else {
+            input
+        };
+        let store = unsafe { open_personal_store() }.ok_or_else(|| {
+            let code = unsafe { GetLastError() };
+            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+        })?;
+        let output = decrypt_message(&store, &input)?;
+        write_result(&request.output_path, &output, "расшифрования", true)?;
+        Ok(crate::signer::DecryptResult {
+            output_path: request.output_path,
+            bytes_written: output.len(),
+        })
+    }
+
+    fn content_encryption_oid_for_certificates(
+        recipients: &[CertificateContext],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        // Choose a symmetric content algorithm compatible with the recipients' public keys.
+        // For GOST 2012 recipients CryptoPro uses Kuznyechik; for GOST 2001 it uses GOST 28147-89.
+        let mut saw_gost_2012 = false;
+        for recipient in recipients {
+            let oid = unsafe { certificate_public_key_oid(recipient.as_ptr()) };
+            match oid {
+                Some(oid) if oid.starts_with(b"1.2.643.7.1.1.1") => saw_gost_2012 = true,
+                Some(_) => {}
+                None => {
+                    return Err(crate::signer::SignerError::Encryption(
+                        "не удалось определить алгоритм ключа получателя".to_owned(),
+                    ))
+                }
+            }
+        }
+        // Kuznyechik for GOST 2012-256/512, Magma (GOST 28147-89) otherwise.
+        let oid: &[u8] = if saw_gost_2012 {
+            b"1.2.643.7.1.1.5.1\0"
+        } else {
+            b"1.2.643.2.2.21\0"
+        };
+        Ok(oid.to_vec())
+    }
+
+    unsafe fn certificate_public_key_oid(context: *const CERT_CONTEXT) -> Option<&'static [u8]> {
+        let info = context.as_ref()?.pCertInfo.as_ref()?;
+        let oid_ptr = info.SubjectPublicKeyInfo.Algorithm.pszObjId;
+        if oid_ptr.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(oid_ptr.cast()).to_bytes())
+    }
+
+    fn encrypt_message(
+        recipients: &[CertificateContext],
+        content_encryption_oid: &[u8],
+        content: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let recipient_pointers = recipients
+            .iter()
+            .map(CertificateContext::as_ptr)
+            .collect::<Vec<_>>();
+        let mut parameters = CRYPT_ENCRYPT_MESSAGE_PARA::default();
+        parameters.cbSize = std::mem::size_of::<CRYPT_ENCRYPT_MESSAGE_PARA>() as u32;
+        parameters.dwMsgEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+        parameters.ContentEncryptionAlgorithm = CRYPT_ALGORITHM_IDENTIFIER {
+            pszObjId: content_encryption_oid.as_ptr() as *mut u8,
+            ..Default::default()
+        };
+        let content_length = u32::try_from(content.len()).map_err(|_| {
+            crate::signer::SignerError::Encryption(
+                "исходный файл превышает лимит CryptoAPI".to_owned(),
+            )
+        })?;
+        let recipient_count = u32::try_from(recipient_pointers.len()).map_err(|_| {
+            crate::signer::SignerError::Encryption("слишком много получателей".to_owned())
+        })?;
+        let mut encrypted_length = 0u32;
+        let measured = unsafe {
+            CryptEncryptMessage(
+                &parameters,
+                recipient_count,
+                recipient_pointers.as_ptr(),
+                content.as_ptr(),
+                content_length,
+                ptr::null_mut(),
+                &mut encrypted_length,
             )
         };
         if measured == 0 {
-            return Err(last_crypto_error("не удалось подготовить CMS-подпись"));
+            let code = unsafe { GetLastError() };
+            return Err(crate::signer::SignerError::Encryption(format!(
+                "не удалось подготовить CMS EnvelopedData (код Windows 0x{code:08X})"
+            )));
         }
-        let mut signed = vec![0u8; signed_length as usize];
+        let mut encrypted = vec![0u8; encrypted_length as usize];
         let created = unsafe {
-            CryptSignMessage(
+            CryptEncryptMessage(
                 &parameters,
-                i32::from(detached),
-                1,
-                &content_pointer,
-                &content_length,
-                signed.as_mut_ptr(),
-                &mut signed_length,
+                recipient_count,
+                recipient_pointers.as_ptr(),
+                content.as_ptr(),
+                content_length,
+                encrypted.as_mut_ptr(),
+                &mut encrypted_length,
             )
         };
         if created == 0 {
-            return Err(last_crypto_error("CryptoAPI не смог создать CMS-подпись"));
+            let code = unsafe { GetLastError() };
+            return Err(crate::signer::SignerError::Encryption(format!(
+                "CryptoAPI не смог создать CMS EnvelopedData (код Windows 0x{code:08X})"
+            )));
         }
-        signed.truncate(signed_length as usize);
-        Ok(signed)
+        encrypted.truncate(encrypted_length as usize);
+        Ok(encrypted)
     }
 
-    fn last_crypto_error(action: &str) -> crate::signer::SignerError {
-        let code = unsafe { GetLastError() };
-        crate::signer::SignerError::Signing(format!("{action} (код Windows 0x{code:08X})"))
+    fn decrypt_message(
+        store: &CertificateStore,
+        encrypted: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let mut parameters = CRYPT_DECRYPT_MESSAGE_PARA::default();
+        parameters.cbSize = std::mem::size_of::<CRYPT_DECRYPT_MESSAGE_PARA>() as u32;
+        parameters.dwMsgAndCertEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+        let mut store_handle = store.0;
+        parameters.cCertStore = 1;
+        parameters.rghCertStore = &mut store_handle;
+        let encrypted_length = u32::try_from(encrypted.len()).map_err(|_| {
+            crate::signer::SignerError::Decryption(
+                "зашифрованный файл слишком велик для CryptoAPI".to_owned(),
+            )
+        })?;
+        let mut decrypted_length = 0u32;
+        let measured = unsafe {
+            CryptDecryptMessage(
+                &parameters,
+                encrypted.as_ptr(),
+                encrypted_length,
+                ptr::null_mut(),
+                &mut decrypted_length,
+                ptr::null_mut(),
+            )
+        };
+        if measured == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(crate::signer::SignerError::Decryption(format!(
+                "не удалось определить размер расшифрованных данных (код Windows 0x{code:08X})"
+            )));
+        }
+        let mut decrypted = vec![0u8; decrypted_length as usize];
+        let mut decrypted_cert = ptr::null_mut();
+        let decoded = unsafe {
+            CryptDecryptMessage(
+                &parameters,
+                encrypted.as_ptr(),
+                encrypted_length,
+                decrypted.as_mut_ptr(),
+                &mut decrypted_length,
+                &mut decrypted_cert,
+            )
+        };
+        if decoded == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(crate::signer::SignerError::Decryption(format!(
+                "не удалось расшифровать файл (код Windows 0x{code:08X})"
+            )));
+        }
+        if !decrypted_cert.is_null() {
+            unsafe { CertFreeCertificateContext(decrypted_cert) };
+        }
+        decrypted.truncate(decrypted_length as usize);
+        Ok(decrypted)
+    }
+
+    fn write_result(
+        output_path: &str,
+        output: &[u8],
+        action: &str,
+        is_decryption: bool,
+    ) -> Result<(), crate::signer::SignerError> {
+        let make_error = |message: String| {
+            if is_decryption {
+                crate::signer::SignerError::Decryption(message)
+            } else {
+                crate::signer::SignerError::Encryption(message)
+            }
+        };
+        let output_path = std::path::PathBuf::from(output_path);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .map_err(|error| {
+                make_error(format!(
+                    "не удалось создать файл результата {action} без перезаписи ({}): {error}",
+                    output_path.display()
+                ))
+            })?;
+        if let Err(error) = file.write_all(output) {
+            drop(file);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(make_error(format!(
+                "не удалось записать файл результата {action}: {error}"
+            )));
+        }
+        Ok(())
     }
 
     fn encode_base64(bytes: &[u8]) -> String {
@@ -727,6 +1149,18 @@ pub fn verify_signature(
     request: crate::signer::VerifyRequest,
 ) -> Result<crate::signer::VerifyResult, crate::signer::SignerError> {
     ffi::verify_cms(request)
+}
+
+pub fn encrypt_file(
+    request: crate::signer::EncryptRequest,
+) -> Result<crate::signer::EncryptResult, crate::signer::SignerError> {
+    ffi::encrypt_cms(request)
+}
+
+pub fn decrypt_file(
+    request: crate::signer::DecryptRequest,
+) -> Result<crate::signer::DecryptResult, crate::signer::SignerError> {
+    ffi::decrypt_cms(request)
 }
 
 fn cades_library_present() -> bool {

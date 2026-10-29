@@ -11,6 +11,7 @@ type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string
 type Doc = { path: string; name: string; selected: boolean };
 type SignBatchItemResult = { inputPath: string; outputPath: string; success: boolean; error: string | null };
 type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string }[]; message: string };
+type CryptoResult = { outputPath: string; bytesWritten: number };
 const { t, locale } = useI18n();
 const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' : 'en';
 const page = ref('sign');
@@ -30,7 +31,7 @@ const certificates = ref<CertInfo[]>([]);
 const selectedCertIds = ref<string[]>([]);
 const certFilter = ref('');
 const certPickerOpen = ref(false);
-const certPickerMode = ref<'signing' | 'defaults'>('signing');
+const certPickerMode = ref<'signing' | 'defaults' | 'encryption'>('signing');
 const pickerDraftCertIds = ref<string[]>([]);
 const certsLoading = ref(false);
 const certsError = ref('');
@@ -45,18 +46,39 @@ const verifyBase64 = ref(false);
 const verifyProgress = ref(false);
 const verifyResult = ref<VerifyResult | null>(null);
 const dragHover = ref(false);
+const cryptoMode = ref<'encrypt' | 'decrypt'>('encrypt');
+const cryptoFiles = ref<Doc[]>([]);
+const cryptoEncoding = ref('der');
+const cryptoRecipientIds = ref<string[]>([]);
+const cryptoProgress = ref(false);
+const cryptoMessage = ref('');
+const cryptoReportOpen = ref(false);
+const cryptoReportItems = ref<{ inputPath: string; outputPath: string; success: boolean; error: string | null }[]>([]);
+const cryptoOutputDir = ref('');
 let unlistenDrop: (() => void) | undefined;
 let unlistenSystemTheme: (() => void) | undefined;
 const outputDir = ref('');
 const isDark = ref(localStorage.getItem('cryptolite.theme') === 'dark');
 let settingsSaveQueue: Promise<unknown> = Promise.resolve();
 const selectedCount = computed(() => documents.value.filter((document) => document.selected).length);
-const selectedCertificate = computed(() => certificates.value.find((certificate) => certificate.id === selectedCertIds.value[0]));
+const selectedCertificates = computed(() => selectedCertIds.value.map((id) => certificates.value.find((certificate) => certificate.id === id)).filter((certificate): certificate is CertInfo => !!certificate && !certificate.expired));
 const defaultCertificateNames = computed(() => certificates.value.filter((certificate) => appSettings.value.defaultCertificateIds.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
-const canSign = computed(() => status.value.available && (standard.value === 'cms' ? status.value.signingAvailable : standard.value === 'cades-bes' ? status.value.cadesAvailable : false) && selectedCount.value > 0 && selectedCertIds.value.length === 1 && !!selectedCertificate.value && !selectedCertificate.value.expired && !signingInProgress.value);
+const canSign = computed(() => {
+  if (!status.value.available || !selectedCount.value || signingInProgress.value) return false;
+  if (!selectedCertificates.value.length) return false;
+  if (standard.value === 'cades-bes') return status.value.cadesAvailable && selectedCertIds.value.length === 1;
+  if (standard.value === 'cms') return status.value.signingAvailable;
+  return false;
+});
 const signSuccessCount = computed(() => signReportItems.value.filter((item) => item.success).length);
 const signErrorCount = computed(() => signReportItems.value.length - signSuccessCount.value);
 const filteredCertificates = computed(() => certificates.value.filter((certificate) => certificate.subject.toLocaleLowerCase().includes(certFilter.value.toLocaleLowerCase())));
+const cryptoSelectedCount = computed(() => cryptoFiles.value.filter((document) => document.selected).length);
+const cryptoRecipientNames = computed(() => certificates.value.filter((certificate) => cryptoRecipientIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
+const canEncrypt = computed(() => status.value.available && cryptoMode.value === 'encrypt' && cryptoSelectedCount.value > 0 && cryptoRecipientIds.value.length > 0 && !cryptoProgress.value);
+const canDecrypt = computed(() => status.value.available && cryptoMode.value === 'decrypt' && cryptoSelectedCount.value > 0 && !cryptoProgress.value);
+const cryptoSuccessCount = computed(() => cryptoReportItems.value.filter((item) => item.success).length);
+const cryptoErrorCount = computed(() => cryptoReportItems.value.length - cryptoSuccessCount.value);
 
 onMounted(async () => {
   document.documentElement.classList.toggle('dark', isDark.value);
@@ -211,6 +233,8 @@ async function runVerify() {
 function handleDroppedPaths(paths: string[]) {
   if (page.value === 'sign') {
     addFiles(paths);
+  } else if (page.value === 'encrypt') {
+    addCryptoFiles(paths);
   } else if (page.value === 'verify' && paths.length) {
     const signatures = paths.filter((path) => /\.(sig|p7s)$/i.test(path));
     const signature = signatures[0] || paths[0];
@@ -245,13 +269,14 @@ async function openCertificatePicker(mode: 'signing' | 'defaults' = 'signing') {
 function confirmCertificates() {
   const activeIds = pickerDraftCertIds.value.filter((id) => certificates.value.some((certificate) => certificate.id === id && !certificate.expired));
   if (certPickerMode.value === 'defaults') appSettings.value.defaultCertificateIds = activeIds;
+  else if (certPickerMode.value === 'encryption') cryptoRecipientIds.value = activeIds;
   else selectedCertIds.value = activeIds;
   if (certPickerMode.value === 'signing') certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject);
   certPickerOpen.value = false;
 }
 async function signSelectedDocument() {
   const selected = documents.value.filter((document) => document.selected);
-  if (!canSign.value || !selected.length || selectedCertIds.value.length !== 1) return;
+  if (!canSign.value || !selected.length || !selectedCertIds.value.length) return;
   const requests = selected.map((document) => {
     const separator = Math.max(document.path.lastIndexOf('/'), document.path.lastIndexOf('\\'));
     const folder = outputDir.value || document.path.slice(0, separator);
@@ -266,7 +291,7 @@ async function signSelectedDocument() {
         standard: standard.value,
         inputPath,
         outputPath,
-        certificateId: selectedCertIds.value[0],
+        certificateIds: [...selectedCertIds.value],
         detached: signatureType.value === 'detached',
         base64: encoding.value === 'base64',
       })),
@@ -278,11 +303,88 @@ async function signSelectedDocument() {
     signingInProgress.value = false;
   }
 }
+function addCryptoFiles(paths: string[]) {
+  for (const path of paths) {
+    if (!cryptoFiles.value.some((doc) => doc.path === path)) {
+      const name = path.split(/[\\/]/).pop() || path;
+      cryptoFiles.value.push({ path, name, selected: true });
+    }
+  }
+}
+async function chooseCryptoFiles() {
+  const result = await open({ multiple: true, title: cryptoMode.value === 'encrypt' ? 'Выберите файлы для шифрования' : 'Выберите файлы для расшифрования' });
+  if (result) addCryptoFiles(Array.isArray(result) ? result : [result]);
+}
+async function chooseCryptoOutput() {
+  const result = await open({ directory: true, title: 'Папка сохранения' });
+  if (result && typeof result === 'string') cryptoOutputDir.value = result;
+}
+function openRecipientPicker() {
+  pickerDraftCertIds.value = [...cryptoRecipientIds.value];
+  certPickerMode.value = 'encryption';
+  certPickerOpen.value = true;
+  certFilter.value = '';
+  certsError.value = '';
+  certsLoading.value = true;
+  invoke<CertInfo[]>('list_certs')
+    .then((certs) => {
+      certificates.value = certs;
+      pickerDraftCertIds.value = pickerDraftCertIds.value.filter((id) => certs.some((certificate) => certificate.id === id && !certificate.expired));
+    })
+    .catch((error) => { certsError.value = String(error); })
+    .finally(() => { certsLoading.value = false; });
+}
+async function runCrypto() {
+  const selected = cryptoFiles.value.filter((document) => document.selected);
+  if (cryptoProgress.value || !selected.length) return;
+  if (cryptoMode.value === 'encrypt' && !cryptoRecipientIds.value.length) return;
+  cryptoProgress.value = true;
+  cryptoMessage.value = '';
+  cryptoReportItems.value = [];
+  for (const document of selected) {
+    const separator = Math.max(document.path.lastIndexOf('/'), document.path.lastIndexOf('\\'));
+    const folder = cryptoOutputDir.value || document.path.slice(0, separator);
+    const slash = document.path.includes('\\') ? '\\' : '/';
+    const baseName = document.name;
+    const outputPath = cryptoMode.value === 'encrypt'
+      ? `${folder ? `${folder}${slash}` : ''}${baseName}.enc`
+      : stripEncryptedExtension(baseName, folder, slash);
+    try {
+      if (cryptoMode.value === 'encrypt') {
+        const result = await invoke<CryptoResult>('encrypt_file', { request: {
+          inputPath: document.path,
+          outputPath,
+          certificateIds: cryptoRecipientIds.value,
+          base64: cryptoEncoding.value === 'base64',
+        } });
+        cryptoReportItems.value.push({ inputPath: document.path, outputPath: result.outputPath, success: true, error: null });
+      } else {
+        const result = await invoke<CryptoResult>('decrypt_file', { request: {
+          inputPath: document.path,
+          outputPath,
+          base64: cryptoEncoding.value === 'base64',
+        } });
+        cryptoReportItems.value.push({ inputPath: document.path, outputPath: result.outputPath, success: true, error: null });
+      }
+    } catch (error) {
+      cryptoReportItems.value.push({ inputPath: document.path, outputPath, success: false, error: String(error) });
+    }
+  }
+  cryptoProgress.value = false;
+  cryptoReportOpen.value = true;
+}
+function stripEncryptedExtension(name: string, folder: string, slash: string): string {
+  const lowered = name.toLowerCase();
+  const base = lowered.endsWith('.p7m') || lowered.endsWith('.p7e') || lowered.endsWith('.enc')
+    ? name.slice(0, -4)
+    : name;
+  return `${folder ? `${folder}${slash}` : ''}${base}.dec`;
+}
 </script>
 
 <template>
   <div class="app-shell" :class="{'drag-hover':dragHover}">
-    <div v-if="dragHover" class="drop-overlay"><span>＋</span><b>{{ page==='verify'?'Отпустите подпись и исходный документ':'Отпустите файлы для добавления' }}</b></div>
+    <div v-if="dragHover" class="drop-overlay"><span>＋</span><b>{{ page==='verify'?'Отпустите подпись и исходный документ':page==='encrypt'?'Отпустите файлы для шифрования или расшифрования':'Отпустите файлы для добавления' }}</b></div>
     <aside class="sidebar">
       <div class="brand"><div class="brand-mark">К</div><div><div class="brand-name">КриптоЛайт</div><div class="brand-caption">{{ t('subtitle') }}</div></div></div>
       <div class="menu-label">WORKSPACE</div>
@@ -293,11 +395,11 @@ async function signSelectedDocument() {
       <nav class="nav-list">
         <button v-for="item in ['settings','about']" :key="item" class="nav-item" :class="{active:page===item}" @click="page=item"><span class="nav-icon">{{ item==='settings'?'⚙':'ⓘ' }}</span>{{ t(`nav.${item}`) }}</button>
       </nav>
-      <div class="sidebar-bottom"><div class="csp-card"><span class="status-dot" :class="{connected:status.available}"></span><div><b>{{ status.available ? t('cspFound') : t('disconnected') }}</b><small>{{ status.available ? status.message : 'CryptoLite 0.1.0' }}</small></div><span class="refresh">↻</span></div><div class="profile"><div class="avatar">К</div><div class="profile-text"><b>Локальный профиль</b><small>Безопасная обработка</small></div></div></div>
+      <div class="sidebar-bottom"><div class="csp-card"><span class="status-dot" :class="{connected:status.available}"></span><div><b>{{ status.available ? t('cspFound') : t('disconnected') }}</b><small>{{ status.available ? status.message : 'CryptoLite 0.1.0' }}</small></div><span class="refresh">↻</span></div></div>
     </aside>
 
     <main class="main-area">
-      <header class="topbar"><div class="breadcrumb">КриптоЛайт <span>/</span> <b>{{ t(`nav.${page}`) }}</b></div><div class="top-actions"><div class="secure-label"><span>◈</span> Локальная обработка</div><button class="language-button" @click="changeLanguage(locale==='ru'?'en':'ru')">{{ locale==='ru'?'RU':'EN' }} <span>⌄</span></button><button class="icon-button" @click="toggleTheme">☼</button></div></header>
+      <header class="topbar"><div class="breadcrumb">КриптоЛайт <span>/</span> <b>{{ t(`nav.${page}`) }}</b></div><div class="top-actions"><button class="language-button" @click="changeLanguage(locale==='ru'?'en':'ru')">{{ locale==='ru'?'RU':'EN' }} <span>⌄</span></button><button class="icon-button" @click="toggleTheme">☼</button></div></header>
 
       <section v-if="page==='sign'" class="content-view">
         <div class="page-heading"><div><div class="eyebrow">DOCUMENT WORKFLOW</div><h1>{{ t('nav.sign') }}</h1><p>Создайте электронную подпись для одного или нескольких документов.</p></div><div class="heading-badge"><span class="status-dot" :class="{connected:status.available}"></span> {{ status.available ? t('cspFound') : t('disconnected') }}</div></div>
@@ -311,7 +413,7 @@ async function signSelectedDocument() {
           <div v-else class="document-list"><article v-for="(doc,index) in documents" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">Готов к подписанию</span><button class="remove-button" @click="documents.splice(index,1)">×</button></article><button class="add-more" @click="chooseFiles">＋ Добавить ещё документы</button></div>
           <div class="documents-footer"><span>Выбрано <b>{{ selectedCount }}</b> из {{ documents.length }} документов</span><span class="supported"><i></i> Файлы остаются на вашем устройстве</span></div>
         </section>
-        <footer class="action-bar"><div class="action-note"><span class="lock-icon">♙</span><span><b>Подпись защищена</b><small>Закрытый ключ остаётся в КриптоПро CSP</small><small v-if="signingMessage" class="signing-message">{{ signingMessage }}</small><small v-else-if="standard==='cades-t'" class="signing-message">CAdES-T подключим после настройки TSP.</small><small v-else-if="standard==='cades-bes'&&!status.cadesAvailable" class="signing-message">Для CAdES-BES требуется установленный КриптоПро ЭЦП SDK.</small></span></div><button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):standard==='cades-t'?'CAdES-T пока не подключён':standard==='cades-bes'&&!status.cadesAvailable?'Требуется КриптоПро ЭЦП SDK':selectedCount===0?'Выберите документы':selectedCertIds.length!==1?'Выберите один сертификат':''" @click="signSelectedDocument"><span>✳</span> {{ signingInProgress ? 'Подписание…' : t('sign') }} <span class="button-arrow">→</span></button></footer>
+        <footer class="action-bar"><div class="action-note"><span class="lock-icon">♙</span><span><b>Подпись защищена</b><small>Закрытый ключ остаётся в КриптоПро CSP</small><small v-if="signingMessage" class="signing-message">{{ signingMessage }}</small><small v-else-if="standard==='cades-t'" class="signing-message">CAdES-T подключим после настройки TSP.</small><small v-else-if="standard==='cades-bes'&&!status.cadesAvailable" class="signing-message">Для CAdES-BES требуется установленный КриптоПро ЭЦП SDK.</small></span></div><button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):standard==='cades-t'?'CAdES-T пока не подключён':standard==='cades-bes'&&!status.cadesAvailable?'Требуется КриптоПро ЭЦП SDK':selectedCount===0?'Выберите документы':selectedCertIds.length===0?'Выберите сертификат(ы)':standard==='cades-bes'&&selectedCertIds.length>1?'CAdES-BES подписывает одним сертификатом':''" @click="signSelectedDocument"><span>✳</span> {{ signingInProgress ? 'Подписание…' : t('sign') }} <span class="button-arrow">→</span></button></footer>
       </section>
 
       <section v-else-if="page==='verify'" class="content-view verify-view">
@@ -323,6 +425,21 @@ async function signSelectedDocument() {
         </section>
         <section v-if="verifyResult" class="verify-result" :class="verifyResult.valid?'valid':'invalid'"><header><span class="verify-result-icon">{{ verifyResult.valid?'✓':'!' }}</span><div><h2>{{ verifyResult.valid?'Подпись действительна':'Подпись не подтверждена' }}</h2><p>{{ verifyResult.message }}</p></div></header><div v-if="verifyResult.signers.length" class="verify-signer-list"><article v-for="(signer,index) in verifyResult.signers" :key="index" class="verify-signer"><b>{{ signer.subject || 'Подписант' }}</b><small>Издатель: {{ signer.issuer }}</small><small>Сертификат действителен до {{ signer.expiresAt }}</small><small class="chain-status" :class="signer.chainTrusted?'trusted':'untrusted'">{{ signer.chainMessage }}</small></article></div></section>
         <footer class="action-bar verify-action"><div class="action-note"><span class="lock-icon">✓</span><span><b>Проверка выполняется локально</b><small>Проверяется криптографическая целостность подписи; доверие к цепочке сертификата оценивается отдельно.</small></span></div><button class="sign-button" :disabled="!status.available || !verifySignaturePath || (verifyDetached && !verifyContentPath) || verifyProgress" @click="runVerify">{{ verifyProgress?'Проверка…':'Проверить подпись' }} <span class="button-arrow">→</span></button></footer>
+      </section>
+
+      <section v-else-if="page==='encrypt'" class="content-view encrypt-view">
+        <div class="page-heading"><div><div class="eyebrow">CMS / PKCS#7 · ENVELOPEDDATA</div><h1>{{ t('nav.encrypt') }}</h1><p>Зашифруйте файлы для одного или нескольких получателей либо расшифруйте своим закрытым ключом.</p></div><div class="heading-badge"><span class="status-dot" :class="{connected:status.available}"></span> {{ status.available ? t('cspFound') : t('disconnected') }}</div></div>
+        <section class="settings-card"><div class="card-heading"><div><h2>Режим и параметры</h2><p>Выберите действие и кодировку результата.</p></div><span class="step-number">01 <span>/ 02</span></span></div>
+          <div class="form-grid"><label class="field"><span>Операция</span><select v-model="cryptoMode"><option value="encrypt">Зашифровать</option><option value="decrypt">Расшифровать</option></select></label><label class="field"><span>Кодировка</span><select v-model="cryptoEncoding"><option value="der">DER · бинарная</option><option value="base64">Base64</option></select></label><label class="field wide-field"><span>Папка сохранения</span><button class="picker-button" @click="chooseCryptoOutput"><span class="picker-leading">▱</span><span class="picker-copy"><b>{{ cryptoOutputDir || 'Папка исходного документа' }}</b><small>Можно изменить для этого списка</small></span><span class="picker-trailing">↗</span></button></label></div>
+          <div v-if="cryptoMode==='encrypt'" class="field-row"><label class="field wide-field"><span>Получатели (сертификаты)</span><button class="picker-button" @click="openRecipientPicker"><span class="picker-leading">♙</span><span class="picker-copy"><b>{{ cryptoRecipientNames.length ? cryptoRecipientNames.join(', ') : 'Выберите сертификаты получателей' }}</b><small>Документ будет зашифрован для всех выбранных сертификатов</small></span><span class="picker-trailing">⌄</span></button></label></div>
+        </section>
+
+        <section class="documents-card"><div class="card-heading doc-heading"><div><div class="title-line"><h2>{{ cryptoMode==='encrypt'?'Файлы для шифрования':'Файлы для расшифрования' }}</h2><span class="count-chip">{{ cryptoFiles.length }}</span></div><p>Добавьте файлы и отметьте те, которые нужно обработать.</p></div><button class="outline-button" @click="chooseCryptoFiles"><span>＋</span> {{ t('add') }}</button></div>
+          <div v-if="!cryptoFiles.length" class="drop-zone" @click="chooseCryptoFiles"><div class="upload-icon"><span>◇</span></div><b>{{ cryptoMode==='encrypt'?'Перетащите документы для шифрования':'Перетащите зашифрованные файлы' }}</b><p>или выберите на компьютере</p><button class="browse-button">Выбрать файлы <span>↗</span></button><small v-if="cryptoMode==='encrypt'">Файлы будут зашифрованы в формат CMS EnvelopedData (.enc)</small><small v-else>Поддерживаются файлы .enc / .p7m / .p7e в DER или Base64</small></div>
+          <div v-else class="document-list"><article v-for="(doc,index) in cryptoFiles" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">{{ cryptoMode==='encrypt'?'Готов к шифрованию':'Готов к расшифрованию' }}</span><button class="remove-button" @click="cryptoFiles.splice(index,1)">×</button></article><button class="add-more" @click="chooseCryptoFiles">＋ Добавить ещё файлы</button></div>
+          <div class="documents-footer"><span>Выбрано <b>{{ cryptoSelectedCount }}</b> из {{ cryptoFiles.length }} файлов</span><span class="supported"><i></i> Файлы остаются на вашем устройстве</span></div>
+        </section>
+        <footer class="action-bar"><div class="action-note"><span class="lock-icon">◇</span><span><b>Защита данных</b><small>Содержимое шифруется КриптоПро CSP; закрытый ключ не покидает систему.</small><small v-if="cryptoMessage" class="signing-message">{{ cryptoMessage }}</small></span></div><button class="sign-button" :disabled="cryptoMode==='encrypt'? !canEncrypt : !canDecrypt" :title="!status.available?t('unavailable'):cryptoMode==='encrypt'&&cryptoSelectedCount===0?'Выберите файлы':cryptoMode==='encrypt'&&!cryptoRecipientIds.length?'Выберите получателей':''" @click="runCrypto"><span>◇</span> {{ cryptoProgress ? (cryptoMode==='encrypt'?'Шифрование…':'Расшифрование…') : (cryptoMode==='encrypt'?'Зашифровать':'Расшифровать') }} <span class="button-arrow">→</span></button></footer>
       </section>
 
       <section v-else-if="page==='settings'" class="content-view settings-view">
@@ -343,8 +460,9 @@ async function signSelectedDocument() {
       <section v-else class="placeholder-view"><div class="placeholder-icon">◇</div><div class="eyebrow">CRYPTOLITE · 0.1.0</div><h1>{{ t(`nav.${page}`) }}</h1><p>Раздел будет реализован на следующем этапе.</p><button class="outline-button" @click="page='sign'">Перейти к подписанию →</button></section>
     </main>
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal"><div class="alert-icon">!</div><h2>{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
-    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOPRO CSP</div><h2>Сертификаты подписи</h2><p>Список обновляется при каждом открытии окна.</p></div><button class="modal-close" @click="certPickerOpen=false">×</button></header><label class="certificate-search"><span>⌕</span><input v-model="certFilter" placeholder="Фильтр по имени владельца"/></label><div v-if="certsLoading" class="certificate-empty">Загрузка сертификатов…</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon">♙</div><b>{{ certificates.length ? 'Сертификаты не найдены' : 'Личное хранилище пусто' }}</b><p>{{ certificates.length ? 'Измените фильтр и попробуйте снова.' : 'Проверьте, что сертификат установлен в хранилище Windows «Личные» текущего пользователя.' }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired"/><div class="certificate-avatar">♙</div><div class="certificate-info"><b>{{ certificate.subject }}</b><span>Издатель: {{ certificate.issuer }}</span><small>{{ certificate.expired ? 'Истёк срок действия' : 'Действителен до' }} {{ certificate.expiresAt }} · {{ certificate.hasPrivateKey ? 'связь с закрытым ключом настроена' : 'связь с закрытым ключом не найдена' }}</small></div><span class="certificate-source">{{ certificate.expired ? 'Недействителен' : certificate.source }}</span></label></div><footer class="certificate-footer"><span>Выбрано: {{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="certPickerOpen=false">Отмена</button><button class="sign-button" @click="confirmCertificates">Выбрать</button></div></footer></section></div>
+    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOPRO CSP</div><h2>{{ certPickerMode==='encryption'?'Сертификаты получателей':'Сертификаты подписи' }}</h2><p>Список обновляется при каждом открытии окна.</p></div><button class="modal-close" @click="certPickerOpen=false">×</button></header><label class="certificate-search"><span>⌕</span><input v-model="certFilter" placeholder="Фильтр по имени владельца"/></label><div v-if="certsLoading" class="certificate-empty">Загрузка сертификатов…</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon">♙</div><b>{{ certificates.length ? 'Сертификаты не найдены' : 'Личное хранилище пусто' }}</b><p>{{ certificates.length ? 'Измените фильтр и попробуйте снова.' : 'Проверьте, что сертификат установлен в хранилище Windows «Личные» текущего пользователя.' }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired"/><div class="certificate-avatar">♙</div><div class="certificate-info"><b>{{ certificate.subject }}</b><span>Издатель: {{ certificate.issuer }}</span><small>{{ certificate.expired ? 'Истёк срок действия' : 'Действителен до' }} {{ certificate.expiresAt }} · {{ certificate.hasPrivateKey ? 'связь с закрытым ключом настроена' : 'связь с закрытым ключом не найдена' }}</small></div><span class="certificate-source">{{ certificate.expired ? 'Недействителен' : certificate.source }}</span></label></div><footer class="certificate-footer"><span>Выбрано: {{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">Сбросить</button><button class="outline-button" @click="certPickerOpen=false">Отмена</button><button class="sign-button" @click="confirmCertificates">Выбрать</button></div></footer></section></div>
     <div v-if="signReportOpen" class="modal-backdrop" @click.self="signReportOpen=false"><section class="sign-report-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOLITE · CMS / PKCS#7</div><h2>Подписание завершено</h2><p>Обработка выбранных документов окончена.</p></div><button class="modal-close" @click="signReportOpen=false">×</button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ signSuccessCount }}</b><span>Успешно</span></div><div class="sign-report-count error"><b>{{ signErrorCount }}</b><span>С ошибкой</span></div></div><div class="sign-report-list"><article v-for="item in signReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status">{{ item.success?'✓':'!' }}</span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ signReportItems.length }} документов</span><button class="sign-button" @click="signReportOpen=false">Готово</button></footer></section></div>
+    <div v-if="cryptoReportOpen" class="modal-backdrop" @click.self="cryptoReportOpen=false"><section class="sign-report-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOLITE · CMS ENVELOPEDDATA</div><h2>{{ cryptoMode==='encrypt'?'Шифрование завершено':'Расшифрование завершено' }}</h2><p>Обработка выбранных файлов окончена.</p></div><button class="modal-close" @click="cryptoReportOpen=false">×</button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ cryptoSuccessCount }}</b><span>Успешно</span></div><div class="sign-report-count error"><b>{{ cryptoErrorCount }}</b><span>С ошибкой</span></div></div><div class="sign-report-list"><article v-for="item in cryptoReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status">{{ item.success?'✓':'!' }}</span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ cryptoReportItems.length }} файлов</span><button class="sign-button" @click="cryptoReportOpen=false">Готово</button></footer></section></div>
   </div>
 </template>
 
