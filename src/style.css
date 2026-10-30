@@ -135,6 +135,20 @@ button:disabled{cursor:not-allowed}
 .alert-modal p{margin:0 auto 10px;color:#7e8691;font-size:13px;line-height:1.55}
 .alert-detail{padding:9px;border-radius:5px;background:#f6f7f8;color:#89919b;font-size:10px;overflow-wrap:anywhere}
 .alert-modal button{height:32px;margin-top:15px;padding:0 15px;border:0;border-radius:5px;background:#2f6df1;color:#fff;font-size:12px}
+.confirm-modal{text-align:left}
+.confirm-modal h2{text-align:center}
+.confirm-modal>p{text-align:center}
+.confirm-cert-list{max-height:120px;overflow:auto;margin:14px 0 0;padding:12px 12px 12px 26px;border-radius:6px;background:#f6f7f8;color:#6f7783;font-size:12px;line-height:1.5}
+.confirm-cert-list li{padding:5px 0;overflow-wrap:anywhere}
+.confirm-cert-list li+li{border-top:1px solid #eceef1}
+.confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+.confirm-actions button{margin-top:0;min-width:96px}
+.confirm-actions .sign-button.primary-dark{background:#5b6c88;box-shadow:0 3px 8px #5b6c882b}
+.confirm-actions .sign-button.primary-dark:hover{background:#4c5b73}
+.dark .confirm-cert-list{background:#292e37;color:#aab1bb}
+.dark .confirm-cert-list li+li{border-top-color:#373c46}
+.dark .confirm-actions .sign-button.primary-dark{background:#3d4c66;box-shadow:none}
+.dark .confirm-actions .sign-button.primary-dark:hover{background:#33405a}
 .certificate-modal{width:min(650px,calc(100vw - 70px));max-height:min(650px,calc(100vh - 70px));display:flex;flex-direction:column;padding:23px;border:1px solid #eaecf0;border-radius:11px;background:#fff;box-shadow:0 18px 50px #11182730}
 .certificate-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:17px}
 .certificate-header h2{margin:0;font-size:20px}

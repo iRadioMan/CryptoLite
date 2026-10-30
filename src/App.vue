@@ -54,6 +54,24 @@ const cryptoRecipientIds = ref<string[]>([]);
 const cryptoProgress = ref(false);
 const cryptoMessage = ref('');
 const cryptoReportOpen = ref(false);
+const multiCertConfirmMode = ref<'signing' | 'encryption' | null>(null);
+const multiCertConfirmNames = ref<string[]>([]);
+let multiCertConfirmResolver: ((confirmed: boolean) => void) | null = null;
+
+function askMultiCertificateConfirmation(mode: 'signing' | 'encryption', ids: string[]): Promise<boolean> {
+  if (ids.length < 2) return Promise.resolve(true);
+  settleMultiCertConfirm(false);
+  multiCertConfirmNames.value = certificates.value.filter((certificate) => ids.includes(certificate.id)).map((certificate) => certificate.subject);
+  multiCertConfirmMode.value = mode;
+  return new Promise<boolean>((resolve) => { multiCertConfirmResolver = resolve; });
+}
+function settleMultiCertConfirm(confirmed: boolean) {
+  const resolver = multiCertConfirmResolver;
+  multiCertConfirmResolver = null;
+  multiCertConfirmMode.value = null;
+  multiCertConfirmNames.value = [];
+  resolver?.(confirmed);
+}
 const cryptoReportItems = ref<{ inputPath: string; outputPath: string; success: boolean; error: string | null }[]>([]);
 const cryptoOutputDir = ref('');
 let unlistenDrop: (() => void) | undefined;
@@ -73,7 +91,15 @@ const canSign = computed(() => {
 });
 const signSuccessCount = computed(() => signReportItems.value.filter((item) => item.success).length);
 const signErrorCount = computed(() => signReportItems.value.length - signSuccessCount.value);
-const filteredCertificates = computed(() => certificates.value.filter((certificate) => certificate.subject.toLocaleLowerCase().includes(certFilter.value.toLocaleLowerCase())));
+const filteredCertificates = computed(() => {
+  const filter = certFilter.value.toLocaleLowerCase();
+  const matching = certificates.value.filter((certificate) => certificate.subject.toLocaleLowerCase().includes(filter));
+  // Выбранные (отмеченные) сертификаты всегда показываем вверху списка, сохраняя исходный порядок внутри групп.
+  const draftIds = new Set(pickerDraftCertIds.value);
+  return matching
+    .filter((certificate) => draftIds.has(certificate.id))
+    .concat(matching.filter((certificate) => !draftIds.has(certificate.id)));
+});
 const cryptoSelectedCount = computed(() => cryptoFiles.value.filter((document) => document.selected).length);
 const cryptoRecipientNames = computed(() => certificates.value.filter((certificate) => cryptoRecipientIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
 const canEncrypt = computed(() => status.value.available && cryptoMode.value === 'encrypt' && cryptoSelectedCount.value > 0 && cryptoRecipientIds.value.length > 0 && !cryptoProgress.value);
@@ -278,7 +304,8 @@ function confirmCertificates() {
 }
 async function signSelectedDocument() {
   const selected = documents.value.filter((document) => document.selected);
-  if (!canSign.value || !selected.length || !selectedCertIds.value.length) return;
+  if (!canSign.value || !selected.length || !selectedCertIds.value.length || signingInProgress.value) return;
+  if (!(await askMultiCertificateConfirmation('signing', selectedCertIds.value))) return;
   const requests = selected.map((document) => {
     const separator = Math.max(document.path.lastIndexOf('/'), document.path.lastIndexOf('\\'));
     const folder = outputDir.value || document.path.slice(0, separator);
@@ -340,6 +367,7 @@ async function runCrypto() {
   const selected = cryptoFiles.value.filter((document) => document.selected);
   if (cryptoProgress.value || !selected.length) return;
   if (cryptoMode.value === 'encrypt' && !cryptoRecipientIds.value.length) return;
+  if (cryptoMode.value === 'encrypt' && !(await askMultiCertificateConfirmation('encryption', cryptoRecipientIds.value))) return;
   cryptoProgress.value = true;
   cryptoMessage.value = '';
   cryptoReportItems.value = [];
@@ -461,6 +489,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else class="placeholder-view"><div class="placeholder-icon">◇</div><div class="eyebrow">CRYPTOLITE · 0.1.1</div><h1>{{ t(`nav.${page}`) }}</h1><p>{{ t('placeholder.description') }}</p><button class="outline-button" @click="page='sign'">{{ t('placeholder.goSign') }}</button></section>
     </main>
+    <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal"><div class="alert-icon">?</div><h2>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="sign-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button primary-dark" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal"><div class="alert-icon">!</div><h2>{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
     <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal"><header class="certificate-header"><div><h2>{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2><p>{{ t('certPicker.listRefresh') }}</p></div><button class="modal-close" @click="certPickerOpen=false">×</button></header><label class="certificate-search"><span>⌕</span><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon">📜</div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired"/><div class="certificate-avatar">👤</div><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }} · {{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.select') }}</button></div></footer></section></div>
     <div v-if="signReportOpen" class="modal-backdrop" @click.self="signReportOpen=false"><section class="sign-report-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOLITE · CMS / PKCS#7</div><h2>{{ t('signReport.title') }}</h2><p>{{ t('signReport.help') }}</p></div><button class="modal-close" @click="signReportOpen=false">×</button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ signSuccessCount }}</b><span>{{ t('signReport.success') }}</span></div><div class="sign-report-count error"><b>{{ signErrorCount }}</b><span>{{ t('signReport.error') }}</span></div></div><div class="sign-report-list"><article v-for="item in signReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status">{{ item.success?'✓':'!' }}</span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ signReportItems.length }} {{ t('signReport.documentsCount') }}</span><button class="sign-button" @click="signReportOpen=false">{{ t('signReport.done') }}</button></footer></section></div>
