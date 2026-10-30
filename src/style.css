@@ -32,7 +32,7 @@ button:disabled{cursor:not-allowed}
 .status-dot.connected{background:#68a98a;box-shadow:0 0 0 3px #68a98a20}
 .refresh{color:#a3a7ad;font-size:18px}
 .main-area{min-width:0;flex:1;display:flex;flex-direction:column;overflow:hidden}
-.topbar{height:62px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 37px;background:#fff;border-bottom:1px solid #e9ebef}
+.topbar{height:62px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#fff;border-bottom:1px solid #e9ebef}
 .breadcrumb{display:flex;align-items:center;gap:10px;font-size:14px;color:#8b929d}
 .breadcrumb span{color:#c6c9ce}
 .breadcrumb b{color:#39414c;font-weight:600}
@@ -40,7 +40,7 @@ button:disabled{cursor:not-allowed}
 .language-button,.icon-button{height:31px;border:1px solid #e7e9ed;border-radius:6px;background:#fff;color:#67707b}
 .language-button{padding:0 9px;font-size:12px}
 .icon-button{width:32px;font-size:17px}
-.content-view{width:min(1040px,calc(100% - 74px));margin:0 auto;padding:18px 12px 18px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden}
+.content-view{margin:7px;padding:25px 20px 10px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden}
 .page-heading{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px}
 .eyebrow{color:#a2a8b0;font-size:10px;font-weight:700;letter-spacing:1.25px}
 .page-heading h1{margin:6px 0 5px;color:#252d37;font-size:28px;letter-spacing:-.6px;line-height:1.2}
@@ -187,7 +187,6 @@ button:disabled{cursor:not-allowed}
 .dark .certificate-avatar,.dark .empty-certificate-icon{background:#1f2b45;color:#8fb3ff}
 .dark .action-note .lock-icon{background:#26352c;color:#92bd9f}
 .dark .placeholder-view p{color:#9aa2ad}
-@media(max-width:1100px){.sidebar{width:260px}.topbar{padding:0 25px}.content-view{width:calc(100% - 50px)}.settings-card,.documents-card{padding-left:17px;padding-right:17px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}
 
 .settings-view .settings-card,.about-view .settings-card{margin-bottom:14px}

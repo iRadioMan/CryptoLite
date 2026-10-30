@@ -1,6 +1,6 @@
 [package]
 name = "cryptolite"
-version = "0.1.0"
+version = "0.1.1"
 description = "КриптоЛайт — приложение для подписания и шифрования файлов"
 authors = ["CryptoLite contributors"]
 edition = "2021"
