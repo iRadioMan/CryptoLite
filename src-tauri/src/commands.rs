@@ -80,6 +80,7 @@ pub async fn save_settings(
         || !["cms", "cades-bes", "cades-t"].contains(&settings.default_standard.as_str())
         || !["der", "base64"].contains(&settings.default_encoding.as_str())
         || !["sig", "p7s"].contains(&settings.default_signature_extension.as_str())
+        || !["attached", "detached", "stamp"].contains(&settings.default_signature_type.as_str())
     {
         return Err("Настройки содержат неподдерживаемые значения".to_owned());
     }
@@ -213,6 +214,76 @@ pub async fn sign_files(requests: Vec<SignRequest>) -> Result<Vec<SignBatchItemR
     })
     .await
     .map_err(|error| format!("Не удалось запустить пакетное подписание: {error}"))
+}
+
+#[tauri::command]
+pub async fn remove_temp_pdf(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let candidate = std::path::PathBuf::from(&path);
+        let temp = std::env::temp_dir();
+        let name = candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Удаляется только промежуточный файл партии подписи PDF из системного temp.
+        if candidate.parent() == Some(temp.as_path()) && name.contains(".signing-") {
+            std::fs::remove_file(&candidate)
+                .map_err(|error| format!("Не удалось удалить промежуточный файл: {error}"))
+        } else {
+            Err("Удаление разрешено только для промежуточных файлов подписи".to_owned())
+        }
+    })
+    .await
+    .map_err(|error| format!("Не удалось запустить удаление: {error}"))?
+}
+#[tauri::command]
+pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResult, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::signer::pades::sign_document(
+            &request.input_path,
+            &request.output_path,
+            &request.certificate_id,
+            &request.stamp,
+        )
+    })
+    .await
+    .map_err(|error| format!("Не удалось запустить подпись PDF: {error}"))?
+    .map_err(|error: SignerError| error.to_string())
+}
+
+#[tauri::command]
+pub async fn sign_pdf_prepare(
+    request: crate::signer::PdfSignPrepareRequest,
+) -> Result<crate::signer::PdfSignPrepareResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let prepared = crate::signer::pades::prepare(
+            &request.input_path,
+            &request.certificate_id,
+            &request.stamp,
+        )?;
+        Ok::<_, SignerError>(crate::signer::PdfSignPrepareResult {
+            prepared_path: prepared.path.display().to_string(),
+            signed_bytes: prepared.bytes[..prepared.contents_at].to_vec(),
+            contents_at: prepared.contents_at,
+            page_count: prepared.page_count,
+        })
+    })
+    .await
+    .map_err(|error| format!("Не удалось запустить подготовку поля подписи: {error}"))?
+    .map_err(|error: SignerError| error.to_string())
+}
+
+#[tauri::command]
+pub async fn sign_pdf_finish(
+    request: crate::signer::PdfSignFinishRequest,
+) -> Result<SignResult, String> {
+    tokio::task::spawn_blocking(move || {
+        let prepared = crate::signer::pades::restore(&request.prepared_path)?;
+        crate::signer::pades::finish_signed(&prepared, &request.payload, &request.output_path)
+    })
+    .await
+    .map_err(|error| format!("Не удалось запустить встраивание подписи: {error}"))?
+    .map_err(|error: SignerError| error.to_string())
 }
 
 #[tauri::command]

@@ -13,6 +13,8 @@ pub enum SignerError {
     CertificateStore(String),
     #[error("Не удалось подписать файл: {0}")]
     Signing(String),
+    #[error("Не удалось подписать PDF: {0}")]
+    Pdf(String),
     #[error("Не удалось зашифровать файл: {0}")]
     Encryption(String),
     #[error("Не удалось расшифровать файл: {0}")]

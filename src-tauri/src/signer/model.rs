@@ -22,6 +22,10 @@ pub struct CertInfo {
     pub expired: bool,
     pub has_private_key: bool,
     pub source: String,
+    pub serial_number: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub owner_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +53,72 @@ pub struct SignBatchItemResult {
     pub output_path: String,
     pub success: bool,
     pub error: Option<String>,
+}
+
+/// Параметры визуальной отметки об электронной подписи (ГОСТ Р 7.0.97-2025, п. 5.23).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfStampSpec {
+    /// Номер страницы, считая с нуля.
+    pub page: usize,
+    /// Прямоугольник отметки в миллиметрах от левого верхнего угла отображаемой страницы.
+    pub left_mm: f64,
+    pub top_mm: f64,
+    pub width_mm: f64,
+    pub height_mm: f64,
+    /// Наименование должности; пустая строка скрывает строку.
+    #[serde(default)]
+    pub position: String,
+}
+
+/// Содержимое подписи, которым заполняется зарезервированное `/Contents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignaturePayload {
+    /// CMS CAdES-BES (DER) от подписанного диапазона PDF.
+    pub cms: Vec<u8>,
+    /// Смещение начала `/Contents`: подписываются байты `[0, contents_at)`.
+    pub contents_at: usize,
+}
+
+/// Запрос на подпись PDF с отметкой: один сертификат, один документ.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignRequest {
+    pub input_path: String,
+    pub output_path: String,
+    pub certificate_id: String,
+    pub stamp: PdfStampSpec,
+}
+
+/// Запрос на подготовку поля подписи PDF (нитка «подготовка → подпись → встраивание»).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignPrepareRequest {
+    pub input_path: String,
+    pub certificate_id: String,
+    pub stamp: PdfStampSpec,
+}
+
+/// Подготовленный PDF: что именно нужно подписать CAdES-BES.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignPrepareResult {
+    pub prepared_path: String,
+    /// Байты диапазона PDF (от начала файла до `/Contents`).
+    pub signed_bytes: Vec<u8>,
+    /// Смещение начала `/Contents` в подготовленном файле.
+    pub contents_at: usize,
+    pub page_count: usize,
+}
+
+/// Запрос на встраивание подписи в подготовленный PDF.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignFinishRequest {
+    pub prepared_path: String,
+    pub payload: PdfSignaturePayload,
+    pub output_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +190,8 @@ pub struct AppSettings {
     pub default_standard: String,
     pub default_encoding: String,
     pub default_detached: bool,
+    /// Вид подписи: attached, detached или stamp (встроенная подпись PDF).
+    pub default_signature_type: String,
     pub default_signature_extension: String,
     pub default_certificate_ids: Vec<String>,
     pub default_output_directory: String,
@@ -136,6 +208,7 @@ impl Default for AppSettings {
             default_standard: "cms".to_owned(),
             default_encoding: "der".to_owned(),
             default_detached: true,
+            default_signature_type: "detached".to_owned(),
             default_signature_extension: "sig".to_owned(),
             default_certificate_ids: Vec::new(),
             default_output_directory: String::new(),

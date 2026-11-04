@@ -220,6 +220,47 @@ mod ffi {
         Err("Выбранный сертификат не найден в CAdESCOM CurrentUser store; проверьте установку CryptoPro ЭЦП SDK.".to_owned())
     }
 
+    /// Хэш-алгоритм CAdESCOM (`CADESCOM_HASH_ALGORITHM`) по ключу сертификата.
+    ///
+    /// В числовых значениях перечисления Стрибог-2012-256 = 1, Стрибог-2012-512 = 2
+    /// (как CAPICOM_HASH_ALGORITHM_CP_GOST_3411), остальные имена — строковые константы.
+    /// CAdESCOM_HASH_ALGORITHM_CP_GOST_3411_2012_256, как его понимает CAdESCOM 2.x.
+    const HASH_GOST_2012_256: i32 = 4;
+    /// Длина 64 байта (Стрибог-512) подписывается тем же алгоритмом по ключу.
+    const HASH_GOST_2012_512: i32 = 4;
+    /// Полные имена перечислений CAdESCOM: в старых сборках отличаются от CAPICOM.
+    const CADESCOM_HASH_ALGORITHM_CP_GOST_3411_2012_256: i32 = 0x0000_0013;
+    const CAPICOM_HASH_ALGORITHM_SHA1: i32 = 0;
+    const HASH_SHA256: i32 = 0;
+
+    fn hash_algorithm_for_certificate(certificate: &IDispatch) -> Result<i32, String> {
+        // CAdESCOM возвращает OID строкой BSTR; при недоступности свойства алгоритм
+        // определяется по OID выбранного сертификата.
+        let algorithm = get(certificate, "PublicKey")
+            .and_then(|value| {
+                let object = as_dispatch(&value)?;
+                as_string(&get(&object, "Algorithm")?)
+            })
+            .map_err(|error| format!("OID открытого ключа: {error}"))?;
+        match algorithm.as_str() {
+            "1.2.643.7.1.1.1.1" => Ok(HASH_GOST_2012_256),
+            "1.2.643.7.1.1.1.2" => Ok(HASH_GOST_2012_512),
+            // ГОСТ Р 34.10-2001: тот же 256-битный Стрибог, что и у ГОСТ 2012-256.
+            "1.2.643.2.2.19" => Ok(HASH_GOST_2012_256),
+            other => Err(format!(
+                "алгоритм открытого ключа {other} не поддерживается для встроенной подписи PDF"
+            )),
+        }
+    }
+
+    fn content_hex(value: &VARIANT) -> Result<String, String> {
+        if value.vt() != VT_BSTR {
+            return Err("CAdESCOM вернул неожиданный тип хэш-значения".to_owned());
+        }
+        let bstr = unsafe { ManuallyDrop::clone(&value.Anonymous.Anonymous.Anonymous.bstrVal) };
+        Ok(String::from_utf16_lossy(&bstr))
+    }
+
     fn reverse_hex_bytes(hex: &str) -> String {
         let mut bytes = hex
             .as_bytes()
@@ -360,6 +401,26 @@ mod ffi {
             return Err("CAdESCOM вернул Base64 подпись с неверной длиной".to_owned());
         }
         Ok(output)
+    }
+
+    // ---------------------------------------------------------------- подпись диапазона PDF
+    //
+    // CAdESCOM подписывает данные по принципу «хэш → подпись» и не принимает готовое
+    // хэш-значение: HashedData в этом компоненте вообще не отдаёт значение хэша
+    // (CAdESCOM.HashedData.Value пуст). Для встроенной подписи PDF, по документации
+    // КриптоПро (пример SimplifiedSignHashCades.cpp), подписывается диапазон файла через
+    // CadesSignHash/CPCryptSignHash: сначала вычисляется хэш диапазона CSP, затем
+    // формируется CMS CAdES-BES по этому хэшу.
+
+    /// Подписывает диапазон PDF: `SignHash` поверх хэша диапазона, CMS CAdES-BES (DER).
+    ///
+    /// Используется та же схема, что и в `CryptSignMessage`: сертификат → контейнер → ключ,
+    /// затем подпись готового хэша диапазона. Хэш диапазона вычисляет CSP по алгоритму ключа.
+    pub(super) fn sign_pdf_range(
+        certificate_id: &str,
+        content: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        crate::signer::csp_native::windows::sign_pdf_range(certificate_id, content)
     }
 }
 

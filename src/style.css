@@ -257,3 +257,34 @@ button:disabled{cursor:not-allowed}
 
 .default-cert-picker{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border:1px solid #e9ebef;border-radius:8px;background:#fafbfc}.default-cert-summary{display:flex;flex-direction:column;gap:5px;min-width:0;color:#7e8792}.default-cert-summary b{overflow:hidden;color:#303844;text-overflow:ellipsis;white-space:nowrap}.dark .default-cert-picker{background:#20242c;border-color:#373c46}.dark .default-cert-summary b{color:#e2e4e8}.dark .default-cert-summary{color:#a0a6b0}
 
+
+/* Редактор отметок об ЭП в PDF */
+.stamp-modal{width:min(880px,calc(100vw - 60px));max-height:calc(100vh - 60px);display:flex;flex-direction:column;padding:22px;border:1px solid #eaecf0;border-radius:11px;background:#fff;box-shadow:0 18px 50px #11182730}
+.stamp-modal .certificate-footer{margin-top:14px}
+.stamp-note{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:14px;padding:10px 12px;border:1px solid #e3ecfd;border-radius:7px;background:#f5f8ff;color:#5f6b7c;font-size:12px;line-height:1.5}
+.stamp-note b{color:#2f5fc7;font-size:12px}
+.stamp-position{width:220px;margin-left:auto}
+.stamp-position input{height:32px;padding:0 10px;border:1px solid #e5e8ec;border-radius:6px;background:#fff;color:#3e4651;font-size:13px}
+.stamp-editor{display:flex;flex-direction:column;min-height:0;flex:1}
+.stamp-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.stamp-pager{display:flex;align-items:center;gap:8px;color:#7d8590;font-size:12px}
+.stamp-pager .outline-button{width:28px;padding:0}
+.stamp-hint{margin:0;flex:1;color:#8b929d;font-size:12px}
+.stamp-stage{position:relative;overflow:auto;max-height:min(62vh,640px);padding:8px;border:1px solid #eceef1;border-radius:8px;background:#f4f5f7}
+.stamp-canvas{position:relative;margin:0 auto;background:#fff;box-shadow:0 2px 10px #1b233512}
+.stamp-canvas-surface{display:block;cursor:crosshair}
+.stamp-zone{position:absolute;display:flex;align-items:flex-start;justify-content:space-between;border:2px dashed #2f6df1;border-radius:3px;background:#2f6df11a;pointer-events:auto}
+.stamp-zone.draft{border-style:solid;background:#2f6df126;pointer-events:none}
+.stamp-zone-label{max-width:calc(100% - 22px);padding:2px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:3px;background:#2f6df1;color:#fff;font-size:10px}
+.stamp-zone-remove{margin:1px;border:0;border-radius:3px;background:#ffffffdd;color:#c04a37;font-size:14px;line-height:1}
+.stamp-summary{display:flex;justify-content:space-between;margin-top:9px;color:#8f96a1;font-size:11px}
+.stamp-summary .warning,.stamp-warning{color:#c06b4f}
+.stamp-message{display:grid;place-items:center;min-height:220px;color:#8f96a1;font-size:13px}
+.stamp-message.error{color:#c66c58}
+.dark .stamp-modal{background:#22252b;border-color:#3a3e46}
+.dark .stamp-note{background:#232c3d;border-color:#31405a;color:#a9b4c4}
+.dark .stamp-note b{color:#8fb3ff}
+.dark .stamp-position input{background:#20242c;border-color:#373c46;color:#e4e6eb}
+.dark .stamp-stage{background:#1b1e24;border-color:#30353f}
+.dark .stamp-zone{background:#2f6df133}
+.stamp-counter{color:#7d8590;font-size:11px;white-space:nowrap}

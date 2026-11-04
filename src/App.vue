@@ -4,11 +4,14 @@ import { useI18n } from 'vue-i18n';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { readFile } from '@tauri-apps/plugin-fs';
 import logoUrl from './assets/logo.png';
+import StampEditor from './components/StampEditor.vue';
+import { forgetStampRects, type StampRect } from './signing';
 
 type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
-type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
-type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string };
+type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureType: string; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
+type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
 type Doc = { path: string; name: string; selected: boolean };
 type SignBatchItemResult = { inputPath: string; outputPath: string; success: boolean; error: string | null };
 type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string }[]; message: string };
@@ -18,7 +21,7 @@ const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' 
 const page = ref('sign');
 const documents = ref<Doc[]>([]);
 const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, message: t('checkingCsp') });
-const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: '' });
+const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureType: 'detached', defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: '' });
 const settingsLoaded = ref(false);
 const settingsSaveState = ref<'saving' | 'saved' | ''>('');
 const settingsError = ref('');
@@ -56,6 +59,14 @@ const cryptoMessage = ref('');
 const cryptoReportOpen = ref(false);
 const multiCertConfirmMode = ref<'signing' | 'encryption' | null>(null);
 const multiCertConfirmNames = ref<string[]>([]);
+const stampDocumentPath = ref('');
+const stampPdfBase64 = ref('');
+const stampRects = ref<StampRect[]>([]);
+const stampOpen = ref(false);
+const stampLoading = ref(false);
+const stampMessage = ref('');
+const stampPosition = ref('');
+const stampPdfBytes = ref(0);
 let multiCertConfirmResolver: ((confirmed: boolean) => void) | null = null;
 
 function askMultiCertificateConfirmation(mode: 'signing' | 'encryption', ids: string[]): Promise<boolean> {
@@ -81,10 +92,22 @@ const isDark = ref(localStorage.getItem('cryptolite.theme') === 'dark');
 let settingsSaveQueue: Promise<unknown> = Promise.resolve();
 const selectedCount = computed(() => documents.value.filter((document) => document.selected).length);
 const selectedCertificates = computed(() => selectedCertIds.value.map((id) => certificates.value.find((certificate) => certificate.id === id)).filter((certificate): certificate is CertInfo => !!certificate && !certificate.expired));
+const stampSignerLabels = computed<Record<string, string>>(() => Object.fromEntries(
+  selectedCertificates.value.map((certificate) => [certificate.id, certificate.ownerName || certificate.subject]),
+));
+const stampDocument = computed(() => documents.value.find((document) => document.path === stampDocumentPath.value) ?? null);
+const stampReady = computed(() => !!stampDocument
+  && stampRects.value.length === selectedCertificates.value.length
+  && stampRects.value.every((rect) => selectedCertificates.value.filter((certificate) => certificate.id === rect.certificateId).length === 1));
 const defaultCertificateNames = computed(() => certificates.value.filter((certificate) => appSettings.value.defaultCertificateIds.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
 const canSign = computed(() => {
   if (!status.value.available || !selectedCount.value || signingInProgress.value) return false;
   if (!selectedCertificates.value.length) return false;
+  if (stampMode.value) {
+    // Встроенная подпись PDF: CAdES-BES, один документ, по области на каждого подписанта.
+    const pdfDocuments = documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name));
+    return status.value.cadesAvailable && pdfDocuments.length === 1;
+  }
   if (standard.value === 'cades-bes') return status.value.cadesAvailable && selectedCertIds.value.length === 1;
   if (standard.value === 'cms') return status.value.signingAvailable;
   return false;
@@ -148,6 +171,7 @@ watch([standard, encoding, signatureType, fileType, outputDir], () => {
     appSettings.value.defaultStandard = standard.value;
     appSettings.value.defaultEncoding = encoding.value;
     appSettings.value.defaultDetached = signatureType.value === 'detached';
+    appSettings.value.defaultSignatureType = signatureType.value;
     appSettings.value.defaultSignatureExtension = fileType.value;
     appSettings.value.defaultOutputDirectory = outputDir.value;
   } else scheduleSettingsSave();
@@ -182,7 +206,8 @@ async function initializeSettings() {
 function applySettings() {
   standard.value = appSettings.value.defaultStandard;
   encoding.value = appSettings.value.defaultEncoding;
-  signatureType.value = appSettings.value.defaultDetached ? 'detached' : 'attached';
+  signatureType.value = appSettings.value.defaultSignatureType
+    || (appSettings.value.defaultDetached ? 'detached' : 'attached');
   fileType.value = appSettings.value.defaultSignatureExtension;
   outputDir.value = appSettings.value.defaultOutputDirectory;
   selectedCertIds.value = [...appSettings.value.defaultCertificateIds];
@@ -302,8 +327,119 @@ function confirmCertificates() {
   if (certPickerMode.value === 'signing') certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject);
   certPickerOpen.value = false;
 }
+function parseDroppedBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+async function openStampEditor(file: Doc) {
+  stampDocumentPath.value = file.path;
+  stampPdfBase64.value = '';
+  stampPdfBytes.value = 0;
+  stampRects.value = [];
+  stampOpen.value = true;
+  stampLoading.value = true;
+  stampMessage.value = '';
+  try {
+    const contents = await readFile(file.path);
+    stampPdfBytes.value = contents.byteLength;
+    let binary = '';
+    const chunk = 0x8000;
+    for (let offset = 0; offset < contents.length; offset += chunk) {
+      binary += String.fromCharCode(...contents.subarray(offset, offset + chunk));
+    }
+    stampPdfBase64.value = btoa(binary);
+    // Разметка прошлого открытия не переносится: области всегда рисуются заново.
+    forgetStampRects(file.path, contents.byteLength);
+    stampRects.value = [];
+  } catch (error) {
+    stampMessage.value = String(error);
+  } finally {
+    stampLoading.value = false;
+  }
+}
+
+/** Signing order: certificates in display order, each with its own rectangle. */
+function stampOrder(): { certificateId: string; rect: StampRect }[] {
+  return selectedCertificates.value.flatMap((certificate) => {
+    const rect = stampRects.value.find((entry) => entry.certificateId === certificate.id);
+    return rect ? [{ certificateId: certificate.id, rect }] : [];
+  });
+}
+
+async function signStampDocument() {
+  const source = stampDocument.value;
+  if (!source || !stampReady.value || signingInProgress.value) return;
+  const separator = Math.max(source.path.lastIndexOf('/'), source.path.lastIndexOf('\\'));
+  const folder = outputDir.value || source.path.slice(0, separator);
+  const slash = source.path.includes('\\') ? '\\' : '/';
+  const baseName = source.name.replace(/\.pdf$/i, '');
+  signingInProgress.value = true;
+  signingMessage.value = '';
+  signReportItems.value = [];
+  let currentInput = source.path;
+  let output = '';
+  let succeeded = true;
+  try {
+    for (const [index, item] of stampOrder().entries()) {
+      const isLast = index === stampOrder().length - 1;
+      const targetName = isLast ? `${baseName}_signed.pdf` : `${baseName}.signing-${index + 1}.pdf`;
+      output = `${folder ? `${folder}${slash}` : ''}${targetName}`;
+      const result = await invoke<CryptoResult>('sign_pdf', {
+        request: {
+          inputPath: currentInput,
+          outputPath: output,
+          certificateId: item.certificateId,
+          stamp: {
+            page: item.rect.page,
+            leftMm: item.rect.leftMm,
+            topMm: item.rect.topMm,
+            widthMm: item.rect.widthMm,
+            heightMm: item.rect.heightMm,
+            position: stampPosition.value,
+          },
+        },
+      });
+      if (!isLast) {
+        // Промежуточный файл нужен только для следующего подписанта.
+        const previous = currentInput === source.path ? null : currentInput;
+        if (previous) {
+          try { await invoke('remove_temp_pdf', { path: previous }); } catch { /* не критично */ }
+        }
+      }
+      currentInput = result.outputPath;
+    }
+    signReportItems.value = [{ inputPath: source.path, outputPath: output, success: true, error: null }];
+  } catch (error) {
+    succeeded = false;
+    signReportItems.value = [{ inputPath: source.path, outputPath: output, success: false, error: String(error) }];
+  } finally {
+    if (!succeeded) signingMessage.value = '';
+    stampOpen.value = false;
+    signReportOpen.value = true;
+    signingInProgress.value = false;
+  }
+}
+
+/** Режим «Штамп на PDF»: подписывается один выбранный PDF, область отмечается в предпросмотре. */
+const stampMode = computed(() => signatureType.value === 'stamp');
+const stampDocuments = computed(() => documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name)));
+
+async function startStampSigning() {
+  if (!stampMode.value || !selectedCertIds.value.length || signingInProgress.value) return;
+  const candidates = stampDocuments.value;
+  if (!candidates.length) { signingMessage.value = t('signPage.stampOnlyPdf'); return; }
+  if (candidates.length > 1) { signingMessage.value = t('signPage.stampSingleDoc'); return; }
+  // Стандарт для встроенной подписи PDF всегда CAdES-BES — отдельного пункта в интерфейсе нет.
+  standard.value = 'cades-bes';
+  await openStampEditor(candidates[0]);
+}
+
 async function signSelectedDocument() {
   const selected = documents.value.filter((document) => document.selected);
+  if (stampMode.value) { await startStampSigning(); return; }
   if (!canSign.value || !selected.length || !selectedCertIds.value.length || signingInProgress.value) return;
   if (!(await askMultiCertificateConfirmation('signing', selectedCertIds.value))) return;
   const requests = selected.map((document) => {
@@ -434,16 +570,17 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
       <section v-if="page==='sign'" class="content-view">
         <div class="page-heading"><div><div class="eyebrow">{{ t('signPage.eyebrow') }}</div><h1>{{ t('nav.sign') }}</h1><p>{{ t('signPage.description') }}</p></div></div>
         <section class="settings-card"><div class="card-heading"><div><h2>{{ t('signPage.paramsTitle') }}</h2><p>{{ t('signPage.paramsHelp') }}</p></div></div>
-          <div class="form-grid"><label class="field"><span>{{ t('standard') }}</span><select v-model="standard"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option><option value="cms">CMS / PKCS#7</option></select></label><label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label><label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option></select></label><label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label></div>
+          <div class="form-grid"><label class="field"><span>{{ t('standard') }}</span><select v-model="standard"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option><option value="cms">CMS / PKCS#7</option></select></label><label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label><label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label><label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label></div>
+          <div v-if="stampMode" class="stamp-note"><b>{{ t('signPage.stampNoteTitle') }}</b><span>{{ t('signPage.stampNote') }}</span><label class="field stamp-position"><span>{{ t('signPage.stampPosition') }}</span><input v-model="stampPosition" :placeholder="t('signPage.stampPositionPlaceholder')" maxlength="60"/></label></div>
           <div class="field-row"><label class="field wide-field"><span>{{ t('certificates') }}</span><button class="picker-button" @click="openCertificatePicker('signing')"><span class="picker-leading">📜</span><span class="picker-copy"><b>{{ certificateNames.length ? certificateNames.join(', ') : t('signPage.selectCerts') }}</b><small>{{ t('signPage.windowsPersonalStore') }}</small></span><span class="picker-trailing">></span></button></label><label class="field wide-field"><span>{{ t('output') }}</span><button class="picker-button" @click="chooseOutput"><span class="picker-leading">📁</span><span class="picker-copy"><b>{{ outputDir || t('signPage.sourceFolder') }}</b><small>{{ t('signPage.changeForList') }}</small></span><span class="picker-trailing">↗</span></button></label></div>
         </section>
 
         <section class="documents-card"><div class="card-heading doc-heading"><div><div class="title-line"><h2>{{ t('signPage.docsTitle') }}</h2><span class="count-chip">{{ documents.length }}</span></div><p>{{ t('signPage.docsHelp') }}</p></div></div>
           <div v-if="!documents.length" class="drop-zone" @click="chooseFiles"><div class="upload-icon"><span>📤</span></div><b>{{ t('drop') }}</b><p>{{ t('dropHint') }}</p><button class="browse-button">{{ t('signPage.chooseFiles') }} <span>↗</span></button><small>{{ t('signPage.supportedFormats') }}</small></div>
-          <div v-else class="document-list"><article v-for="(doc,index) in documents" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">{{ t('signPage.readyToSign') }}</span><button class="remove-button" @click="documents.splice(index,1)">×</button></article><button class="add-more" @click="chooseFiles">{{ t('signPage.addMoreDocs') }}</button></div>
+          <div v-else class="document-list"><article v-for="(doc,index) in documents" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">{{ t('signPage.readyToSign') }}</span><button class="remove-button" @click="documents.splice(index,1)">&times;</button></article><button class="add-more" @click="chooseFiles">{{ t('signPage.addMoreDocs') }}</button></div>
           <div class="documents-footer"><span>{{ t('signPage.selectedOf') }} <b>{{ selectedCount }}</b> {{ t('signPage.ofDocs') }} {{ documents.length }} {{ t('signPage.documents') }}</span></div>
         </section>
-        <footer class="action-bar"><button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):standard==='cades-t'?t('signPage.cadesNotConnected'):standard==='cades-bes'&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):selectedCertIds.length===0?t('signPage.chooseCerts'):standard==='cades-bes'&&selectedCertIds.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument"><span>✳</span> {{ signingInProgress ? t('signPage.signingInProgress') : t('sign') }} <span class="button-arrow">→</span></button></footer>
+        <footer class="action-bar"><button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'?t('signPage.cadesNotConnected'):standard==='cades-bes'&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):selectedCertIds.length===0?t('signPage.chooseCerts'):standard==='cades-bes'&&!stampMode&&selectedCertIds.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument"><span>✳</span> {{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }} <span class="button-arrow">→</span></button></footer>
       </section>
 
       <section v-else-if="page==='verify'" class="content-view verify-view">
@@ -466,7 +603,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
         <section class="documents-card"><div class="card-heading doc-heading"><div><div class="title-line"><h2>{{ cryptoMode==='encrypt'?t('encryptPage.filesEncrypt'):t('encryptPage.filesDecrypt') }}</h2><span class="count-chip">{{ cryptoFiles.length }}</span></div><p>{{ t('encryptPage.filesHelp') }}</p></div></div>
           <div v-if="!cryptoFiles.length" class="drop-zone" @click="chooseCryptoFiles"><div class="upload-icon"><span>📤</span></div><b>{{ cryptoMode==='encrypt'?t('encryptPage.dropEncrypt'):t('encryptPage.dropDecrypt') }}</b><p>{{ t('encryptPage.orChoose') }}</p><button class="browse-button">{{ t('encryptPage.chooseFiles') }} <span>↗</span></button><small v-if="cryptoMode==='encrypt'">{{ t('encryptPage.encryptToEnc') }}</small><small v-else>{{ t('encryptPage.decryptSupported') }}</small></div>
-          <div v-else class="document-list"><article v-for="(doc,index) in cryptoFiles" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">{{ cryptoMode==='encrypt'?t('encryptPage.readyEncrypt'):t('encryptPage.readyDecrypt') }}</span><button class="remove-button" @click="cryptoFiles.splice(index,1)">×</button></article><button class="add-more" @click="chooseCryptoFiles">{{ t('encryptPage.addMore') }}</button></div>
+          <div v-else class="document-list"><article v-for="(doc,index) in cryptoFiles" :key="doc.path" class="document-row"><input v-model="doc.selected" type="checkbox"/><div class="file-icon">{{ doc.name.split('.').pop()?.slice(0,3).toUpperCase() }}</div><div class="file-info"><b>{{ doc.name }}</b><small>{{ doc.path }}</small></div><span class="file-ready">{{ cryptoMode==='encrypt'?t('encryptPage.readyEncrypt'):t('encryptPage.readyDecrypt') }}</span><button class="remove-button" @click="cryptoFiles.splice(index,1)">&times;</button></article><button class="add-more" @click="chooseCryptoFiles">{{ t('encryptPage.addMore') }}</button></div>
           <div class="documents-footer"><span>{{ t('encryptPage.selectedOf') }} <b>{{ cryptoSelectedCount }}</b> {{ t('encryptPage.ofFiles') }} {{ cryptoFiles.length }} {{ t('encryptPage.files') }}</span></div>
         </section>
         <footer class="action-bar"><button class="sign-button" :disabled="cryptoMode==='encrypt'? !canEncrypt : !canDecrypt" :title="!status.available?t('unavailable'):cryptoMode==='encrypt'&&cryptoSelectedCount===0?t('encryptPage.chooseFilesBtn'):cryptoMode==='encrypt'&&!cryptoRecipientIds.length?t('encryptPage.chooseRecipientsBtn'):''" @click="runCrypto"><span>◇</span> {{ cryptoProgress ? (cryptoMode==='encrypt'?t('encryptPage.encrypting'):t('encryptPage.decrypting')) : (cryptoMode==='encrypt'?t('encryptPage.encrypt'):t('encryptPage.decrypt')) }} <span class="button-arrow">→</span></button></footer>
@@ -489,6 +626,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else class="placeholder-view"><div class="placeholder-icon">◇</div><div class="eyebrow">CRYPTOLITE · 0.1.1</div><h1>{{ t(`nav.${page}`) }}</h1><p>{{ t('placeholder.description') }}</p><button class="outline-button" @click="page='sign'">{{ t('placeholder.goSign') }}</button></section>
     </main>
+    <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal"><header class="certificate-header"><div><div class="eyebrow">CRYPTOLITE · PAdES</div><h2>{{ t('stampEditor.title') }}</h2><p>{{ t('stampEditor.help') }}</p></div><button class="modal-close" @click="stampOpen=false">×</button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
     <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal"><div class="alert-icon">?</div><h2>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="sign-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button primary-dark" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal"><div class="alert-icon">!</div><h2>{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
     <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal"><header class="certificate-header"><div><h2>{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2><p>{{ t('certPicker.listRefresh') }}</p></div><button class="modal-close" @click="certPickerOpen=false">×</button></header><label class="certificate-search"><span>⌕</span><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon">📜</div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired"/><div class="certificate-avatar">👤</div><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }} · {{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.select') }}</button></div></footer></section></div>

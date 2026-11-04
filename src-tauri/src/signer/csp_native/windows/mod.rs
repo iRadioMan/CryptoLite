@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+pub mod digest;
+
 #[allow(unsafe_code)]
 mod ffi {
     use std::ffi::CStr;
@@ -9,6 +11,73 @@ mod ffi {
         CryptAcquireContextW, CryptGetProvParam, CryptReleaseContext, CRYPT_VERIFYCONTEXT,
     };
 
+    /// CALG_GR3411_2012_256 (0x800C), см. документацию КриптоПро по хэш-алгоритмам CSP.
+    const HASH_ALG_GOST_2012_256: u32 = 0x0000_800C;
+    /// CALG_GR3411_2012_512 (0x800D).
+    const HASH_ALG_GOST_2012_512: u32 = 0x0000_800D;
+
+    /// OID алгоритмов дайджеста, которые встречаются в сертификатах ГОСТ.
+    const DIGEST_OID_GOST_2012_256: &[u8] = b"1.2.643.7.1.1.2.2\0";
+    const DIGEST_OID_GOST_2012_512: &[u8] = b"1.2.643.7.1.1.2.3\0";
+    const DIGEST_OID_GOST_2001: &[u8] = b"1.2.643.2.2.9\0";
+    const DIGEST_OID_SHA_256: &[u8] = b"2.16.840.1.101.3.4.2.1\0";
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        /// `CryptSetHashParam` отсутствует в windows-sys: объявляем подпись из advapi32.
+        fn CryptSetHashParam(
+            h_hash: usize,
+            dw_param: u32,
+            pb_data: *const u8,
+            dw_flags: u32,
+        ) -> i32;
+    }
+
+    /// OID алгоритма дайджеста для подписи по ключу ГОСТ 2012-512 и CALG Стрибог-2012-512.
+    ///
+    /// Остальные ГОСТ-ключи подписываются Стрибогом-2012-256 (`CALG_GR3411_2012_256`).
+    /// ГОСТ Р 34.10-2012 подписывает хэш той же длины, что и ключ, поэтому 512-битный ключ
+    /// не подписывается усечённым Стрибогом-256.
+    fn hash_algorithm_for_certificate(
+        context: *const CERT_CONTEXT,
+    ) -> Result<(u32, &'static [u8]), crate::signer::SignerError> {
+        let hash_oid = hash_oid_for_certificate(context)?;
+        let algorithm = if hash_oid == DIGEST_OID_GOST_2012_512 {
+            HASH_ALG_GOST_2012_512
+        } else {
+            HASH_ALG_GOST_2012_256
+        };
+        Ok((algorithm, digest_oid_constant(&hash_oid)?))
+    }
+
+    /// Статический OID по значению из сертификата: `pszObjId` живёт вместе с контекстом
+    /// сертификата, а OID нужен в CMS до закрытия контекста — поэтому берётся константа.
+    fn digest_oid_constant(hash_oid: &[u8]) -> Result<&'static [u8], crate::signer::SignerError> {
+        if hash_oid == DIGEST_OID_GOST_2012_256 {
+            Ok(DIGEST_OID_GOST_2012_256)
+        } else if hash_oid == DIGEST_OID_GOST_2012_512 {
+            Ok(DIGEST_OID_GOST_2012_512)
+        } else if hash_oid == DIGEST_OID_GOST_2001 {
+            Ok(DIGEST_OID_GOST_2001)
+        } else {
+            Err(crate::signer::SignerError::Signing(
+                "неизвестный OID алгоритма хэша сертификата".to_owned(),
+            ))
+        }
+    }
+
+    /// OID содержимого `id-data`, которым помечен подписанный диапазон PDF.
+    ///
+    /// Без явного `ContentType` Windows кодирует PKCS#7 v1.5 и не пишет
+    /// `contentType`/`messageDigest` в подписанные атрибуты. Такая подпись технически
+    /// проходит проверку, но это не CAdES-BES и не PAdES: КриптоПро PDF, Acrobat и
+    /// КриптоАРМ требуют CMS v3 с подписанными атрибутами (см. `/SubFilter adbe.pkcs7.detached`
+    /// в эталонном файле: подпись начинается с `1.2.840.113549.1.7.2`, signerInfo v3).
+    fn id_data_content_type() -> Vec<u8> {
+        b"1.2.840.113549.1.7.1\0".to_vec()
+    }
+
+    /// Подпись диапазона PDF и подпись готового хэша (структура из cades.h).
     pub(super) struct ProviderContext(usize);
 
     pub(super) fn acquire_provider(provider_type: u32) -> Result<ProviderContext, u32> {
@@ -58,7 +127,8 @@ mod ffi {
         CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChain,
         CertFreeCertificateContext, CertGetCertificateChain, CertGetCertificateContextProperty,
         CertGetNameStringW, CertOpenSystemStoreW, CertVerifyCertificateChainPolicy,
-        CryptDecryptMessage, CryptDestroyKey, CryptEncryptMessage, CryptGetUserKey, CryptMsgClose,
+        CryptCreateHash, CryptDecryptMessage, CryptDestroyHash, CryptDestroyKey,
+        CryptEncryptMessage, CryptGetHashParam, CryptGetUserKey, CryptHashData, CryptMsgClose,
         CryptMsgGetParam, CryptMsgOpenToEncode, CryptMsgUpdate,
         CryptVerifyDetachedMessageSignature, CryptVerifyMessageSignature, AT_KEYEXCHANGE,
         AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
@@ -68,7 +138,7 @@ mod ffi {
         CMSG_SIGNED_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO_0,
         CRYPT_ALGORITHM_IDENTIFIER, CRYPT_DECRYPT_MESSAGE_PARA, CRYPT_ENCRYPT_MESSAGE_PARA,
         CRYPT_INTEGER_BLOB, CRYPT_KEY_PROV_INFO, CRYPT_VERIFY_MESSAGE_PARA, HCERTSTORE,
-        PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+        HP_HASHSIZE, HP_HASHVAL, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
 
     pub(super) struct CertificateStore(HCERTSTORE);
@@ -95,6 +165,292 @@ mod ffi {
         }
     }
 
+    pub(super) fn sign_pdf_range(
+        certificate_id: &str,
+        content: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let store = unsafe { open_personal_store() }.ok_or_else(|| {
+            let code = unsafe { GetLastError() };
+            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+        })?;
+        let certificate = find_certificate(&store, certificate_id)?;
+        let provider = provider_for_certificate(certificate.as_ptr(), AT_SIGNATURE)?;
+        // Ключ контейнера может быть только AT_KEYEXCHANGE (токены), поэтому спецификация
+        // определяется по фактическим ключам, как в CMS-пути.
+        let key_spec = signing_key_spec(provider.0)?;
+        // Хэш диапазона и SignerInfo должны использовать один алгоритм: Стрибог-2012-256
+        // или Стрибог-2012-512 — в зависимости от ключа сертификата.
+        let (hash_algorithm, hash_oid) = hash_algorithm_for_certificate(certificate.as_ptr())?;
+        let digest = crypto_hash(provider.0, hash_algorithm, hash_oid, content)?;
+        // CMS строится по готовому хэшу: SignHash формирует SignerInfo без содержимого.
+        let cms = sign_digest(
+            &certificate,
+            provider,
+            key_spec,
+            hash_algorithm,
+            hash_oid,
+            &digest,
+        )?;
+        Ok(cms)
+    }
+
+    /// Открывает контейнер закрытого ключа сертификата (BLOB KEY_PROV_INFO → CryptAcquireContext).
+    ///
+    /// `key_spec` — предпочтительная спецификация ключа; подпись выбирает фактическую через
+    /// [`signing_key_spec`], потому что в токенах доступен не любой ключ контейнера.
+    fn provider_for_certificate(
+        context: *const CERT_CONTEXT,
+        _key_spec: u32,
+    ) -> Result<ProviderContext, crate::signer::SignerError> {
+        let mut key_info_len = 0u32;
+        let ok = unsafe {
+            CertGetCertificateContextProperty(
+                context,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                ptr::null_mut(),
+                &mut key_info_len,
+            )
+        };
+        if ok == 0 || key_info_len == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "у сертификата подписанта нет сведений о закрытом ключе (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let mut key_info_bytes = vec![0u8; key_info_len as usize];
+        let ok = unsafe {
+            CertGetCertificateContextProperty(
+                context,
+                CERT_KEY_PROV_INFO_PROP_ID,
+                key_info_bytes.as_mut_ptr() as *mut c_void,
+                &mut key_info_len,
+            )
+        };
+        if ok == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось прочитать сведения о закрытом ключе (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let key_info = key_info_bytes.as_ptr() as *const CRYPT_KEY_PROV_INFO;
+        let mut provider = 0usize;
+        let acquired = unsafe {
+            CryptAcquireContextW(
+                &mut provider,
+                (*key_info).pwszContainerName,
+                (*key_info).pwszProvName,
+                (*key_info).dwProvType,
+                0,
+            )
+        };
+        if acquired == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось открыть контейнер закрытого ключа подписанта (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let provider = ProviderContext(provider);
+        Ok(provider)
+    }
+
+    /// Хэш диапазона PDF алгоритмом CSP (Стрибог-2012-256/512).
+    fn crypto_hash(
+        provider: usize,
+        hash_algorithm: u32,
+        hash_oid: &[u8],
+        content: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let mut hash = 0usize;
+        let created = unsafe { CryptCreateHash(provider, hash_algorithm, 0, 0, &mut hash) };
+        if created == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось создать объект хэширования CSP (OID {}) (код Windows 0x{:08X})",
+                String::from_utf8_lossy(&hash_oid[..hash_oid.len().saturating_sub(1)]),
+                unsafe { GetLastError() }
+            )));
+        }
+        let length = u32::try_from(content.len()).map_err(|_| {
+            crate::signer::SignerError::Signing("диапазон PDF превышает лимит CryptoAPI".to_owned())
+        })?;
+        let updated = unsafe { CryptHashData(hash, content.as_ptr(), length, 0) };
+        if updated == 0 {
+            unsafe { CryptDestroyHash(hash) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось вычислить хэш диапазона PDF (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let mut digest_len = 0u32;
+        let mut size_of_len = 4u32;
+        let got_size = unsafe {
+            CryptGetHashParam(
+                hash,
+                HP_HASHSIZE,
+                &mut digest_len as *mut u32 as *mut u8,
+                &mut size_of_len,
+                0,
+            )
+        };
+        if got_size == 0 || digest_len == 0 {
+            unsafe { CryptDestroyHash(hash) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось определить размер хэша диапазона PDF (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let mut digest = vec![0u8; digest_len as usize];
+        let mut got_digest = digest_len;
+        let got_value =
+            unsafe { CryptGetHashParam(hash, HP_HASHVAL, digest.as_mut_ptr(), &mut got_digest, 0) };
+        unsafe { CryptDestroyHash(hash) };
+        if got_value == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось получить хэш диапазона PDF (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        digest.truncate(got_digest as usize);
+        Ok(digest)
+    }
+
+    /// CMS CAdES-BES по готовому хэшу: `SignHash` со SignerInfo без содержимого.
+    ///
+    /// `/SubFilter adbe.pkcs7.detached` подразумевает CMS v3: `contentType` = `id-data` и
+    /// подписанный атрибут `messageDigest` с хэшем диапазона. Windows добавляет эти атрибуты
+    /// только когда тип содержимого задан явно (`id-data`); иначе получается PKCS#7 v1.5
+    /// без подписанных атрибутов, который КриптоПро PDF и Acrobat не принимают за PAdES/CAdES.
+    fn sign_digest(
+        certificate: &CertificateContext,
+        provider: ProviderContext,
+        key_spec: u32,
+        hash_algorithm: u32,
+        hash_oid: &[u8],
+        digest: &[u8],
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let context = certificate.as_ptr();
+        let cert_info = unsafe { context.as_ref() }
+            .and_then(|ctx| unsafe { ctx.pCertInfo.as_ref() })
+            .ok_or_else(|| {
+                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+            })?;
+        let cert_context = unsafe { context.as_ref() }.ok_or_else(|| {
+            crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+        })?;
+        let cert_blob = CRYPT_INTEGER_BLOB {
+            cbData: cert_context.cbCertEncoded,
+            pbData: cert_context.pbCertEncoded,
+        };
+        // Состояние хэша берётся из CSP: SignHash подписывает HP_HASHVAL.
+        let mut hash = 0usize;
+        let created = unsafe { CryptCreateHash(provider.0, hash_algorithm, 0, 0, &mut hash) };
+        if created == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось создать объект хэширования для подписи (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let set = unsafe { CryptSetHashParam(hash, HP_HASHVAL, digest.as_ptr(), 0) };
+        if set == 0 {
+            unsafe { CryptDestroyHash(hash) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось задать хэш диапазона PDF (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let signer_info = CMSG_SIGNER_ENCODE_INFO {
+            cbSize: std::mem::size_of::<CMSG_SIGNER_ENCODE_INFO>() as u32,
+            pCertInfo: cert_info as *const CERT_INFO as *mut CERT_INFO,
+            Anonymous: CMSG_SIGNER_ENCODE_INFO_0 {
+                hCryptProv: provider.0,
+            },
+            dwKeySpec: key_spec,
+            HashAlgorithm: CRYPT_ALGORITHM_IDENTIFIER {
+                pszObjId: hash_oid.as_ptr() as *mut u8,
+                ..Default::default()
+            },
+            pvHashAuxInfo: ptr::null_mut(),
+            cAuthAttr: 0,
+            rgAuthAttr: ptr::null_mut(),
+            cUnauthAttr: 0,
+            rgUnauthAttr: ptr::null_mut(),
+        };
+        let mut signer_infos = [signer_info];
+        let mut cert_blobs = [cert_blob];
+        let signed = CMSG_SIGNED_ENCODE_INFO {
+            cbSize: std::mem::size_of::<CMSG_SIGNED_ENCODE_INFO>() as u32,
+            cSigners: 1,
+            rgSigners: signer_infos.as_mut_ptr(),
+            cCertEncoded: 1,
+            rgCertEncoded: cert_blobs.as_mut_ptr(),
+            cCrlEncoded: 0,
+            rgCrlEncoded: ptr::null_mut(),
+        };
+        let mut content_type = id_data_content_type();
+        let content_oid = content_type.as_mut_ptr();
+        let message = unsafe {
+            CryptMsgOpenToEncode(
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                CMSG_DETACHED_FLAG,
+                CMSG_SIGNED,
+                &signed as *const CMSG_SIGNED_ENCODE_INFO as *const c_void,
+                content_oid as *const u8,
+                ptr::null(),
+            )
+        };
+        if message.is_null() {
+            unsafe { CryptDestroyHash(hash) };
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось открыть CMS для подписи хэша (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let _ = unsafe { CryptMsgUpdate(message, ptr::null(), 0, 1) };
+        let mut encoded_len = 0u32;
+        let sized = unsafe {
+            CryptMsgGetParam(
+                message,
+                CMSG_CONTENT_PARAM,
+                0,
+                ptr::null_mut(),
+                &mut encoded_len,
+            )
+        };
+        if sized == 0 || encoded_len == 0 {
+            unsafe {
+                CryptMsgClose(message);
+                CryptDestroyHash(hash);
+            }
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось получить CMS по хэшу (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        let mut encoded = vec![0u8; encoded_len as usize];
+        let got = unsafe {
+            CryptMsgGetParam(
+                message,
+                CMSG_CONTENT_PARAM,
+                0,
+                encoded.as_mut_ptr() as *mut c_void,
+                &mut encoded_len,
+            )
+        };
+        unsafe {
+            CryptMsgClose(message);
+            CryptDestroyHash(hash);
+        }
+        if got == 0 {
+            return Err(crate::signer::SignerError::Signing(format!(
+                "не удалось получить закодированную CMS (код Windows 0x{:08X})",
+                unsafe { GetLastError() }
+            )));
+        }
+        encoded.truncate(encoded_len as usize);
+        Ok(encoded)
+    }
+
+    pub(super) fn sha256_unused() {}
+
     unsafe fn open_personal_store() -> Option<CertificateStore> {
         let name: Vec<u16> = "MY\0".encode_utf16().collect();
         let store = CertOpenSystemStoreW(0, name.as_ptr());
@@ -106,6 +462,32 @@ mod ffi {
         previous: *const CERT_CONTEXT,
     ) -> *mut CERT_CONTEXT {
         CertEnumCertificatesInStore(store.0, previous)
+    }
+
+    /// `CryptGetUserKey` по спецификации и проверка, что ключ действительно лежит в этом
+    /// контейнере. Возвращает false, если ключа нет (например, в токене доступен только один).
+    fn container_has_key(provider: usize, key_spec: u32) -> bool {
+        let mut key = 0usize;
+        if unsafe { CryptGetUserKey(provider, key_spec, &mut key) } == 0 {
+            return false;
+        }
+        unsafe { CryptDestroyKey(key) };
+        true
+    }
+
+    /// Спецификация ключа для подписи — как в `CryptSignMessage`: сначала `AT_SIGNATURE`,
+    /// затем `AT_KEYEXCHANGE`.
+    fn signing_key_spec(provider: usize) -> Result<u32, crate::signer::SignerError> {
+        if container_has_key(provider, AT_SIGNATURE) {
+            return Ok(AT_SIGNATURE);
+        }
+        if container_has_key(provider, AT_KEYEXCHANGE) {
+            return Ok(AT_KEYEXCHANGE);
+        }
+        Err(crate::signer::SignerError::Signing(format!(
+            "в контейнере закрытого ключа не найден ни ключ подписи, ни ключ обмена (код Windows 0x{:08X})",
+            unsafe { GetLastError() }
+        )))
     }
 
     unsafe fn read_certificate(context: *const CERT_CONTEXT) -> Option<crate::signer::CertInfo> {
@@ -137,15 +519,36 @@ mod ffi {
                 .collect::<String>()
         };
         let id = format!("{issuer}:{serial_id}");
+        let not_before =
+            super::filetime_to_date(info.NotBefore.dwHighDateTime, info.NotBefore.dwLowDateTime);
+        let not_after =
+            super::filetime_to_date(info.NotAfter.dwHighDateTime, info.NotAfter.dwLowDateTime);
         Some(crate::signer::CertInfo {
             id,
-            subject,
+            subject: subject.clone(),
             issuer,
             expires_at,
             expired,
             has_private_key,
             source: "Windows · Личное хранилище".to_owned(),
+            serial_number: hex_upper(&serial_id),
+            not_before,
+            not_after,
+            owner_name: subject
+                .split(',')
+                .find_map(|part| part.trim().strip_prefix("CN="))
+                .unwrap_or(&subject)
+                .to_owned(),
         })
+    }
+
+    /// Серийный номер в привычной записи — без служебного префикса fallback.
+    fn hex_upper(serial_id: &str) -> String {
+        if serial_id.starts_with("fallback:") {
+            String::new()
+        } else {
+            serial_id.to_owned()
+        }
     }
 
     fn filetime_is_expired(high: u32, low: u32) -> bool {
@@ -453,6 +856,7 @@ mod ffi {
     }
 
     fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>, crate::signer::SignerError> {
+        use base64::Engine as _;
         let compact = bytes
             .iter()
             .copied()
@@ -467,41 +871,13 @@ mod ffi {
         } else {
             compact
         };
-        let mut out = Vec::with_capacity(compact.len() * 3 / 4);
-        let mut chunk = [0u8; 4];
-        let mut used = 0;
-        for byte in compact {
-            chunk[used] = match byte {
-                b'A'..=b'Z' => byte - b'A',
-                b'a'..=b'z' => byte - b'a' + 26,
-                b'0'..=b'9' => byte - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                b'=' => 64,
-                _ => {
-                    return Err(crate::signer::SignerError::Signing(
-                        "файл не является корректной Base64/PEM подписью".to_owned(),
-                    ))
-                }
-            };
-            used += 1;
-            if used == 4 {
-                out.push((chunk[0] << 2) | (chunk[1] >> 4));
-                if chunk[2] != 64 {
-                    out.push((chunk[1] << 4) | (chunk[2] >> 2));
-                }
-                if chunk[3] != 64 {
-                    out.push((chunk[2] << 6) | chunk[3]);
-                }
-                used = 0;
-            }
-        }
-        if used != 0 {
-            return Err(crate::signer::SignerError::Signing(
-                "некорректная длина Base64 подписи".to_owned(),
-            ));
-        }
-        Ok(out)
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .map_err(|_| {
+                crate::signer::SignerError::Signing(
+                    "файл не является корректной Base64/PEM подписью".to_owned(),
+                )
+            })
     }
 
     fn find_certificate(
@@ -539,6 +915,35 @@ mod ffi {
         Some(format!("{issuer}:{serial_id}"))
     }
 
+    fn find_certificate_by_id(
+        store: &CertificateStore,
+        id: &str,
+    ) -> Result<CertificateContext, crate::signer::SignerError> {
+        find_certificate(store, id)
+    }
+
+    pub(super) fn pdf_certificate_public_key_oid(
+        id: &str,
+    ) -> Result<Vec<u8>, crate::signer::SignerError> {
+        let store = unsafe { open_personal_store() }.ok_or_else(|| {
+            let code = unsafe { GetLastError() };
+            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+        })?;
+        let certificate = find_certificate_by_id(&store, id)?;
+        let info = unsafe { certificate.as_ptr().as_ref() }
+            .and_then(|context| unsafe { context.pCertInfo.as_ref() })
+            .ok_or_else(|| {
+                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+            })?;
+        let oid = info.SubjectPublicKeyInfo.Algorithm.pszObjId;
+        if oid.is_null() {
+            return Err(crate::signer::SignerError::Signing(
+                "в сертификате отсутствует OID открытого ключа".to_owned(),
+            ));
+        }
+        Ok(unsafe { CStr::from_ptr(oid.cast()) }.to_bytes().to_vec())
+    }
+
     fn hash_oid_for_certificate(
         context: *const CERT_CONTEXT,
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
@@ -555,9 +960,9 @@ mod ffi {
         }
         let public_key_oid = unsafe { CStr::from_ptr(public_key_oid_ptr.cast()) }.to_bytes();
         let hash_oid: &[u8] = match public_key_oid {
-            b"1.2.643.7.1.1.1.1" => b"1.2.643.7.1.1.2.2\0",
-            b"1.2.643.7.1.1.1.2" => b"1.2.643.7.1.1.2.3\0",
-            b"1.2.643.2.2.19" => b"1.2.643.2.2.9\0",
+            b"1.2.643.7.1.1.1.1" => DIGEST_OID_GOST_2012_256,
+            b"1.2.643.7.1.1.1.2" => DIGEST_OID_GOST_2012_512,
+            b"1.2.643.2.2.19" => DIGEST_OID_GOST_2001,
             _ => {
                 return Err(crate::signer::SignerError::Signing(format!(
                     "алгоритм сертификата пока не поддерживается (OID {})",
@@ -1170,6 +1575,25 @@ pub fn probe() -> crate::signer::CspStatus {
 
 pub fn list_certificates() -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
     ffi::list_personal_certificates()
+}
+
+/// Подпись подписываемого диапазона PDF.
+///
+/// Возвращает CMS CAdES-BES (DER) над байтами диапазона: тот же путь, что описан в
+/// документации КриптоПро для встроенной подписи PDF (`SimplifiedSignHashCades.cpp`):
+/// хэш диапазона вычисляет CSP, затем CMS формируется по этому хэшу.
+pub fn sign_pdf_range(
+    certificate_id: &str,
+    content: &[u8],
+) -> Result<Vec<u8>, crate::signer::SignerError> {
+    ffi::sign_pdf_range(certificate_id, content)
+}
+
+/// OID открытого ключа выбранного сертификата — им выбирается алгоритм хэша для PDF.
+pub fn pdf_certificate_public_key_oid(
+    certificate_id: &str,
+) -> Result<Vec<u8>, crate::signer::SignerError> {
+    ffi::pdf_certificate_public_key_oid(certificate_id)
 }
 
 pub fn sign_file(

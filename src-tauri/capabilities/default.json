@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimal desktop permissions for CryptoLite",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-message", "dialog:allow-save"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-message", "dialog:allow-save", "fs:allow-read-file"]
 }
