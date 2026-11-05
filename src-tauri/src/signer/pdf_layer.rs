@@ -16,6 +16,7 @@
 //! CMS при этом сама помечена как `id-data` и содержит подписанные атрибуты (CMS v3).
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -115,6 +116,7 @@ pub fn prepare(
     let mut allocator = Allocator {
         bytes: &mut bytes,
         next: first,
+        offsets: BTreeMap::new(),
     };
     let font_id = allocator.reserve();
     let font_file_id = allocator.reserve();
@@ -129,8 +131,19 @@ pub fn prepare(
 
     let objects = embed_font::font_objects(&cid_to_code);
     allocator.write(font_file_id, objects.font_file)?;
-    allocator.write(descriptor_id, objects.descriptor)?;
-    allocator.write(cid_font_id, objects.cid_font)?;
+    let mut descriptor = match objects.descriptor {
+        Object::Dictionary(d) => d,
+        _ => Dictionary::new(),
+    };
+    descriptor.set(b"FontFile2".to_vec(), Object::Reference(font_file_id));
+    allocator.write(descriptor_id, Object::Dictionary(descriptor))?;
+
+    let mut cid_font = match objects.cid_font {
+        Object::Dictionary(d) => d,
+        _ => Dictionary::new(),
+    };
+    cid_font.set(b"FontDescriptor".to_vec(), Object::Reference(descriptor_id));
+    allocator.write(cid_font_id, Object::Dictionary(cid_font))?;
     allocator.write(to_unicode_id, objects.to_unicode)?;
     
     let font_dict = match objects.font {
@@ -179,7 +192,7 @@ pub fn prepare(
         ),
         (
             b"SubFilter".to_vec(),
-            Object::Name(b"adbe.pkcs7.detached".to_vec()),
+            Object::Name(b"ETSI.CAdES.detached".to_vec()),
         ),
         // Зарезервировано под CMS фиксированной длины; заполняется после записи файла.
         (
@@ -303,12 +316,11 @@ pub fn prepare(
     let mut trailer = document.trailer.clone();
     trailer.remove(b"Prev");
     trailer.remove(b"XRefStm");
-    trailer.set(b"Size".to_vec(), Object::Integer(i64::from(first) + 10));
-    // Позиция предыдущей таблицы xref для инкрементального обновления
-    let count = allocator.next - first + 1;
+    let size = allocator.next;                       // max_id + 1 по документу
+    let offsets = std::mem::take(&mut allocator.offsets);
     drop(allocator);
     let previous_start = find_previous_xref(&bytes).unwrap_or(0);
-    write_xref(&mut bytes, first, count, &trailer, previous_start)?;
+    write_xref(&mut bytes, &offsets, &trailer, size, previous_start)?;
 
     let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
     let path = staging_path(source);
@@ -339,6 +351,7 @@ fn reserved_contents_bytes() -> usize {
 struct Allocator<'a> {
     bytes: &'a mut Vec<u8>,
     next: u32,
+    offsets: BTreeMap<u32, u64>,
 }
 
 impl Allocator<'_> {
@@ -350,23 +363,34 @@ impl Allocator<'_> {
 
     fn write(&mut self, id: lopdf::ObjectId, object: Object) -> Result<(), SignerError> {
         let mut body = Vec::new();
-        // Используем внутренний формат lopdf для записи объекта
-        match &object {
-            Object::Dictionary(dict) => {
-                body.extend_from_slice(b"<<");
-                for (key, value) in dict.iter() {
-                    body.push(b'/');
-                    body.extend_from_slice(key);
-                    body.push(b' ');
-                    serialize_object(&mut body, value);
-                }
-                body.extend_from_slice(b">>");
-            }
-            _ => serialize_object(&mut body, &object),
-        }
+        serialize_object(&mut body, &object);
+        self.offsets.insert(id.0, self.bytes.len() as u64 + 1); // +1: пропускаем ведущий '\n'
         write_object(self.bytes, id, &body);
         Ok(())
     }
+}
+
+fn serialize_dict(buf: &mut Vec<u8>, dict: &Dictionary) {
+    buf.extend_from_slice(b"<<");
+    for (key, value) in dict.iter() {
+        buf.push(b'/');
+        buf.extend_from_slice(key);
+        // ByteRange - сырой массив фиксированной ширины, а не строка
+        if key.as_slice() == b"ByteRange" {
+            buf.extend_from_slice(OFFSETS);
+            continue;
+        }
+        // пробел нужен только перед числом/ссылкой/bool/null;
+        // перед `<`, `(`, `[`, `/` он не нужен (это даёт `/Contents<...>`)
+        if !matches!(
+            value,
+            Object::Array(_) | Object::Dictionary(_) | Object::Name(_) | Object::String(..)
+        ) {
+            buf.push(b' ');
+        }
+        serialize_object(buf, value);
+    }
+    buf.extend_from_slice(b">>");
 }
 
 /// Записывает объект с указанным номером (`N 0 obj … endobj`).
@@ -383,7 +407,13 @@ fn serialize_object(buf: &mut Vec<u8>, obj: &Object) {
         Object::String(s, format) => match format {
             lopdf::StringFormat::Literal => {
                 buf.push(b'(');
-                buf.extend_from_slice(s);
+                for &b in s {
+                    match b {
+                        b'(' | b')' | b'\\' => { buf.push(b'\\'); buf.push(b); }
+                        b'\r' => buf.extend_from_slice(b"\\r"),
+                        _ => buf.push(b),
+                    }
+                }
                 buf.push(b')');
             }
             lopdf::StringFormat::Hexadecimal => {
@@ -402,16 +432,7 @@ fn serialize_object(buf: &mut Vec<u8>, obj: &Object) {
             }
             buf.push(b']');
         }
-        Object::Dictionary(dict) => {
-            buf.extend_from_slice(b"<<");
-            for (key, value) in dict.iter() {
-                buf.push(b'/');
-                buf.extend_from_slice(key);
-                buf.push(b' ');
-                serialize_object(buf, value);
-            }
-            buf.extend_from_slice(b">>");
-        }
+        Object::Dictionary(dict) => serialize_dict(buf, dict),
         Object::Stream(stream) => {
             serialize_object(buf, &Object::Dictionary(stream.dict.clone()));
             buf.extend_from_slice(b"\nstream\n");
@@ -431,35 +452,38 @@ fn write_object(bytes: &mut Vec<u8>, id: lopdf::ObjectId, body: &[u8]) {
     bytes.extend_from_slice(b"\nendobj\n");
 }
 
-/// Таблица `xref` + `trailer` + `startxref` + `%%EOF`.
 fn write_xref(
     bytes: &mut Vec<u8>,
-    first: u32,
-    count: u32,
+    offsets: &BTreeMap<u32, u64>,   // id -> смещение, только объекты этого обновления
     trailer: &Dictionary,
+    size: u32,                      // max_id + 1 по всему документу
     previous_start: u64,
 ) -> Result<(), SignerError> {
-    // Смещения всех объектов последнего обновления берутся из файла: записаны только что.
-    let mut entries = String::new();
-    for id in first..first + count {
-        let header = format!("\n{id} 0 obj\n");
-        let at = find_subsequence(bytes, header.as_bytes()).ok_or_else(|| {
-            signing_error(format!("не удалось найти объект {id} при записи xref"))
-        })?;
-        entries.push_str(&format!("{:010} 00000 n \n", at + 1));
-    }
     let xref_at = bytes.len();
-    bytes.extend_from_slice(format!("xref\n{first} {count}\n").as_bytes());
-    bytes.extend_from_slice(entries.as_bytes());
+    bytes.extend_from_slice(b"xref\n");
+
+    // группируем подряд идущие id в подсекции
+    let ids: Vec<u32> = offsets.keys().copied().collect();
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i;
+        while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+            j += 1;
+        }
+        write!(bytes, "{} {}\n", ids[i], j - i + 1).unwrap();
+        for id in &ids[i..=j] {
+            write!(bytes, "{:010} 00000 n \n", offsets[id]).unwrap();
+        }
+        i = j + 1;
+    }
+
     let mut trailer = trailer.clone();
+    trailer.set(b"Size".to_vec(), Object::Integer(size as i64));
     if previous_start > 0 {
         trailer.set(b"Prev".to_vec(), Object::Integer(previous_start as i64));
     }
-    let mut dictionary = Vec::new();
-    serialize_object(&mut dictionary, &Object::Dictionary(trailer));
     bytes.extend_from_slice(b"trailer\n");
-    bytes.extend_from_slice(&dictionary);
-    use std::io::Write as _;
+    serialize_object(bytes, &Object::Dictionary(trailer));
     write!(bytes, "\nstartxref\n{xref_at}\n%%EOF\n").unwrap();
     Ok(())
 }
@@ -483,8 +507,12 @@ pub fn locate(bytes: &[u8]) -> Result<(usize, usize, usize), SignerError> {
         return Err(signing_error("не закрыто поле /Contents подписи PDF"));
     }
     let marker = b"/ByteRange";
-    let tail_start = contents_at.saturating_sub(1024);
-    let offsets_at = search_back(bytes, tail_start..contents_at, marker)
+    let before = contents_at.saturating_sub(1024)..contents_at;
+    let after_end = (contents_end + 1024).min(bytes.len());
+    let offsets_at = search_back(bytes, before, marker)
+        .or_else(|| {
+            find_subsequence(&bytes[contents_end..after_end], marker).map(|p| contents_end + p)
+        })
         .map(|at| at + marker.len())
         .ok_or_else(|| signing_error("не удалось найти диапазон подписи в PDF"))?;
     Ok((offsets_at, contents_at, contents_end))
@@ -549,6 +577,7 @@ pub fn assemble_document(
     if cms.is_empty() {
         return Err(signing_error("пустая CMS подписи PDF"));
     }
+    let cms = trim_der(cms)?;
     let capacity = contents_end.saturating_sub(contents_at + 1);
     if cms.len() * 2 > capacity {
         return Err(signing_error(format!(
@@ -557,18 +586,22 @@ pub fn assemble_document(
             capacity / 2
         )));
     }
-    let range = range_value(staged.len(), contents_at, contents_end);
     let mut output = staged.to_vec();
-    // `/ByteRange` пишется по центру заглушки: `[` и `]` остаются на своих местах,
-    // а промежутки до них забиваются пробелами. Длина поля не меняется.
-    let field = offsets_at..offsets_at + OFFSETS.len() - 1;
-    let inner = field.start + 1..field.end - 1;
-    let value = &range.as_bytes()[1..range.len() - 1];
-    if value.len() > inner.len() {
-        return Err(signing_error("не удалось записать диапазон подписи PDF"));
+    let br_len = OFFSETS.len();
+    if output.get(offsets_at) != Some(&b'[')
+        || output.get(offsets_at + br_len - 1) != Some(&b']')
+    {
+        return Err(signing_error("заглушка /ByteRange не на своём месте"));
     }
-    output[inner.start..inner.end].fill(b' ');
-    output[inner.start..inner.start + value.len()].copy_from_slice(value);
+    let tail_start = contents_end + 1;
+    let text = format!("[0 {} {} {}", contents_at, tail_start, staged.len() - tail_start);
+    if text.len() >= br_len {
+        return Err(signing_error("диапазон подписи не помещается в заглушку"));
+    }
+    let mut field = text.into_bytes();
+    field.resize(br_len - 1, b' ');   // добиваем пробелами
+    field.push(b']');
+    output[offsets_at..offsets_at + br_len].copy_from_slice(&field);
     // CMS — hex, остаток поля нулями, как у КриптоПро PDF и Acrobat.
     let hex: Vec<u8> = cms
         .iter()
@@ -654,6 +687,61 @@ fn staging_path(source: &Path) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("cryptolite-{}-{nanos}-{name}", std::process::id()))
+}
+
+/// Обрезает хвост после DER-структуры CMS (буфер мог прийти с нулевым запасом).
+fn trim_der(cms: &[u8]) -> Result<&[u8], SignerError> {
+    if cms.len() < 2 || cms[0] != 0x30 {
+        return Err(signing_error("CMS не начинается с DER SEQUENCE"));
+    }
+    let (header, len) = match cms[1] {
+        n if n < 0x80 => (2, n as usize),
+        0x80 => return Ok(cms), // BER с неопределённой длиной: обрезать нельзя
+        n => {
+            let k = (n & 0x7F) as usize;
+            if k > 4 || cms.len() < 2 + k {
+                return Err(signing_error("некорректная длина CMS"));
+            }
+            let len = cms[2..2 + k].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+            (2 + k, len)
+        }
+    };
+    let total = header + len;
+    if total > cms.len() {
+        return Err(signing_error("CMS короче, чем заявлено в заголовке"));
+    }
+    Ok(&cms[..total])
+}
+
+/// Вписывает финальный /ByteRange в буфер (длина файла не меняется).
+fn write_byte_range(
+    out: &mut [u8],
+    offsets_at: usize,
+    contents_at: usize,
+    contents_end: usize,
+) -> Result<(), SignerError> {
+    let br_len = OFFSETS.len();
+    if out.get(offsets_at) != Some(&b'[') || out.get(offsets_at + br_len - 1) != Some(&b']') {
+        return Err(signing_error("заглушка /ByteRange не на своём месте"));
+    }
+    let tail_start = contents_end + 1;
+    let text = format!("[0 {} {} {}", contents_at, tail_start, out.len() - tail_start);
+    if text.len() >= br_len {
+        return Err(signing_error("диапазон подписи не помещается в заглушку"));
+    }
+    let mut field = text.into_bytes();
+    field.resize(br_len - 1, b' ');
+    field.push(b']');
+    out[offsets_at..offsets_at + br_len].copy_from_slice(&field);
+    Ok(())
+}
+
+/// Копия подготовленного PDF с записанным /ByteRange: её и нужно хэшировать.
+pub fn with_byte_range(staged: &[u8]) -> Result<(Vec<u8>, usize, usize), SignerError> {
+    let (offsets_at, contents_at, contents_end) = locate(staged)?;
+    let mut out = staged.to_vec();
+    write_byte_range(&mut out, offsets_at, contents_at, contents_end)?;
+    Ok((out, contents_at, contents_end))
 }
 
 /// Отрезает всё после последнего `%%EOF`: в PDF допустим мусор в конце, но он попадёт
@@ -1027,7 +1115,7 @@ mod tests {
             (b"Type".to_vec(), Object::Name(b"Sig".to_vec())),
             (
                 b"SubFilter".to_vec(),
-                Object::Name(b"adbe.pkcs7.detached".to_vec()),
+                Object::Name(b"ETSI.CAdES.detached".to_vec()),
             ),
             (
                 b"Contents".to_vec(),

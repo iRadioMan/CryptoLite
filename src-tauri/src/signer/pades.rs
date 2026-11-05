@@ -64,21 +64,7 @@ pub fn sign_prepared(
     prepared: &PreparedDocument,
     certificate_id: &str,
 ) -> Result<PdfSignaturePayload, SignerError> {
-    // Проверка типа и положения поля подписи выполнена при подготовке документа.
-    // Тот же путь сборки, что и в `finish`, но вместо CMS — нули того же размера:
-    // длина зарезервированного поля не зависит от содержимого, поэтому подписанные байты
-    // (с уже подставленным `/ByteRange`) совпадут с итоговым файлом побайтово.
-    let capacity = prepared
-        .contents_end
-        .saturating_sub(prepared.contents_at + 1);
-    let placeholder = "0".repeat(capacity);
-    let document = pdf_layer::assemble_document(
-        &prepared.bytes,
-        prepared.contents_at,
-        prepared.contents_end,
-        placeholder.as_bytes(),
-    )?;
-    let (_offsets, contents_at, contents_end) = pdf_layer::locate(&document)?;
+    let (document, contents_at, contents_end) = pdf_layer::with_byte_range(&prepared.bytes)?;
     let content = pdf_layer::signed_content(&document, contents_at, contents_end)?;
     let cms = csp_native::windows::sign_pdf_range(certificate_id, &content)?;
     Ok(PdfSignaturePayload {

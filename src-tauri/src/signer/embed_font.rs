@@ -333,13 +333,18 @@ pub struct FontObjects {
 
 pub fn font_objects(cid_to_code: &BTreeMap<u16, u16>) -> FontObjects {
     let font_data = font();
-    let font_file = Object::Stream(Stream::new(
-        Dictionary::from_iter([(
-            b"Length1".to_vec(),
-            Object::Integer(font_data.data.len() as i64),
+    let s = |v: i64| -> i64 {
+        (v as f64 * 1000.0 / f64::from(font_data.units_per_em)).round() as i64
+    };
+    let mut stream = Stream::new(
+    Dictionary::from_iter([(
+        b"Length1".to_vec(),
+        Object::Integer(font_data.data.len() as i64),
         )]),
         font_data.data.to_vec(),
-    ));
+    );
+    let _ = stream.compress(); // добавит /Filter /FlateDecode и пересчитает /Length
+    let font_file = Object::Stream(stream);
 
     let descriptor = Dictionary::from_iter([
         (b"Type".to_vec(), Object::Name(b"FontDescriptor".to_vec())),
@@ -349,36 +354,26 @@ pub fn font_objects(cid_to_code: &BTreeMap<u16, u16>) -> FontObjects {
         (
             b"FontBBox".to_vec(),
             Object::Array(
-                font_data.bbox
-                    .iter()
-                    .map(|value| Object::Integer(i64::from(*value)))
-                    .collect(),
+                font_data.bbox.iter().map(|v| Object::Integer(s(i64::from(*v)))).collect(),
             ),
         ),
         (b"ItalicAngle".to_vec(), Object::Integer(0)),
-        (b"Ascent".to_vec(), Object::Integer(i64::from(font_data.ascent))),
-        (
-            b"Descent".to_vec(),
-            Object::Integer(i64::from(font_data.descent)),
-        ),
-        (b"CapHeight".to_vec(), Object::Integer(1493)),
+        (b"Ascent".to_vec(), Object::Integer(s(i64::from(font_data.ascent)))),
+        (b"Descent".to_vec(), Object::Integer(s(i64::from(font_data.descent)))),
+        (b"CapHeight".to_vec(), Object::Integer(s(1493))),
         (b"StemV".to_vec(), Object::Integer(80)),
     ]);
 
     // /W: ширины ровно для использованных CID, по 1000 единиц на кегль.
-    let widths: Vec<Object> = cid_to_code
-        .keys()
-        .map(|cid| {
-            let width = (f64::from(font_data.width_of_glyph(*cid))
-                / f64::from(font_data.units_per_em)
-                * 1000.0)
-                .round() as i64;
-            Object::Array(vec![
-                Object::Integer(i64::from(*cid)),
-                Object::Array(vec![Object::Integer(width)]),
-            ])
-        })
-        .collect();
+    let mut widths: Vec<Object> = Vec::new();
+    for cid in cid_to_code.keys() {
+        let width = (f64::from(font_data.width_of_glyph(*cid))
+            / f64::from(font_data.units_per_em)
+            * 1000.0)
+            .round() as i64;
+        widths.push(Object::Integer(i64::from(*cid)));
+        widths.push(Object::Array(vec![Object::Integer(width)]));
+    }
 
     let cid_font = Dictionary::from_iter([
         (b"Type".to_vec(), Object::Name(b"Font".to_vec())),
@@ -400,7 +395,7 @@ pub fn font_objects(cid_to_code: &BTreeMap<u16, u16>) -> FontObjects {
         ),
         (
             b"DW".to_vec(),
-            Object::Integer(i64::from(font_data.width_of(b' ' as u16))),
+            Object::Integer(s(i64::from(font_data.width_of(b' ' as u16)))),
         ),
         (b"W".to_vec(), Object::Array(widths)),
         // Код CID — это номер глифа TrueType-шрифта: таблица глифов не переставляется.
