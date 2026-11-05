@@ -188,7 +188,7 @@ pub fn prepare(
         (b"Type".to_vec(), Object::Name(b"Sig".to_vec())),
         (
             b"Filter".to_vec(),
-            Object::Name(b"Adobe.PPKLite".to_vec()),
+            Object::Name(b"CryptoPro PDF".to_vec()),
         ),
         (
             b"SubFilter".to_vec(),
@@ -197,8 +197,7 @@ pub fn prepare(
         // Зарезервировано под CMS фиксированной длины; заполняется после записи файла.
         (
             b"Contents".to_vec(),
-            Object::String(vec![b'0'; reserved_contents_bytes() * 2], StringFormat::Hexadecimal)
-                .into(),
+            Object::String(vec![0u8; reserved_contents_bytes()], StringFormat::Hexadecimal).into(),
         ),
         // Диапазон фиксированной ширины: заполняется на месте, длина файла не меняется.
         (
@@ -402,7 +401,14 @@ fn serialize_object(buf: &mut Vec<u8>, obj: &Object) {
         Object::Real(f) => buf.extend_from_slice(format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').as_bytes()),
         Object::Name(n) => {
             buf.push(b'/');
-            buf.extend_from_slice(n);
+            for &b in n {
+                // всё, кроме печатных ASCII без разделителей, пишем как #XX
+                if b <= b' ' || b >= 0x7F || b"#()<>[]{}/%".contains(&b) {
+                    buf.extend_from_slice(format!("#{b:02X}").as_bytes());
+                } else {
+                    buf.push(b);
+                }
+            }
         }
         Object::String(s, format) => match format {
             lopdf::StringFormat::Literal => {
@@ -418,7 +424,9 @@ fn serialize_object(buf: &mut Vec<u8>, obj: &Object) {
             }
             lopdf::StringFormat::Hexadecimal => {
                 buf.push(b'<');
-                buf.extend_from_slice(s);
+                for b in s {
+                    buf.extend_from_slice(format!("{b:02X}").as_bytes());
+                }
                 buf.push(b'>');
             }
         },
