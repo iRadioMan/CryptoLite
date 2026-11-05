@@ -131,7 +131,6 @@ pub fn prepare(
     let signature_id = allocator.reserve();
     let widget_id = allocator.reserve();
     let acroform_id = allocator.reserve();
-    let annots_id = allocator.reserve();
 
     let objects = embed_font::font_objects(&cid_to_code);
     allocator.write(font_file_id, objects.font_file)?;
@@ -271,15 +270,9 @@ pub fn prepare(
         .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?
         .clone();
     let mut new_page = page.clone();
-    let annots = existing_array(&document, &page, b"Annots")?;
-    allocator.write(annots_id, Object::Array(annots))?;
-    new_page.set(
-        b"Annots".to_vec(),
-        Object::Array(vec![
-            Object::Reference(annots_id),
-            Object::Reference(widget_id),
-        ]),
-    );
+    let mut annots = existing_array(&document, &page, b"Annots")?;
+    annots.push(Object::Reference(widget_id));
+    new_page.set(b"Annots".to_vec(), Object::Array(annots));
     allocator
         .write(page_id, Object::Dictionary(new_page))
         .map_err(|error| {
@@ -287,7 +280,6 @@ pub fn prepare(
                 "страница PDF находится внутри потока объектов и не может быть обновлена: {error:?}"
             ))
         })?;
-    let _ = annots_id;
 
     // Поле подписи в AcroForm: `/Fields` — массив существующих полей плюс новый виджет.
     let acroform = match catalog.get(b"AcroForm") {
