@@ -29,6 +29,9 @@ use crate::signer::{CertInfo, PdfSignaturePayload, PdfStampSpec, SignResult, Sig
 /// (как у КриптоПро PDF: `[ 0 64180 166598 14908]`), поэтому длина файла при подписи не меняется.
 const OFFSETS: &[u8] = b"[ 0 0000000000 0000000000 0000000000]";
 
+/// Множитель размера шрифта
+const FONT_SCALE: f64 = 1.4;
+
 /// Подготовленный PDF и позиции его полей подписи.
 pub struct PreparedDocument {
     pub path: PathBuf,
@@ -112,7 +115,8 @@ pub fn prepare(
     // отображаются одинаково на любой системе.
     let texts = stamp_lines(stamp, &signer);
     let lines: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
-    let (encoded, cid_to_code) = embed_font::encode_lines(&lines);
+    let sizes: Vec<f64> = texts.iter().map(|(_, size)| *size).collect();
+    let (encoded, cid_to_code) = embed_font::encode_lines_with_sizes(&lines, &sizes);
     let mut allocator = Allocator {
         bytes: &mut bytes,
         next: first,
@@ -1034,7 +1038,7 @@ fn stamp_lines(stamp: &PdfStampSpec, signer: &CertInfo) -> Vec<(String, f64)> {
             5.5,
         ));
     }
-    lines
+    lines.into_iter().map(|(t, s)| (t, s * FONT_SCALE)).collect()
 }
 
 /// Поток формы отметки: рамка и строки, уложенные по ширине штампа.
@@ -1050,7 +1054,8 @@ fn appearance_content(encoded: &[embed_font::EncodedLine], width: f64, height: f
         width - 1.2,
         height - 1.2
     ));
-    let mut y = height - 11.0;
+    let first = encoded.first().map(|l| l.font_size).unwrap_or(5.5);
+    let mut y = height - 4.0 - first;
     for line in encoded {
         if y < 6.0 {
             break;
