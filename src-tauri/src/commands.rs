@@ -226,7 +226,9 @@ pub async fn remove_temp_pdf(path: String) -> Result<(), String> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         // Удаляется только промежуточный файл партии подписи PDF из системного temp.
-        if candidate.parent() == Some(temp.as_path()) && name.contains(".signing-") {
+        let parent = candidate.parent().and_then(|p| p.canonicalize().ok());
+        let temp = std::env::temp_dir().canonicalize().ok();
+        if parent.is_some() && parent == temp && name.contains(".signing-") {
             std::fs::remove_file(&candidate)
                 .map_err(|error| format!("Не удалось удалить промежуточный файл: {error}"))
         } else {

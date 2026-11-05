@@ -8,6 +8,7 @@ import { readFile } from '@tauri-apps/plugin-fs';
 import logoUrl from './assets/logo.png';
 import StampEditor from './components/StampEditor.vue';
 import { forgetStampRects, type StampRect } from './signing';
+import { tempDir } from '@tauri-apps/api/path';
 
 type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
 type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureType: string; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
@@ -385,8 +386,11 @@ async function signStampDocument() {
   try {
     for (const [index, item] of stampOrder().entries()) {
       const isLast = index === stampOrder().length - 1;
-      const targetName = isLast ? `${baseName}_signed.pdf` : `${baseName}.signing-${index + 1}.pdf`;
-      output = `${folder ? `${folder}${slash}` : ''}${targetName}`;
+      const tmp = await tempDir();
+      const targetPath = isLast
+        ? `${folder ? folder + slash : ''}${baseName}_signed.pdf`
+        : `${tmp}${tmp.endsWith(slash) ? '' : slash}${baseName}.signing-${index + 1}.pdf`;
+      output = targetPath;
       const result = await invoke<CryptoResult>('sign_pdf', {
         request: {
           inputPath: currentInput,
@@ -406,7 +410,7 @@ async function signStampDocument() {
         // Промежуточный файл нужен только для следующего подписанта.
         const previous = currentInput === source.path ? null : currentInput;
         if (previous) {
-          try { await invoke('remove_temp_pdf', { path: previous }); } catch { /* не критично */ }
+          await invoke('remove_temp_pdf', { path: previous });
         }
       }
       currentInput = result.outputPath;
@@ -619,7 +623,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view about-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" alt="{{ t('brandName') }}"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.1.1</span><p><span>©️ {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" alt="{{ t('brandName') }}"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.2.1</span><p><span>©️ {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid"><section class="settings-card"><div class="card-heading"><div><h2>{{ t('about.provider') }}</h2></div></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div></dl></section><section class="settings-card"><div class="card-heading"><div><h2>{{ t('about.technologies') }}</h2><p>{{ t('about.technologiesHelp') }}</p></div></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section></div>
         <section class="settings-card about-license"><div class="card-heading"><div><h2>{{ t('about.licenseTitle') }}</h2><p>{{ t('about.licenseIntro') }}</p></div></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
       </section>
