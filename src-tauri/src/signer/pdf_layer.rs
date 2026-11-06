@@ -4,38 +4,37 @@
 //! Порядок берётся у КриптоПро PDF / КриптоАРМ (эталонный подписанный документ):
 //!
 //! - Исходный файл **не перезаписывается**: к нему дописывается инкрементальное обновление
-//!   (ISO 32000-1, 7.5.6): новые объекты, новая таблица `xref`, `trailer` с прежним `/Root`,
-//!   `startxref`, `%%EOF`. Поэтому уже существующие подписи и разметка остаются целыми.
+//!   (ISO 32000-1, 7.5.6): новые объекты и xref того же типа со ссылкой `/Prev`.
+//!   Все исходные байты, включая хвост после `%%EOF`, сохраняются.
 //! - Поле подписи — виджет `/Sig` в `/AcroForm /Fields` со ссылкой `/V` на словарь `/Sig`
 //!   и внешним видом `/AP` (рисуется встроенным шрифтом, а не стандартным Helvetica, из-за
 //!   которой кириллица превращалась в «кракозябры»).
-//! - `/SubFilter` — `adbe.pkcs7.detached`; `/Contents` фиксированной длины заполняется
+//! - `/SubFilter` — `ETSI.CAdES.detached`; `/Contents` фиксированной длины заполняется
 //!   шестнадцатеричной CMS, `/ByteRange` — `[0 A B C]`.
 //!
 //! Подписываемые байты (ISO 32000-1, 7.6.2): всё до `<` в `/Contents` и всё после `>`;
 //! CMS при этом сама помечена как `id-data` и содержит подписанные атрибуты (CMS v3).
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::io::ErrorKind;
 
-use lopdf::{Dictionary, Document, Object, Stream, StringFormat};
+use lopdf::{Dictionary, Document, IncrementalDocument, Object, Stream, StringFormat};
 
 use crate::signer::embed_font;
-use crate::signer::{CertInfo, PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
+use crate::signer::{CertInfo, PdfSignaturePayload, PdfSignPrepareResult, PdfStampSpec, SignResult, SignerError};
 
 /// Ширина `/ByteRange`-заглушки. Настоящие смещения пишутся в это поле через пробелы
 /// (как у КриптоПро PDF: `[ 0 64180 166598 14908]`), поэтому длина файла при подписи не меняется.
-const OFFSETS: &[u8] = b"[ 0 0000000000 0000000000 0000000000]";
+const OFFSETS: &[u8] = b"[0 9999999999 9999999999 9999999999]";
 
 /// Множитель размера шрифта
 const FONT_SCALE: f64 = 1.4;
 
 /// Подготовленный PDF и позиции его полей подписи.
 pub struct PreparedDocument {
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub bytes: Vec<u8>,
     pub digest_algorithm: String,
     pub page_count: usize,
@@ -50,7 +49,9 @@ pub struct PreparedDocument {
 /// Удаление файлов документов
 impl Drop for PreparedDocument {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -73,11 +74,43 @@ pub fn prepare(
         )));
     }
     let signer = certificate_info(certificate_id)?;
-    let document = Document::load(source)
+    let source_bytes = std::fs::read(source)
+        .map_err(|error| signing_error(format!("не удалось прочитать документ: {error}")))?;
+    let (bytes, page_count) = prepare_bytes(source_bytes, stamp, &signer)?;
+    let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
+    let path = staging_path(source);
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        let _ = std::fs::remove_file(&path);
+        return Err(signing_error(format!(
+            "не удалось записать временный файл: {error}"
+        )));
+    }
+    Ok(PreparedDocument {
+        path: Some(path),
+        bytes,
+        digest_algorithm: _digest_algorithm.to_owned(),
+        page_count,
+        offsets_at,
+        contents_at,
+        contents_end,
+    })
+}
+
+fn prepare_bytes(
+    source_bytes: Vec<u8>,
+    stamp: &PdfStampSpec,
+    signer: &CertInfo,
+) -> Result<(Vec<u8>, usize), SignerError> {
+    let document = Document::load_mem(&source_bytes)
         .map_err(|error| signing_error(format!("не удалось прочитать PDF: {error}")))?;
     if document.is_encrypted() {
         return Err(signing_error(
             "PDF защищён паролем: встроенная подпись такого документа пока не поддерживается",
+        ));
+    }
+    if document.xref_start == 0 || document.xref_recovery.is_some() {
+        return Err(signing_error(
+            "PDF требует восстановления таблицы ссылок; инкрементальная подпись отменена",
         ));
     }
     let catalog_id = document
@@ -85,10 +118,6 @@ pub fn prepare(
         .get(b"Root")
         .and_then(Object::as_reference)
         .map_err(|error| signing_error(format!("не найден каталог PDF: {error}")))?;
-    // Каталог может быть в потоке объектов: проверяем доступность
-    let _catalog = document
-        .get_dictionary(catalog_id)
-        .map_err(|error| signing_error(format!("не удалось прочитать каталог PDF: {error}")))?;
     let catalog = document
         .get_dictionary(catalog_id)
         .map_err(|error| signing_error(format!("не удалось прочитать каталог PDF: {error}")))?
@@ -105,61 +134,71 @@ pub fn prepare(
     let width = x1 - x0;
     let height = y1 - y0;
 
-    // Исходные байты — основа инкрементального обновления. Добавляемый `%%EOF` остаётся
-    // в подписанном диапазоне, поэтому `Catalog`/`Pages` ниже читаются только для адресов
-    // объектов; сами объекты копируются без изменений.
-    let mut bytes = std::fs::read(source)
-        .map_err(|error| signing_error(format!("не удалось прочитать документ: {error}")))?;
-    trim_to_last_eof(&mut bytes);
-    if !bytes.ends_with(b"\n") && !bytes.ends_with(b"\r") {
-        bytes.extend_from_slice(b"\n");
-    }
-
-    // Номера объектов: новые идут после максимального существующего, чтобы не затереть
-    // объекты прошлых версий (в том числе подписи, которые могли быть в потоке объектов).
-    let first = document.max_id + 1;
 
     // Отметка набирается встроенным DejaVu Sans Condensed: кириллица и латиница
     // отображаются одинаково на любой системе.
-    let texts = stamp_lines(stamp, &signer);
+    let texts = stamp_lines(stamp, signer);
     let lines: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
     let sizes: Vec<f64> = texts.iter().map(|(_, size)| *size).collect();
     let (encoded, cid_to_code) = embed_font::encode_lines_with_sizes(&lines, &sizes);
-    let mut allocator = Allocator {
-        bytes: &mut bytes,
-        next: first,
-        offsets: BTreeMap::new(),
+    // Существующие поля AcroForm нужны заранее: по ним подбирается уникальное имя.
+    let acroform = match catalog.get(b"AcroForm") {
+        Ok(Object::Reference(id)) => document.get_dictionary(*id).cloned().unwrap_or_default(),
+        Ok(Object::Dictionary(dictionary)) => dictionary.clone(),
+        _ => Dictionary::new(),
     };
-    let font_id = allocator.reserve();
-    let font_file_id = allocator.reserve();
-    let descriptor_id = allocator.reserve();
-    let cid_font_id = allocator.reserve();
-    let to_unicode_id = allocator.reserve();
-    let appearance_id = allocator.reserve();
-    let signature_id = allocator.reserve();
-    let widget_id = allocator.reserve();
+    let mut fields = match acroform.get(b"Fields") {
+        Ok(Object::Array(items)) => items.clone(),
+        // /Fields может быть косвенной ссылкой на массив
+        Ok(Object::Reference(id)) => document
+            .get_object(*id)
+            .and_then(Object::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let field_name = unique_field_name(&document, &fields);
+    let page = document
+        .get_dictionary(page_id)
+        .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?
+        .clone();
+    let mut annots = existing_array(&document, &page, b"Annots")?;
+    let mut new_page = page;
+    let page_count = document.get_pages().len();
+    let mut incremental = IncrementalDocument::create_from(source_bytes, document);
+    // A hybrid revision's auxiliary stream belongs to /Prev, not the new revision.
+    incremental.new_document.trailer.remove(b"XRefStm");
+    let new_document = &mut incremental.new_document;
+    let font_id = new_document.new_object_id();
+    let font_file_id = new_document.new_object_id();
+    let descriptor_id = new_document.new_object_id();
+    let cid_font_id = new_document.new_object_id();
+    let to_unicode_id = new_document.new_object_id();
+    let appearance_id = new_document.new_object_id();
+    let signature_id = new_document.new_object_id();
+    let widget_id = new_document.new_object_id();
     let existing_acroform_id = match catalog.get(b"AcroForm") {
         Ok(Object::Reference(id)) => Some(*id),
         _ => None,
     };
-    let acroform_id = existing_acroform_id.unwrap_or_else(|| allocator.reserve());
+    let acroform_id = existing_acroform_id.unwrap_or_else(|| new_document.new_object_id());
 
     let objects = embed_font::font_objects(&cid_to_code);
-    allocator.write(font_file_id, objects.font_file)?;
+    new_document.set_object(font_file_id, objects.font_file);
     let mut descriptor = match objects.descriptor {
         Object::Dictionary(d) => d,
         _ => Dictionary::new(),
     };
     descriptor.set(b"FontFile2".to_vec(), Object::Reference(font_file_id));
-    allocator.write(descriptor_id, Object::Dictionary(descriptor))?;
+    new_document.set_object(descriptor_id, Object::Dictionary(descriptor));
 
     let mut cid_font = match objects.cid_font {
         Object::Dictionary(d) => d,
         _ => Dictionary::new(),
     };
     cid_font.set(b"FontDescriptor".to_vec(), Object::Reference(descriptor_id));
-    allocator.write(cid_font_id, Object::Dictionary(cid_font))?;
-    allocator.write(to_unicode_id, objects.to_unicode)?;
+    new_document.set_object(cid_font_id, Object::Dictionary(cid_font));
+    new_document.set_object(to_unicode_id, objects.to_unicode);
     
     let font_dict = match objects.font {
         lopdf::Object::Dictionary(mut dict) => {
@@ -169,7 +208,7 @@ pub fn prepare(
         }
         _ => lopdf::Dictionary::new(),
     };
-    allocator.write(font_id, lopdf::Object::Dictionary(font_dict))?;
+    new_document.set_object(font_id, Object::Dictionary(font_dict));
     let appearance = Stream::new(
         Dictionary::from_iter([
             (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
@@ -197,25 +236,8 @@ pub fn prepare(
         ]),
         appearance_content(&encoded, width, height),
     );
-    allocator.write(appearance_id, Object::Stream(appearance))?;
+    new_document.set_object(appearance_id, Object::Stream(appearance));
 
-    // Существующие поля AcroForm нужны заранее: по ним подбирается уникальное имя.
-    let acroform = match catalog.get(b"AcroForm") {
-        Ok(Object::Reference(id)) => document.get_dictionary(*id).cloned().unwrap_or_default(),
-        Ok(Object::Dictionary(dictionary)) => dictionary.clone(),
-        _ => Dictionary::new(),
-    };
-    let mut fields = match acroform.get(b"Fields") {
-        Ok(Object::Array(items)) => items.clone(),
-        // /Fields может быть косвенной ссылкой на массив
-        Ok(Object::Reference(id)) => document
-            .get_object(*id)
-            .and_then(Object::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    let field_name = unique_field_name(&document, &fields);
 
     let signature = Dictionary::from_iter([
         (b"Type".to_vec(), Object::Name(b"Sig".to_vec())),
@@ -235,7 +257,7 @@ pub fn prepare(
         // Диапазон фиксированной ширины: заполняется на месте, длина файла не меняется.
         (
             b"ByteRange".to_vec(),
-            Object::String(OFFSETS.to_vec(), StringFormat::Literal).into(),
+            Object::Array(vec![0.into(), 9_999_999_999i64.into(), 9_999_999_999i64.into(), 9_999_999_999i64.into()]),
         ),
         (b"M".to_vec(), pdf_date_string()),
         (
@@ -252,7 +274,7 @@ pub fn prepare(
         ),
         (b"ContactInfo".to_vec(), text_string(&signer.owner_name)),
     ]);
-    allocator.write(signature_id, Object::Dictionary(signature))?;
+    new_document.set_object(signature_id, Object::Dictionary(signature));
 
     // Ссылки на существующие объекты в новых словарях обязательны: слайды/страница
     // остаются на месте, инкрементальное обновление их не трогает.
@@ -286,87 +308,30 @@ pub fn prepare(
             )])),
         ),
     ]);
-    allocator.write(widget_id, Object::Dictionary(widget))?;
+    new_document.set_object(widget_id, Object::Dictionary(widget));
 
     // Обновлённые версии страницы и каталога: старые объекты остаются в подписанных байтах
     // без изменений, новые версии переопределяют `/Annots` и `/AcroForm`.
-    let page = document
-        .get_dictionary(page_id)
-        .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?
-        .clone();
-    let mut new_page = page.clone();
-    let mut annots = existing_array(&document, &page, b"Annots")?;
     annots.push(Object::Reference(widget_id));
     new_page.set(b"Annots".to_vec(), Object::Array(annots));
-    allocator
-        .write(page_id, Object::Dictionary(new_page))
-        .map_err(|error| {
-            signing_error(format!(
-                "страница PDF находится внутри потока объектов и не может быть обновлена: {error:?}"
-            ))
-        })?;
+    new_document.set_object(page_id, Object::Dictionary(new_page));
     fields.push(Object::Reference(widget_id));
-    let mut new_acroform = acroform.clone();
+    let mut new_acroform = acroform;
     new_acroform.set(b"Fields".to_vec(), Object::Array(fields));
     new_acroform.set(b"SigFlags".to_vec(), Object::Integer(3));
-    allocator
-        .write(acroform_id, Object::Dictionary(new_acroform))?;
+    new_document.set_object(acroform_id, Object::Dictionary(new_acroform));
     // Каталог переписываем только когда AcroForm ещё не был косвенным объектом:
     // иначе каталог остаётся байт-в-байт прежним, как у КриптоПро.
     if existing_acroform_id.is_none() {
-        let mut new_catalog = catalog.clone();
+        let mut new_catalog = catalog;
         new_catalog.set(b"AcroForm".to_vec(), Object::Reference(acroform_id));
-        allocator
-            .write(catalog_id, Object::Dictionary(new_catalog))
-            .map_err(|error| {
-                signing_error(format!(
-                    "каталог PDF находится внутри потока объектов и не может быть обновлён: {error:?}"
-                ))
-            })?;
+        new_document.set_object(catalog_id, Object::Dictionary(new_catalog));
     }
-    let mut new_catalog = catalog.clone();
-    new_catalog.set(b"AcroForm".to_vec(), Object::Reference(acroform_id));
-    allocator
-        .write(catalog_id, Object::Dictionary(new_catalog))
-        .map_err(|error| {
-            signing_error(format!(
-                "каталог PDF находится внутри потока объектов и не может быть обновлён: {error:?}"
-            ))
-        })?;
 
-    // Таблица xref и trailer продлевают файл, а не меняют уже существующие байты.
-    let mut trailer = document.trailer.clone();
-    trailer.remove(b"Prev");
-    trailer.remove(b"XRefStm");
-    let size = allocator.next;                       // max_id + 1 по документу
-    let offsets = std::mem::take(&mut allocator.offsets);
-    drop(allocator);
-    let previous_start = find_previous_xref(&bytes)
-    .ok_or_else(|| {
-        signing_error(
-            "не удалось определить предыдущий startxref; \
-             инкрементальное обновление отменено"
-        )
-    })?;
-    write_xref(&mut bytes, &offsets, &trailer, size, previous_start)?;
-
-    let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
-    let path = staging_path(source);
-    if let Err(error) = std::fs::write(&path, &bytes) {
-        let _ = std::fs::remove_file(&path);
-        return Err(signing_error(format!(
-            "не удалось записать временный файл: {error}"
-        )));
-    }
-    Ok(PreparedDocument {
-        path,
-        bytes,
-        digest_algorithm: _digest_algorithm.to_owned(),
-        page_count: document.get_pages().len(),
-        offsets_at,
-        contents_at,
-        contents_end,
-    })
+    let mut bytes = Vec::new();
+    incremental.save_to(&mut bytes)
+        .map_err(|error| signing_error(format!("не удалось записать ревизию PDF: {error}")))?;
+    Ok((bytes, page_count))
 }
 
 /// Сколько байт резервируется под CMS. CAdES-BES по ГОСТ с цепочкой 2–3 сертификатов
@@ -375,169 +340,11 @@ fn reserved_contents_bytes() -> usize {
     16 * 1024
 }
 
-/// Выделяет номера новых объектов и дописывает их в файл.
-struct Allocator<'a> {
-    bytes: &'a mut Vec<u8>,
-    next: u32,
-    offsets: BTreeMap<u32, (u64, u16)>,
-}
-
-impl Allocator<'_> {
-    fn reserve(&mut self) -> lopdf::ObjectId {
-        let id = (self.next, 0);
-        self.next += 1;
-        id
-    }
-
-    fn write(&mut self, id: lopdf::ObjectId, object: Object) -> Result<(), SignerError> {
-        let mut body = Vec::new();
-        serialize_object(&mut body, &object);
-        self.offsets.insert(
-            id.0,
-            (self.bytes.len() as u64 + 1, id.1),
-        );
-        write_object(self.bytes, id, &body);
-        Ok(())
-    }
-}
-
-fn serialize_dict(buf: &mut Vec<u8>, dict: &Dictionary) {
-    buf.extend_from_slice(b"<<");
-    for (key, value) in dict.iter() {
-        buf.push(b'/');
-        buf.extend_from_slice(key);
-        // ByteRange - сырой массив фиксированной ширины, а не строка
-        if key.as_slice() == b"ByteRange" {
-            buf.extend_from_slice(OFFSETS);
-            continue;
-        }
-        // пробел нужен только перед числом/ссылкой/bool/null;
-        // перед `<`, `(`, `[`, `/` он не нужен (это даёт `/Contents<...>`)
-        if !matches!(
-            value,
-            Object::Array(_) | Object::Dictionary(_) | Object::Name(_) | Object::String(..)
-        ) {
-            buf.push(b' ');
-        }
-        serialize_object(buf, value);
-    }
-    buf.extend_from_slice(b">>");
-}
-
-/// Записывает объект с указанным номером (`N 0 obj … endobj`).
-fn serialize_object(buf: &mut Vec<u8>, obj: &Object) {
-    match obj {
-        Object::Null => buf.extend_from_slice(b"null"),
-        Object::Boolean(b) => buf.extend_from_slice(if *b { b"true" } else { b"false" }),
-        Object::Integer(i) => buf.extend_from_slice(i.to_string().as_bytes()),
-        Object::Real(f) => buf.extend_from_slice(format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').as_bytes()),
-        Object::Name(n) => {
-            buf.push(b'/');
-            for &b in n {
-                // всё, кроме печатных ASCII без разделителей, пишем как #XX
-                if b <= b' ' || b >= 0x7F || b"#()<>[]{}/%".contains(&b) {
-                    buf.extend_from_slice(format!("#{b:02X}").as_bytes());
-                } else {
-                    buf.push(b);
-                }
-            }
-        }
-        Object::String(s, format) => match format {
-            lopdf::StringFormat::Literal => {
-                buf.push(b'(');
-                for &b in s {
-                    match b {
-                        b'(' | b')' | b'\\' => { buf.push(b'\\'); buf.push(b); }
-                        b'\r' => buf.extend_from_slice(b"\\r"),
-                        _ => buf.push(b),
-                    }
-                }
-                buf.push(b')');
-            }
-            lopdf::StringFormat::Hexadecimal => {
-                buf.push(b'<');
-                for b in s {
-                    buf.extend_from_slice(format!("{b:02X}").as_bytes());
-                }
-                buf.push(b'>');
-            }
-        },
-        Object::Array(arr) => {
-            buf.push(b'[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    buf.push(b' ');
-                }
-                serialize_object(buf, item);
-            }
-            buf.push(b']');
-        }
-        Object::Dictionary(dict) => serialize_dict(buf, dict),
-        Object::Stream(stream) => {
-            serialize_object(buf, &Object::Dictionary(stream.dict.clone()));
-            buf.extend_from_slice(b"\nstream\n");
-            buf.extend_from_slice(&stream.content);
-            buf.extend_from_slice(b"\nendstream");
-        }
-        Object::Reference(id) => {
-            buf.extend_from_slice(format!("{} {} R", id.0, id.1).as_bytes());
-        }
-    }
-}
-
-fn write_object(bytes: &mut Vec<u8>, id: lopdf::ObjectId, body: &[u8]) {
-    use std::io::Write as _;
-    write!(bytes, "\n{} {} obj\n", id.0, id.1).unwrap();
-    bytes.extend_from_slice(body);
-    bytes.extend_from_slice(b"\nendobj\n");
-}
-
-fn write_xref(
-    bytes: &mut Vec<u8>,
-    offsets: &BTreeMap<u32, (u64, u16)>,
-    trailer: &Dictionary,
-    size: u32,
-    previous_start: u64,
-) -> Result<(), SignerError> {
-    let xref_at = bytes.len();
-    bytes.extend_from_slice(b"xref\n");
-
-    // группируем подряд идущие id в подсекции
-    let ids: Vec<u32> = offsets.keys().copied().collect();
-    let mut i = 0;
-    while i < ids.len() {
-        let mut j = i;
-        while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
-            j += 1;
-        }
-        write!(bytes, "{} {}\n", ids[i], j - i + 1).unwrap();
-        for id in &ids[i..=j] {
-            let (offset, generation) = offsets[id];
-            write!(
-                bytes,
-                "{:010} {:05} n \n",
-                offset,
-                generation
-            ).unwrap();
-        }
-        i = j + 1;
-    }
-
-    let mut trailer = trailer.clone();
-    trailer.set(b"Size".to_vec(), Object::Integer(size as i64));
-    if previous_start > 0 {
-        trailer.set(b"Prev".to_vec(), Object::Integer(previous_start as i64));
-    }
-    bytes.extend_from_slice(b"trailer\n");
-    serialize_object(bytes, &Object::Dictionary(trailer));
-    write!(bytes, "\nstartxref\n{xref_at}\n%%EOF\n").unwrap();
-    Ok(())
-}
 
 /// Абсолютные позиции `/ByteRange`, `<` и `>` поля подписи.
 ///
 /// В документе бывает несколько `/Contents` (например, содержимое страницы), поэтому поле
-/// ищется по паре «`/ByteRange (` + `/Contents<`», добавленной в конец файла.
+/// ищется по последнему `/Contents<` и соседнему `/ByteRange` нашего writer.
 pub fn locate(bytes: &[u8]) -> Result<(usize, usize, usize), SignerError> {
     let contents_at = locate_contents(bytes).ok_or_else(|| {
         signing_error("не удалось найти поле подписи в подготовленном PDF")
@@ -633,21 +440,7 @@ pub fn assemble_document(
         )));
     }
     let mut output = staged.to_vec();
-    let br_len = OFFSETS.len();
-    if output.get(offsets_at) != Some(&b'[')
-        || output.get(offsets_at + br_len - 1) != Some(&b']')
-    {
-        return Err(signing_error("заглушка /ByteRange не на своём месте"));
-    }
-    let tail_start = contents_end + 1;
-    let text = format!("[0 {} {} {}", contents_at, tail_start, staged.len() - tail_start);
-    if text.len() >= br_len {
-        return Err(signing_error("диапазон подписи не помещается в заглушку"));
-    }
-    let mut field = text.into_bytes();
-    field.resize(br_len - 1, b' ');   // добиваем пробелами
-    field.push(b']');
-    output[offsets_at..offsets_at + br_len].copy_from_slice(&field);
+    write_byte_range(&mut output, offsets_at, contents_at, contents_end)?;
     // CMS — hex, остаток поля нулями, как у КриптоПро PDF и Acrobat.
     let hex: Vec<u8> = cms
         .iter()
@@ -659,11 +452,6 @@ pub fn assemble_document(
     Ok(output)
 }
 
-/// `/ByteRange`: `[ 0 A B C]`, где `A` — смещение `<` в `/Contents`, `B` — сразу после `>`.
-fn range_value(file_len: usize, contents_at: usize, contents_end: usize) -> String {
-    let tail_start = contents_end + 1;
-    format!("[ 0 {contents_at} {tail_start} {}]", file_len - tail_start)
-}
 
 /// Создаёт файл результата без перезаписи. Если имя занято, добавляет суффикс:
 /// `doc-signed.pdf` → `doc-signed (1).pdf` → `doc-signed (2).pdf` …
@@ -840,15 +628,20 @@ pub fn with_byte_range(staged: &[u8]) -> Result<(Vec<u8>, usize, usize), SignerE
     write_byte_range(&mut out, offsets_at, contents_at, contents_end)?;
     Ok((out, contents_at, contents_end))
 }
-
-/// Отрезает всё после последнего `%%EOF`: в PDF допустим мусор в конце, но он попадёт
-/// в подписанный диапазон, поэтому его лучше не переносить.
-fn trim_to_last_eof(bytes: &mut Vec<u8>) {
-    let needle = b"%%EOF";
-    if let Some(at) = search_back(bytes, 0..bytes.len(), needle) {
-        bytes.truncate(at + needle.len());
-    }
+/// Передаёт staging-файл внешнему подписанту; finish восстанавливает владение файлом.
+pub fn export_prepared(mut prepared: PreparedDocument) -> Result<PdfSignPrepareResult, SignerError> {
+    let (bytes, contents_at, contents_end) = with_byte_range(&prepared.bytes)?;
+    let signed_bytes = signed_content(&bytes, contents_at, contents_end)?;
+    let path = prepared.path.take()
+        .ok_or_else(|| signing_error("не найден временный файл подготовленного PDF"))?;
+    Ok(PdfSignPrepareResult {
+        prepared_path: path.display().to_string(),
+        signed_bytes,
+        contents_at,
+        page_count: prepared.page_count,
+    })
 }
+
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -859,32 +652,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn is_pdf_whitespace(b: u8) -> bool {
-    matches!(b, 0 | 9 | 10 | 12 | 13 | 32)
-}
-
-fn find_previous_xref(bytes: &[u8]) -> Option<u64> {
-    // Ищем последний EOF, затем последний startxref перед ним.
-    let eof_at = search_back(bytes, 0..bytes.len(), b"%%EOF")?;
-    let marker = b"startxref";
-    let at = search_back(bytes, 0..eof_at, marker)?;
-    let mut pos = at + marker.len();
-    // PDF допускает LF, CRLF, CR и другие пробельные символы.
-    while pos < eof_at && is_pdf_whitespace(bytes[pos]) {
-        pos += 1;
-    }
-    let start = pos;
-    while pos < eof_at && bytes[pos].is_ascii_digit() {
-        pos += 1;
-    }
-    if start == pos {
-        return None;
-    }
-    std::str::from_utf8(&bytes[start..pos])
-        .ok()?
-        .parse::<u64>()
-        .ok()
-}
 
 fn search_back(haystack: &[u8], range: std::ops::Range<usize>, needle: &[u8]) -> Option<usize> {
     let start = range.start.min(haystack.len());
@@ -1185,15 +952,110 @@ fn appearance_content(encoded: &[embed_font::EncodedLine], width: f64, height: f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
 
-    /// Минимальный PDF с таблицей xref и полем `/Sig`-заглушкой.
-    fn sample_staged_pdf() -> Vec<u8> {
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = staging_path(Path::new("test"));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn prepared(&self) -> PreparedDocument {
+            let bytes = sample_staged_pdf();
+            let (offsets_at, contents_at, contents_end) = locate(&bytes).unwrap();
+            let path = self.0.join("staged.pdf");
+            std::fs::write(&path, &bytes).unwrap();
+            PreparedDocument {
+                path: Some(path), bytes, offsets_at, contents_at, contents_end,
+                page_count: 1, digest_algorithm: String::new(),
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn exported_preparation_survives_until_finish() {
+        let dir = TestDirectory::new();
+        let prepared = dir.prepared();
+        let exported = export_prepared(prepared).unwrap();
+        assert!(Path::new(&exported.prepared_path).is_file());
+        assert_eq!(exported.page_count, 1);
+        let restored = crate::signer::pades::restore(&exported.prepared_path).unwrap();
+        let result = finish(&restored, &PdfSignaturePayload {
+            cms: vec![0x30, 0x00], contents_at: exported.contents_at,
+        }, &dir.0.join("signed.pdf")).unwrap();
+        drop(restored);
+        assert!(!Path::new(&exported.prepared_path).exists());
+        let final_bytes = std::fs::read(result.output_path).unwrap();
+        let doc = Document::load_mem(&final_bytes).unwrap();
+        let field = doc.get_dictionary(signature_fields(&doc)[0].as_reference().unwrap()).unwrap();
+        let sig = doc.get_dictionary(field.get(b"V").unwrap().as_reference().unwrap()).unwrap();
+        let range: Vec<usize> = sig.get(b"ByteRange").unwrap().as_array().unwrap()
+            .iter().map(|v| usize::try_from(v.as_i64().unwrap()).unwrap()).collect();
+        assert!(range[3] > 0);
+        assert_eq!(range[2] + range[3], final_bytes.len());
+        assert_eq!(exported.signed_bytes, [&final_bytes[..range[1]],
+            &final_bytes[range[2]..range[2] + range[3]]].concat());
+    }
+
+    #[test]
+    fn failed_export_removes_staging_file() {
+        let dir = TestDirectory::new();
+        let mut prepared = dir.prepared();
+        let path = prepared.path.clone().unwrap();
+        prepared.bytes.clear();
+        assert!(matches!(export_prepared(prepared), Err(SignerError::Pdf(_))));
+        assert!(!path.exists());
+        let mut missing = dir.prepared();
+        let path = missing.path.take().unwrap();
+        assert!(matches!(export_prepared(missing), Err(SignerError::Pdf(_))));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejected_payload_does_not_change_output() {
+        let dir = TestDirectory::new();
+        let prepared = dir.prepared();
+        let output = dir.0.join("existing.pdf");
+        std::fs::write(&output, b"existing output").unwrap();
+        let capacity = (prepared.contents_end - prepared.contents_at - 1) / 2;
+        let mut oversized = vec![0x30, 0x82];
+        oversized.extend_from_slice(&((capacity + 1 - 4) as u16).to_be_bytes());
+        oversized.resize(capacity + 1, 0);
+        for payload in [
+            PdfSignaturePayload { cms: Vec::new(), contents_at: prepared.contents_at },
+            PdfSignaturePayload { cms: vec![0x30, 0x82, 0x01], contents_at: prepared.contents_at },
+            PdfSignaturePayload { cms: vec![0x30, 0x03, 0x01], contents_at: prepared.contents_at },
+            PdfSignaturePayload { cms: oversized, contents_at: prepared.contents_at },
+            PdfSignaturePayload { cms: vec![0x30, 0x00], contents_at: prepared.contents_at + 1 },
+        ] {
+            assert!(matches!(finish(&prepared, &payload, &output), Err(SignerError::Pdf(_))));
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+        }
+    }
+
+    fn sample_pdf(kind: lopdf::xref::XrefType, modern: bool) -> Vec<u8> {
         let mut document = Document::with_version("1.7");
+        document.reference_table.cross_reference_type = kind;
         let pages_id = document.new_object_id();
         let content_id = document.add_object(Stream::new(
             Dictionary::new(),
-            b"BT /F1 12 Tf 72 720 Td (Probe) Tj ET".to_vec(),
+            b"0 0 0 RG 72 700 120 40 re S".to_vec(),
         ));
+        let annotation_id = document.add_object(lopdf::dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "Contents" => Object::string_literal("Existing annotation"),
+        });
         let page_id = document.add_object(Object::Dictionary(Dictionary::from_iter([
             (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
             (b"Parent".to_vec(), Object::Reference(pages_id).into()),
@@ -1208,6 +1070,7 @@ mod tests {
             ),
             (b"Contents".to_vec(), Object::Reference(content_id).into()),
             (b"Resources".to_vec(), Object::Dictionary(Dictionary::new())),
+            (b"Annots".to_vec(), Object::Array(vec![annotation_id.into()])),
         ])));
         document.set_object(
             pages_id,
@@ -1227,49 +1090,245 @@ mod tests {
         document
             .trailer
             .set(b"Root".to_vec(), Object::Reference(catalog));
-        document.add_object(Object::Dictionary(Dictionary::from_iter([
-            (b"Type".to_vec(), Object::Name(b"Sig".to_vec())),
-            (
-                b"SubFilter".to_vec(),
-                Object::Name(b"ETSI.CAdES.detached".to_vec()),
-            ),
-            (
-                b"Contents".to_vec(),
-                Object::String(vec![b'0'; 4096 * 2], StringFormat::Hexadecimal).into(),
-            ),
-            (
-                b"ByteRange".to_vec(),
-                Object::String(OFFSETS.to_vec(), StringFormat::Literal).into(),
-            ),
-        ])));
         let mut bytes = Vec::new();
-        document.save_to(&mut bytes).unwrap();
+        if modern {
+            let fields = document.add_object(Object::Array(Vec::new()));
+            let form = document.add_object(dictionary! { "Fields" => fields });
+            document.get_object_mut(catalog).unwrap().as_dict_mut().unwrap().set("AcroForm", form);
+            document.save_modern(&mut bytes).unwrap();
+        } else {
+            document.save_to(&mut bytes).unwrap();
+        }
         bytes
     }
 
     #[test]
-    fn byte_range_keeps_file_length() {
-        let bytes = sample_staged_pdf();
-        let contents_at = locate_contents(&bytes).unwrap();
-        let offsets_at = find_subsequence(&bytes, b"/ByteRange")
-            .map(|at| at + b"/ByteRange".len())
-            .unwrap();
-        assert_eq!(bytes[contents_at], b'<');
-        let contents_end = contents_at + 1 + 8192;
-        assert_eq!(bytes[contents_end], b'>');
+    fn incremental_update_preserves_existing_form_and_generations() {
+        for indirect in [false, true] {
+            let mut source = Document::load_mem(&sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false)).unwrap();
+            let old_page = *source.get_pages().get(&1).unwrap();
+            let page = source.objects.remove(&old_page).unwrap();
+            let page_id = (old_page.0, 2);
+            source.set_object(page_id, page);
+            let pages_id = source.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+            source.get_object_mut(pages_id).unwrap().as_dict_mut().unwrap().set("Kids", vec![page_id.into()]);
+            let existing = source.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("Signature1"),
+                "V" => Object::string_literal("Keep this field"),
+            });
+            let fields = source.add_object(vec![Object::Reference(existing)]);
+            let form = dictionary! { "Fields" => fields, "NeedAppearances" => true };
+            let form_value = if indirect {
+                Object::Reference(source.add_object(form))
+            } else {
+                Object::Dictionary(form)
+            };
+            let catalog_id = source.trailer.get(b"Root").unwrap().as_reference().unwrap();
+            source.get_object_mut(catalog_id).unwrap().as_dict_mut().unwrap().set("AcroForm", form_value);
+            let mut original = Vec::new();
+            source.save_to(&mut original).unwrap();
+            let (staged, _) = prepare_bytes(original.clone(), &test_stamp(), &test_signer()).unwrap();
+            assert!(staged.starts_with(&original));
+            let parsed = Document::load_mem(&staged).unwrap();
+            assert_eq!(parsed.get_pages().get(&1), Some(&page_id));
+            let fields = signature_fields(&parsed);
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].as_reference().unwrap(), existing);
+            assert_eq!(parsed.get_dictionary(existing).unwrap().get(b"V").unwrap().as_str().unwrap(), b"Keep this field");
+            let widget = parsed.get_dictionary(fields[1].as_reference().unwrap()).unwrap();
+            assert_eq!(widget.get(b"T").unwrap().as_str().unwrap(), b"Signature2");
+            assert_eq!(widget.get(b"P").unwrap().as_reference().unwrap(), page_id);
+            let form = parsed.dereference(parsed.catalog().unwrap().get(b"AcroForm").unwrap()).unwrap().1.as_dict().unwrap();
+            assert!(form.get(b"NeedAppearances").unwrap().as_bool().unwrap());
+            assert_eq!(form.get(b"SigFlags").unwrap().as_i64().unwrap(), 3);
+        }
+    }
 
-        let signed = assemble_document(&bytes, contents_at, contents_end, &[0x30, 0x80]).unwrap();
-        assert_eq!(signed.len(), bytes.len(), "длина файла не меняется");
-        let range = range_value(bytes.len(), contents_at, contents_end);
-        assert_eq!(signed[offsets_at], b'[');
-        assert_eq!(signed[offsets_at + OFFSETS.len() - 1], b']');
-        assert_eq!(
-            &signed[offsets_at + OFFSETS.len() - 1 - range.len()..offsets_at + OFFSETS.len() - 1],
-            range.as_bytes()
-        );
-        assert_eq!(signed[contents_at], b'<');
-        assert_eq!(&signed[contents_at + 1..contents_at + 5], b"3080");
-        assert_eq!(signed[contents_end], b'>');
+    #[test]
+    fn invalid_stamp_is_rejected() {
+        let source = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
+        let mut stamp = test_stamp();
+        stamp.page = 1;
+        assert!(matches!(prepare_bytes(source.clone(), &stamp, &test_signer()), Err(SignerError::Pdf(_))));
+        stamp.page = 0;
+        stamp.width_mm = 0.0;
+        assert!(matches!(prepare_bytes(source, &stamp, &test_signer()), Err(SignerError::Pdf(_))));
+    }
+
+
+
+    fn test_stamp() -> PdfStampSpec {
+        PdfStampSpec {
+            page: 0, left_mm: 20.0, top_mm: 20.0,
+            width_mm: 80.0, height_mm: 35.0, position: String::new(),
+        }
+    }
+
+    fn test_signer() -> CertInfo {
+        CertInfo {
+            id: "test".into(), subject: String::new(), issuer: String::new(),
+            expires_at: "2027-01-01".into(), expired: false, has_private_key: false,
+            source: "synthetic".into(), serial_number: "01".into(),
+            not_before: "2026-01-01".into(), not_after: "2027-01-01".into(),
+            owner_name: "Тестовый подписант".into(),
+        }
+    }
+
+    fn sample_staged_pdf() -> Vec<u8> {
+        prepare_bytes(
+            sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false),
+            &test_stamp(), &test_signer(),
+        ).unwrap().0
+    }
+
+    #[test]
+    fn incremental_update_preserves_xref_kind() {
+        use lopdf::xref::XrefType;
+        for kind in [XrefType::CrossReferenceTable, XrefType::CrossReferenceStream] {
+            let source = sample_pdf(kind, false);
+            let previous = Document::load_mem(&source).unwrap().xref_start;
+            let (staged, pages) = prepare_bytes(source, &test_stamp(), &test_signer()).unwrap();
+            let parsed = Document::load_mem(&staged).unwrap();
+            assert_eq!(pages, 1);
+            assert!(matches!((parsed.reference_table.cross_reference_type, kind),
+                (XrefType::CrossReferenceTable, XrefType::CrossReferenceTable)
+                | (XrefType::CrossReferenceStream, XrefType::CrossReferenceStream)),
+                "xref kind changed: {:?} -> {:?}", kind, parsed.reference_table.cross_reference_type);
+            // lopdf consumes /Prev while resolving the chain; inspect the written revision.
+            let xref = &staged[parsed.xref_start..];
+            let prev_at = find_subsequence(xref, b"/Prev").unwrap() + 5;
+            let prev_text = String::from_utf8_lossy(&xref[prev_at..]);
+            let prev: usize = prev_text.trim_start().chars().take_while(|c| c.is_ascii_digit())
+                .collect::<String>().parse().unwrap();
+            assert_eq!(prev, previous);
+            let xref_at = parsed.xref_start;
+            match kind {
+                XrefType::CrossReferenceTable => assert!(staged[xref_at..].starts_with(b"xref")),
+                XrefType::CrossReferenceStream => {
+                    let (&(id, generation), object) = parsed.objects.iter().rev().find(|(_, obj)| {
+                        obj.as_stream().is_ok_and(|s| s.dict.get(b"Type").and_then(Object::as_name).is_ok_and(|name| name == b"XRef"))
+                    }).unwrap();
+                    assert!(staged[xref_at..].starts_with(format!("{id} {generation} obj").as_bytes()));
+                    let size = object.as_stream().unwrap().dict.get(b"Size").unwrap().as_i64().unwrap();
+                    assert!(size > i64::from(id));
+                    assert!(matches!(parsed.reference_table.entries.get(&id),
+                        Some(lopdf::xref::XrefEntry::Normal { offset, generation: g })
+                        if *offset as usize == xref_at && *g == generation));
+                }
+            }
+            for (&id, entry) in &parsed.reference_table.entries {
+                if let lopdf::xref::XrefEntry::Normal { offset, generation } = entry {
+                    assert!(staged[*offset as usize..].starts_with(format!("{id} {generation} obj").as_bytes()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_update_preserves_existing_signed_bytes() {
+        for tail in [b"\n".as_slice(), b"\r\n", b"\r", b"", b"\r\n\n  "] {
+            let mut source = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
+            while source.last().is_some_and(|b| b.is_ascii_whitespace()) {
+                source.pop();
+            }
+            source.extend_from_slice(tail);
+            let (staged, _) = prepare_bytes(source.clone(), &test_stamp(), &test_signer()).unwrap();
+            assert_eq!(&staged[..source.len()], source.as_slice(), "tail {tail:?}");
+            let (_, at, end) = locate(&staged).unwrap();
+            let first = assemble_document(&staged, at, end, &[0x30, 0x00]).unwrap();
+            let (second_staged, _) = prepare_bytes(first.clone(), &test_stamp(), &test_signer()).unwrap();
+            let (_, at2, end2) = locate(&second_staged).unwrap();
+            let second = assemble_document(&second_staged, at2, end2, &[0x30, 0x00]).unwrap();
+            assert_eq!(&second[..first.len()], first.as_slice());
+            let doc = Document::load_mem(&second).unwrap();
+            let fields = signature_fields(&doc);
+            assert_eq!(fields.len(), 2);
+            let names: Vec<_> = fields.iter().map(|field| {
+                doc.get_dictionary(field.as_reference().unwrap()).unwrap().get(b"T").unwrap().as_str().unwrap()
+            }).collect();
+            assert_ne!(names[0], names[1]);
+            let page = doc.get_dictionary(*doc.get_pages().get(&1).unwrap()).unwrap();
+            let annots = existing_array(&doc, page, b"Annots").unwrap();
+            assert_eq!(annots.len(), 3);
+            assert_eq!(doc.get_dictionary(annots[0].as_reference().unwrap()).unwrap()
+                .get(b"Contents").unwrap().as_str().unwrap(), b"Existing annotation");
+            for field in fields {
+                assert!(annots.iter().any(|a| a.as_reference().unwrap() == field.as_reference().unwrap()));
+            }
+        }
+    }
+
+    fn signature_fields(doc: &Document) -> &[Object] {
+        let acroform = doc.catalog().unwrap().get(b"AcroForm").unwrap();
+        let (_, acroform) = doc.dereference(acroform).unwrap();
+        let (_, fields) = doc.dereference(acroform.as_dict().unwrap().get(b"Fields").unwrap()).unwrap();
+        fields.as_array().unwrap()
+    }
+
+    #[test]
+    fn incremental_update_reads_objects_from_streams() {
+        let source = sample_pdf(lopdf::xref::XrefType::CrossReferenceStream, true);
+        let original = Document::load_mem(&source).unwrap();
+        assert!(original.reference_table.entries.values().any(|entry|
+            matches!(entry, lopdf::xref::XrefEntry::Compressed { .. })));
+        let (bytes, count) = prepare_bytes(source, &test_stamp(), &test_signer()).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(doc.get_pages(), original.get_pages());
+        let fields = signature_fields(&doc);
+        assert_eq!(fields.len(), 1);
+        let page = doc.get_dictionary(*doc.get_pages().get(&1).unwrap()).unwrap();
+        let annots = existing_array(&doc, page, b"Annots").unwrap();
+        assert!(annots.iter().any(|a| a.as_reference().unwrap() == fields[0].as_reference().unwrap()));
+    }
+
+    #[test]
+    fn assembled_byte_range_matches_signing_input() {
+        let staged = sample_staged_pdf();
+        let (signing, at, end) = with_byte_range(&staged).unwrap();
+        let expected = signed_content(&signing, at, end).unwrap();
+        let final_bytes = assemble_document(&staged, at, end, &[0x30, 0x00]).unwrap();
+        let doc = Document::load_mem(&final_bytes).unwrap();
+        let field = doc.get_dictionary(signature_fields(&doc)[0].as_reference().unwrap()).unwrap();
+        let sig = doc.get_dictionary(field.get(b"V").unwrap().as_reference().unwrap()).unwrap();
+        let range: Vec<usize> = sig.get(b"ByteRange").unwrap().as_array().unwrap()
+            .iter().map(|v| usize::try_from(v.as_i64().unwrap()).unwrap()).collect();
+        assert_eq!(range, vec![0, at, end + 1, final_bytes.len() - end - 1]);
+        let actual = [&final_bytes[range[0]..range[0] + range[1]],
+            &final_bytes[range[2]..range[2] + range[3]]].concat();
+        assert_eq!(actual, expected);
+        assert_eq!(final_bytes.len(), staged.len());
+        let cms = sig.get(b"Contents").unwrap().as_str().unwrap();
+        assert_eq!(&cms[..2], &[0x30, 0x00]);
+        assert!(cms[2..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn locate_accepts_both_signature_key_orders() {
+        for before in [true, false] {
+            let contents = b"/Contents<0000>";
+            let range = [b"/ByteRange".as_slice(), OFFSETS].concat();
+            let bytes = if before {
+                [b"<<".as_slice(), &range, contents, b">>"].concat()
+            } else {
+                [b"<<".as_slice(), contents, &range, b">>"].concat()
+            };
+            let (offsets, at, end) = locate(&bytes).unwrap();
+            assert_eq!(&bytes[offsets..offsets + OFFSETS.len()], OFFSETS);
+            assert_eq!(&bytes[at..=end], b"<0000>");
+        }
+    }
+
+    #[test]
+    fn invalid_pdf_is_rejected() {
+        for bytes in [Vec::new(), b"not a PDF".to_vec()] {
+            assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer()), Err(SignerError::Pdf(_))));
+        }
+        let mut bytes = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
+        let at = search_back(&bytes, 0..bytes.len(), b"startxref").unwrap() + b"startxref\n".len();
+        let end = at + bytes[at..].iter().position(|b| !b.is_ascii_digit()).unwrap();
+        bytes[at..end].fill(b'0');
+        assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer()), Err(SignerError::Pdf(_))));
     }
 
     #[test]

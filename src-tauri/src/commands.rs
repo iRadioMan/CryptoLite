@@ -263,12 +263,7 @@ pub async fn sign_pdf_prepare(
             &request.certificate_id,
             &request.stamp,
         )?;
-        Ok::<_, SignerError>(crate::signer::PdfSignPrepareResult {
-            prepared_path: prepared.path.display().to_string(),
-            signed_bytes: prepared.bytes[..prepared.contents_at].to_vec(),
-            contents_at: prepared.contents_at,
-            page_count: prepared.page_count,
-        })
+        crate::signer::pdf_layer::export_prepared(prepared)
     })
     .await
     .map_err(|error| format!("Не удалось запустить подготовку поля подписи: {error}"))?
