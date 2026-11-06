@@ -411,12 +411,11 @@ mod ffi {
         let output_path = std::path::PathBuf::from(&request.output_path);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&output_path)
             .map_err(|error| {
                 crate::signer::SignerError::Signing(format!(
-                    "не удалось создать файл результата ({}): {error}",
+                    "не удалось создать файл результата без перезаписи ({}): {error}",
                     output_path.display()
                 ))
             })?;
