@@ -90,9 +90,12 @@ async function render() {
   element.style.height = `${viewport.height}px`;
   const context = element.getContext('2d');
   if (!context) return;
-  renderTask = (target.render({ canvasContext: context, viewport } as never) as unknown as {
-    cancel: () => void;
-  });
+
+  renderTask = target.render({
+    canvasContext: context,
+    viewport,
+    transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined,
+  } as never) as unknown as { cancel: () => void; promise: Promise<void> };
 }
 
 function point(event: MouseEvent) {
