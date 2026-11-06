@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
 
 use lopdf::{Dictionary, Document, Object, Stream, StringFormat};
 
@@ -46,6 +47,13 @@ pub struct PreparedDocument {
     pub contents_end: usize,
 }
 
+/// Удаление файлов документов
+impl Drop for PreparedDocument {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn signing_error(message: impl Into<String>) -> SignerError {
     SignerError::Pdf(message.into())
 }
@@ -56,7 +64,7 @@ pub fn prepare(
     stamp: &PdfStampSpec,
     certificate_id: &str,
     _digest_algorithm: &str,
-    new_id: &str,
+    _new_id: &str,
 ) -> Result<PreparedDocument, SignerError> {
     if !source.is_file() {
         return Err(signing_error(format!(
@@ -130,7 +138,11 @@ pub fn prepare(
     let appearance_id = allocator.reserve();
     let signature_id = allocator.reserve();
     let widget_id = allocator.reserve();
-    let acroform_id = allocator.reserve();
+    let existing_acroform_id = match catalog.get(b"AcroForm") {
+        Ok(Object::Reference(id)) => Some(*id),
+        _ => None,
+    };
+    let acroform_id = existing_acroform_id.unwrap_or_else(|| allocator.reserve());
 
     let objects = embed_font::font_objects(&cid_to_code);
     allocator.write(font_file_id, objects.font_file)?;
@@ -187,6 +199,24 @@ pub fn prepare(
     );
     allocator.write(appearance_id, Object::Stream(appearance))?;
 
+    // Существующие поля AcroForm нужны заранее: по ним подбирается уникальное имя.
+    let acroform = match catalog.get(b"AcroForm") {
+        Ok(Object::Reference(id)) => document.get_dictionary(*id).cloned().unwrap_or_default(),
+        Ok(Object::Dictionary(dictionary)) => dictionary.clone(),
+        _ => Dictionary::new(),
+    };
+    let mut fields = match acroform.get(b"Fields") {
+        Ok(Object::Array(items)) => items.clone(),
+        // /Fields может быть косвенной ссылкой на массив
+        Ok(Object::Reference(id)) => document
+            .get_object(*id)
+            .and_then(Object::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let field_name = unique_field_name(&document, &fields);
+
     let signature = Dictionary::from_iter([
         (b"Type".to_vec(), Object::Name(b"Sig".to_vec())),
         (
@@ -214,8 +244,7 @@ pub fn prepare(
         ),
         (
             b"Name".to_vec(),
-            Object::String(format!("Signature_{new_id}").into_bytes(), StringFormat::Literal)
-                .into(),
+            Object::String(field_name.clone().into_bytes(), StringFormat::Literal).into(),
         ),
         (
             b"Location".to_vec(),
@@ -233,11 +262,7 @@ pub fn prepare(
         (b"FT".to_vec(), Object::Name(b"Sig".to_vec())),
         (
             b"T".to_vec(),
-            Object::String(
-                format!("Signature_{new_id}").into_bytes(),
-                StringFormat::Literal,
-            )
-            .into(),
+            Object::String(field_name.clone().into_bytes(), StringFormat::Literal).into(),
         ),
         (
             b"Rect".to_vec(),
@@ -280,23 +305,25 @@ pub fn prepare(
                 "страница PDF находится внутри потока объектов и не может быть обновлена: {error:?}"
             ))
         })?;
-
-    // Поле подписи в AcroForm: `/Fields` — массив существующих полей плюс новый виджет.
-    let acroform = match catalog.get(b"AcroForm") {
-        Ok(Object::Reference(id)) => document.get_dictionary(*id).cloned().unwrap_or_default(),
-        Ok(Object::Dictionary(dictionary)) => dictionary.clone(),
-        _ => Dictionary::new(),
-    };
-    let mut fields = match acroform.get(b"Fields").and_then(Object::as_array) {
-        Ok(fields) => fields.clone(),
-        Err(_) => Vec::new(),
-    };
     fields.push(Object::Reference(widget_id));
     let mut new_acroform = acroform.clone();
     new_acroform.set(b"Fields".to_vec(), Object::Array(fields));
     new_acroform.set(b"SigFlags".to_vec(), Object::Integer(3));
     allocator
         .write(acroform_id, Object::Dictionary(new_acroform))?;
+    // Каталог переписываем только когда AcroForm ещё не был косвенным объектом:
+    // иначе каталог остаётся байт-в-байт прежним, как у КриптоПро.
+    if existing_acroform_id.is_none() {
+        let mut new_catalog = catalog.clone();
+        new_catalog.set(b"AcroForm".to_vec(), Object::Reference(acroform_id));
+        allocator
+            .write(catalog_id, Object::Dictionary(new_catalog))
+            .map_err(|error| {
+                signing_error(format!(
+                    "каталог PDF находится внутри потока объектов и не может быть обновлён: {error:?}"
+                ))
+            })?;
+    }
     let mut new_catalog = catalog.clone();
     new_catalog.set(b"AcroForm".to_vec(), Object::Reference(acroform_id));
     allocator
@@ -314,7 +341,13 @@ pub fn prepare(
     let size = allocator.next;                       // max_id + 1 по документу
     let offsets = std::mem::take(&mut allocator.offsets);
     drop(allocator);
-    let previous_start = find_previous_xref(&bytes).unwrap_or(0);
+    let previous_start = find_previous_xref(&bytes)
+    .ok_or_else(|| {
+        signing_error(
+            "не удалось определить предыдущий startxref; \
+             инкрементальное обновление отменено"
+        )
+    })?;
     write_xref(&mut bytes, &offsets, &trailer, size, previous_start)?;
 
     let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
@@ -346,7 +379,7 @@ fn reserved_contents_bytes() -> usize {
 struct Allocator<'a> {
     bytes: &'a mut Vec<u8>,
     next: u32,
-    offsets: BTreeMap<u32, u64>,
+    offsets: BTreeMap<u32, (u64, u16)>,
 }
 
 impl Allocator<'_> {
@@ -359,7 +392,10 @@ impl Allocator<'_> {
     fn write(&mut self, id: lopdf::ObjectId, object: Object) -> Result<(), SignerError> {
         let mut body = Vec::new();
         serialize_object(&mut body, &object);
-        self.offsets.insert(id.0, self.bytes.len() as u64 + 1); // +1: пропускаем ведущий '\n'
+        self.offsets.insert(
+            id.0,
+            (self.bytes.len() as u64 + 1, id.1),
+        );
         write_object(self.bytes, id, &body);
         Ok(())
     }
@@ -458,9 +494,9 @@ fn write_object(bytes: &mut Vec<u8>, id: lopdf::ObjectId, body: &[u8]) {
 
 fn write_xref(
     bytes: &mut Vec<u8>,
-    offsets: &BTreeMap<u32, u64>,   // id -> смещение, только объекты этого обновления
+    offsets: &BTreeMap<u32, (u64, u16)>,
     trailer: &Dictionary,
-    size: u32,                      // max_id + 1 по всему документу
+    size: u32,
     previous_start: u64,
 ) -> Result<(), SignerError> {
     let xref_at = bytes.len();
@@ -476,7 +512,13 @@ fn write_xref(
         }
         write!(bytes, "{} {}\n", ids[i], j - i + 1).unwrap();
         for id in &ids[i..=j] {
-            write!(bytes, "{:010} 00000 n \n", offsets[id]).unwrap();
+            let (offset, generation) = offsets[id];
+            write!(
+                bytes,
+                "{:010} {:05} n \n",
+                offset,
+                generation
+            ).unwrap();
         }
         i = j + 1;
     }
@@ -623,6 +665,42 @@ fn range_value(file_len: usize, contents_at: usize, contents_end: usize) -> Stri
     format!("[ 0 {contents_at} {tail_start} {}]", file_len - tail_start)
 }
 
+/// Создаёт файл результата без перезаписи. Если имя занято, добавляет суффикс:
+/// `doc-signed.pdf` → `doc-signed (1).pdf` → `doc-signed (2).pdf` …
+fn create_unique(desired: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let dir = desired.parent().unwrap_or_else(|| Path::new("."));
+    let stem = desired
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "document".to_owned());
+    let ext = desired.extension().map(|e| e.to_string_lossy().into_owned());
+
+    for n in 0..10_000u32 {
+        let candidate = if n == 0 {
+            desired.to_path_buf()
+        } else {
+            let name = match &ext {
+                Some(ext) => format!("{stem} ({n}).{ext}"),
+                None => format!("{stem} ({n})"),
+            };
+            dir.join(name)
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "не удалось подобрать свободное имя файла",
+    ))
+}
+
 /// Вписывает CMS в `/Contents` и записывает подписанный PDF (существующий файл не перезаписывается).
 pub fn finish(
     prepared: &PreparedDocument,
@@ -637,26 +715,22 @@ pub fn finish(
     }
     let bytes = assemble_document(&prepared.bytes, contents_at, contents_end, &payload.cms)?;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output_path)
-        .map_err(|error| {
-            signing_error(format!(
-                "не удалось создать файл результата без перезаписи ({}): {error}",
-                output_path.display()
-            ))
-        })?;
-    if let Err(error) = file.write_all(&bytes) {
+    let (mut file, final_path) = create_unique(output_path).map_err(|error| {
+        signing_error(format!(
+            "не удалось создать файл результата ({}): {error}",
+            output_path.display()
+        ))
+    })?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
         drop(file);
-        let _ = std::fs::remove_file(output_path);
+        let _ = std::fs::remove_file(&final_path);
         return Err(signing_error(format!(
             "не удалось записать подписанный PDF: {error}"
         )));
     }
-    let _ = std::fs::remove_file(&prepared.path);
+    // Временный файл удалит Drop у PreparedDocument.
     Ok(SignResult {
-        output_path: output_path.display().to_string(),
+        output_path: final_path.display().to_string(),
         bytes_written: bytes.len(),
     })
 }
@@ -668,6 +742,25 @@ fn text_string(text: &str) -> Object {
         bytes.extend_from_slice(&unit.to_be_bytes());
     }
     Object::String(bytes, StringFormat::Literal)
+}
+
+/// Свободное имя поля подписи: Signature1, Signature2, … среди уже существующих полей.
+fn unique_field_name(document: &Document, fields: &[Object]) -> String {
+    let used: std::collections::HashSet<Vec<u8>> = fields
+        .iter()
+        .filter_map(|field| {
+            let dict = match field {
+                Object::Reference(id) => document.get_dictionary(*id).ok()?,
+                Object::Dictionary(d) => d,
+                _ => return None,
+            };
+            dict.get(b"T").ok()?.as_str().ok().map(|s| s.to_vec())
+        })
+        .collect();
+    (1..)
+        .map(|n| format!("Signature{n}"))
+        .find(|name| !used.contains(name.as_bytes()))
+        .unwrap()
 }
 
 fn certificate_info(certificate_id: &str) -> Result<CertInfo, SignerError> {
@@ -766,13 +859,31 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, 0 | 9 | 10 | 12 | 13 | 32)
+}
+
 fn find_previous_xref(bytes: &[u8]) -> Option<u64> {
-    let at = bytes
-        .windows(b"\nstartxref\n".len())
-        .rposition(|w| w == b"\nstartxref\n")?;
-    let tail = &bytes[at + b"\nstartxref\n".len()..];
-    let end = tail.iter().position(|&b| b == b'\n' || b == b'\r')?;
-    std::str::from_utf8(&tail[..end]).ok()?.parse::<u64>().ok()
+    // Ищем последний EOF, затем последний startxref перед ним.
+    let eof_at = search_back(bytes, 0..bytes.len(), b"%%EOF")?;
+    let marker = b"startxref";
+    let at = search_back(bytes, 0..eof_at, marker)?;
+    let mut pos = at + marker.len();
+    // PDF допускает LF, CRLF, CR и другие пробельные символы.
+    while pos < eof_at && is_pdf_whitespace(bytes[pos]) {
+        pos += 1;
+    }
+    let start = pos;
+    while pos < eof_at && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    if start == pos {
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..pos])
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
 fn search_back(haystack: &[u8], range: std::ops::Range<usize>, needle: &[u8]) -> Option<usize> {
