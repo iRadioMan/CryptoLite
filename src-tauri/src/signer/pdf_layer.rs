@@ -639,11 +639,12 @@ pub fn finish(
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(output_path)
         .map_err(|error| {
             signing_error(format!(
-                "не удалось создать файл результата без перезаписи ({}): {error}",
+                "не удалось создать файл результата ({}): {error}",
                 output_path.display()
             ))
         })?;
