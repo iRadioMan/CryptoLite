@@ -77,7 +77,7 @@ pub struct PdfStampSpec {
 pub struct PdfSignaturePayload {
     /// CMS CAdES-BES (DER) от подписанного диапазона PDF.
     pub cms: Vec<u8>,
-    /// Смещение начала `/Contents`: подписываются байты `[0, contents_at)`.
+    /// Смещение `<` в `/Contents`: исключается всё `<...>`, подписываются обе части PDF.
     pub contents_at: usize,
 }
 
@@ -105,7 +105,7 @@ pub struct PdfSignPrepareRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PdfSignPrepareResult {
     pub prepared_path: String,
-    /// Байты диапазона PDF (от начала файла до `/Contents`).
+    /// Префикс и суффикс PDF без `<Contents>`, с уже заполненным `/ByteRange`.
     pub signed_bytes: Vec<u8>,
     /// Смещение начала `/Contents` в подготовленном файле.
     pub contents_at: usize,
