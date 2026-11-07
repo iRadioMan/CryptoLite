@@ -32,6 +32,15 @@ const OFFSETS: &[u8] = b"[0 9999999999 9999999999 9999999999]";
 /// Множитель размера шрифта
 const FONT_SCALE: f64 = 1.4;
 
+/// Боковые поля текста внутри рамки штампа, pt.
+const STAMP_PADDING_X: f64 = 4.5;
+
+/// Верхнее и нижнее поля текста внутри рамки штампа, pt.
+const STAMP_PADDING_Y: f64 = 3.0;
+
+/// Межстрочный интервал в долях кегля.
+const STAMP_LEADING: f64 = 1.2;
+
 /// Подготовленный PDF и позиции его полей подписи.
 pub struct PreparedDocument {
     pub path: Option<PathBuf>,
@@ -911,40 +920,74 @@ fn stamp_lines(stamp: &PdfStampSpec, signer: &CertInfo) -> Vec<(String, f64)> {
     lines.into_iter().map(|(t, s)| (t, s * FONT_SCALE)).collect()
 }
 
-/// Поток формы отметки: рамка и строки, уложенные по ширине штампа.
+/// Единый масштаб кеглей, при котором блок строк полностью помещается в штамп.
+/// 1.0 — номинальные кегли ГОСТ; меньшее значение — уменьшение под область.
+fn fit_scale(encoded: &[embed_font::EncodedLine], width: f64, height: f64) -> f64 {
+    let font = embed_font::font();
+    let units = f64::from(font.units_per_em);
+    let available_width = (width - 2.0 * STAMP_PADDING_X).max(0.0);
+    let available_height = (height - 2.0 * STAMP_PADDING_Y).max(0.0);
+    let (Some(first), Some(last)) = (encoded.first(), encoded.last()) else {
+        return 1.0;
+    };
+    let widest = encoded
+        .iter()
+        .map(|line| f64::from(line.width_units) / units * line.font_size)
+        .fold(0.0_f64, f64::max);
+    let ascent = f64::from(font.ascent) / units;
+    let descent = -f64::from(font.descent) / units;
+    let gaps: f64 = encoded
+        .windows(2)
+        .map(|pair| pair[0].font_size * STAMP_LEADING)
+        .sum();
+    let block_height = ascent * first.font_size + gaps + descent * last.font_size;
+    if widest <= 0.0 || block_height <= 0.0 {
+        return 1.0;
+    }
+    (available_width / widest)
+        .min(available_height / block_height)
+        .clamp(0.0, 1.0)
+}
+
+/// Поток формы отметки: белая подложка, рамка и строки, вписанные в область штампа.
 ///
 /// Текст пишется CID-кодами Identity-H встроенного DejaVu, поэтому кириллица отображается
-/// на любой машине. Строка уменьшается, если не помещается в область.
+/// на любой машине. Все строки выводятся единым масштабом `fit_scale`, поэтому ни одна
+/// строка не теряется и пропорции глифов не искажаются.
 fn appearance_content(encoded: &[embed_font::EncodedLine], width: f64, height: f64) -> Vec<u8> {
     let font = embed_font::font();
-    let available = width - 9.0;
     let mut content = String::new();
+    // Белая подложка: текст документа под отметкой не просвечивает.
+    content.push_str(&format!(
+        "q 1 1 1 rg 0 0 {:.2} {:.2} re f Q\n",
+        width, height
+    ));
     content.push_str(&format!(
         "q 0.55 0.55 0.55 RG 0.6 w 0.6 0.6 {:.2} {:.2} re S Q\n",
         width - 1.2,
         height - 1.2
     ));
-    let first = encoded.first().map(|l| l.font_size).unwrap_or(5.5);
-    let mut y = height - 4.0 - first;
+    let scale = fit_scale(encoded, width, height);
+    let ascent = f64::from(font.ascent) / f64::from(font.units_per_em);
+    let mut y = height
+        - STAMP_PADDING_Y
+        - encoded
+            .first()
+            .map_or(0.0, |line| ascent * line.font_size * scale);
     for line in encoded {
-        if y < 6.0 {
+        let size = line.font_size * scale;
+        // Защита от недопустимого `Tf 0` в вырожденных областях.
+        if size < 0.01 {
             break;
         }
-        let size = line.font_size.max(4.0);
-        let natural = f64::from(line.width_units) / f64::from(font.units_per_em) * size;
-        let scale = if natural > available {
-            (available / natural).clamp(0.55, 1.0)
-        } else {
-            1.0
-        };
-        let hex = embed_font::cids_to_hex(line);
         content.push_str(&format!(
-            "BT /F0 {:.2} Tf 0.12 0.12 0.12 rg 4.5 {:.2} Td <{}> Tj ET\n",
-            size * scale,
+            "BT /F0 {:.3} Tf 0.12 0.12 0.12 rg {:.2} {:.3} Td <{}> Tj ET\n",
+            size,
+            STAMP_PADDING_X,
             y,
-            hex
+            embed_font::cids_to_hex(line)
         ));
-        y -= size + 2.4;
+        y -= line.font_size * STAMP_LEADING * scale;
     }
     content.into_bytes()
 }
@@ -1179,6 +1222,129 @@ mod tests {
             sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false),
             &test_stamp(), &test_signer(),
         ).unwrap().0
+    }
+
+    /// Строки отметки в том виде, в каком их получает `appearance_content`.
+    fn stamp_encoded(stamp: &PdfStampSpec, signer: &CertInfo) -> Vec<embed_font::EncodedLine> {
+        let texts = stamp_lines(stamp, signer);
+        let lines: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
+        let sizes: Vec<f64> = texts.iter().map(|(_, size)| *size).collect();
+        embed_font::encode_lines_with_sizes(&lines, &sizes).0
+    }
+
+    /// Кегли строк, записанные в поток формы (`/F0 <size> Tf`).
+    fn rendered_sizes(content: &str) -> Vec<f64> {
+        content
+            .split("/F0 ")
+            .skip(1)
+            .map(|rest| rest.split(" Tf").next().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn appearance_content_fills_white_and_fits_all_lines() {
+        let encoded = stamp_encoded(&test_stamp(), &test_signer());
+        let (width, height) = (120.0, 40.0);
+        let content = String::from_utf8(appearance_content(&encoded, width, height)).unwrap();
+        // Подложка заливается первой, до рамки и текста.
+        assert!(
+            content.starts_with("q 1 1 1 rg 0 0 120.00 40.00 re f Q\n"),
+            "{content}"
+        );
+        let scale = fit_scale(&encoded, width, height);
+        assert!(
+            scale > 0.0 && scale < 1.0,
+            "кегли не уменьшены под 120×40 pt: {scale}"
+        );
+        let rendered = rendered_sizes(&content);
+        assert_eq!(
+            rendered.len(),
+            encoded.len(),
+            "часть строк потеряна:\n{content}"
+        );
+        for (size, line) in rendered.iter().zip(&encoded) {
+            assert!(
+                (*size - line.font_size * scale).abs() < 1e-3,
+                "кегль {size} не равен {}: единый масштаб нарушен",
+                line.font_size * scale
+            );
+        }
+        // Самая широкая строка и весь блок по высоте укладываются во внутреннюю область.
+        let font = embed_font::font();
+        let units = f64::from(font.units_per_em);
+        let widest = encoded
+            .iter()
+            .map(|line| f64::from(line.width_units) / units * line.font_size)
+            .fold(0.0_f64, f64::max);
+        let gaps: f64 = encoded
+            .windows(2)
+            .map(|pair| pair[0].font_size * STAMP_LEADING)
+            .sum();
+        let block = f64::from(font.ascent) / units * encoded[0].font_size
+            + gaps
+            + -f64::from(font.descent) / units * encoded[encoded.len() - 1].font_size;
+        assert!(
+            widest * scale <= width - 2.0 * STAMP_PADDING_X + 1e-6,
+            "строка шире области: {} > {}",
+            widest * scale,
+            width - 2.0 * STAMP_PADDING_X
+        );
+        assert!(
+            block * scale <= height - 2.0 * STAMP_PADDING_Y + 1e-6,
+            "блок выше области: {} > {}",
+            block * scale,
+            height - 2.0 * STAMP_PADDING_Y
+        );
+        // На большой области кегли остаются номинальными: увеличения нет.
+        assert_eq!(fit_scale(&encoded, 400.0, 200.0), 1.0);
+    }
+
+    #[test]
+    fn prepared_appearance_is_white_and_auto_scaled() {
+        let source = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
+        let stamp = PdfStampSpec {
+            page: 0,
+            left_mm: 20.0,
+            top_mm: 20.0,
+            width_mm: 40.0,
+            height_mm: 15.0,
+            position: String::new(),
+        };
+        let signer = test_signer();
+        let (bytes, _) = prepare_bytes(source, &stamp, &signer).unwrap();
+        let document = Document::load_mem(&bytes).unwrap();
+        let field = signature_fields(&document)[0].as_reference().unwrap();
+        let widget = document.get_dictionary(field).unwrap();
+        let appearance = widget
+            .get(b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"N")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let stream = document
+            .get_object(appearance)
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        let content = String::from_utf8(stream.content.clone()).unwrap();
+        assert!(
+            content.contains("1 1 1 rg") && content.contains("re f"),
+            "нет белой подложки:\n{content}"
+        );
+        let rendered = rendered_sizes(&content);
+        assert_eq!(
+            rendered.len(),
+            stamp_lines(&stamp, &signer).len(),
+            "часть строк потеряна:\n{content}"
+        );
+        let largest = rendered.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            largest < 9.1,
+            "кегль {largest} не уменьшен под область 40×15 мм:\n{content}"
+        );
     }
 
     #[test]
