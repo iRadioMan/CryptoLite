@@ -30,7 +30,7 @@ use crate::signer::{CertInfo, PdfSignaturePayload, PdfSignPrepareResult, PdfStam
 const OFFSETS: &[u8] = b"[0 9999999999 9999999999 9999999999]";
 
 /// Множитель размера шрифта
-const FONT_SCALE: f64 = 1.4;
+const FONT_SCALE: f64 = 2.0;
 
 /// Боковые поля текста внутри рамки штампа, pt.
 const STAMP_PADDING_X: f64 = 4.5;
