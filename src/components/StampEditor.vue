@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n';
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy, type PDFPageProxy } from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { StampRect } from '../signing';
+import AppIcon from './AppIcon.vue';
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -182,9 +183,9 @@ onBeforeUnmount(() => {
   <div class="stamp-editor">
     <header class="stamp-toolbar">
       <div class="stamp-pager">
-        <button class="outline-button" :disabled="activePage === 0" @click="changePage(-1)">‹</button>
+        <button class="outline-button" :disabled="activePage === 0" :aria-label="t('stampEditor.prevPage')" @click="changePage(-1)"><AppIcon name="chevron-left" :size="16" /></button>
         <span>{{ t('stampEditor.page', { current: activePage + 1, total: pageCount || 1 }) }}</span>
-        <button class="outline-button" :disabled="activePage + 1 >= pageCount" @click="changePage(1)">›</button>
+        <button class="outline-button" :disabled="activePage + 1 >= pageCount" :aria-label="t('stampEditor.nextPage')" @click="changePage(1)"><AppIcon name="chevron-right" :size="16" /></button>
       </div>
       <p class="stamp-hint">
         {{ nextSigner ? t('stampEditor.hint', { signer: signerLabels[nextSigner] ?? nextSigner }) : t('stampEditor.allPlaced') }}
@@ -216,7 +217,7 @@ onBeforeUnmount(() => {
           :style="zoneStyle(rect)"
         >
           <span class="stamp-zone-label">{{ signerLabels[rect.certificateId] ?? rect.certificateId }}</span>
-          <button class="stamp-zone-remove" :title="t('stampEditor.remove')" @mousedown.stop @click.stop="removeRect(rect)">×</button>
+          <button class="stamp-zone-remove" :title="t('stampEditor.remove')" :aria-label="t('stampEditor.remove')" @mousedown.stop @click.stop="removeRect(rect)"><AppIcon name="x" :size="14" /></button>
         </div>
         <div
           v-if="draft"
