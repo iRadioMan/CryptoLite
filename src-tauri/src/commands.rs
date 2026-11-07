@@ -196,9 +196,9 @@ pub async fn sign_files(requests: Vec<SignRequest>) -> Result<Vec<SignBatchItemR
                 let input_path = request.input_path.clone();
                 let output_path = request.output_path.clone();
                 match crate::signer::native::NativeSigner.sign_file(request) {
-                    Ok(_) => SignBatchItemResult {
+                    Ok(result) => SignBatchItemResult {
                         input_path,
-                        output_path,
+                        output_path: result.output_path,
                         success: true,
                         error: None,
                     },

@@ -16,9 +16,7 @@
 //! CMS при этом сама помечена как `id-data` и содержит подписанные атрибуты (CMS v3).
 #![allow(dead_code)]
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::io::ErrorKind;
 
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, Stream, StringFormat};
 
@@ -462,42 +460,6 @@ pub fn assemble_document(
 }
 
 
-/// Создаёт файл результата без перезаписи. Если имя занято, добавляет суффикс:
-/// `doc-signed.pdf` → `doc-signed (1).pdf` → `doc-signed (2).pdf` …
-fn create_unique(desired: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
-    let dir = desired.parent().unwrap_or_else(|| Path::new("."));
-    let stem = desired
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_owned());
-    let ext = desired.extension().map(|e| e.to_string_lossy().into_owned());
-
-    for n in 0..10_000u32 {
-        let candidate = if n == 0 {
-            desired.to_path_buf()
-        } else {
-            let name = match &ext {
-                Some(ext) => format!("{stem} ({n}).{ext}"),
-                None => format!("{stem} ({n})"),
-            };
-            dir.join(name)
-        };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(
-        ErrorKind::AlreadyExists,
-        "не удалось подобрать свободное имя файла",
-    ))
-}
-
 /// Вписывает CMS в `/Contents` и записывает подписанный PDF (существующий файл не перезаписывается).
 pub fn finish(
     prepared: &PreparedDocument,
@@ -512,19 +474,12 @@ pub fn finish(
     }
     let bytes = assemble_document(&prepared.bytes, contents_at, contents_end, &payload.cms)?;
 
-    let (mut file, final_path) = create_unique(output_path).map_err(|error| {
+    let final_path = super::output::write_unique(output_path, &bytes).map_err(|error| {
         signing_error(format!(
-            "не удалось создать файл результата ({}): {error}",
+            "не удалось записать подписанный PDF ({}): {error}",
             output_path.display()
         ))
     })?;
-    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(&final_path);
-        return Err(signing_error(format!(
-            "не удалось записать подписанный PDF: {error}"
-        )));
-    }
     // Временный файл удалит Drop у PreparedDocument.
     Ok(SignResult {
         output_path: final_path.display().to_string(),

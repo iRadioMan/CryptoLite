@@ -5,7 +5,6 @@ pub mod digest;
 #[allow(unsafe_code)]
 mod ffi {
     use std::ffi::CStr;
-    use std::io::Write;
     use std::ptr;
     use windows_sys::Win32::Security::Cryptography::{
         CryptAcquireContextW, CryptGetProvParam, CryptReleaseContext, CRYPT_VERIFYCONTEXT,
@@ -408,26 +407,16 @@ mod ffi {
             output = encode_base64(&output).into_bytes();
         }
 
-        let output_path = std::path::PathBuf::from(&request.output_path);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-            .map_err(|error| {
+        let requested = std::path::PathBuf::from(&request.output_path);
+        let final_path =
+            crate::signer::output::write_unique(&requested, &output).map_err(|error| {
                 crate::signer::SignerError::Signing(format!(
-                    "не удалось создать файл результата без перезаписи ({}): {error}",
-                    output_path.display()
+                    "не удалось записать файл результата ({}): {error}",
+                    requested.display()
                 ))
             })?;
-        if let Err(error) = file.write_all(&output) {
-            drop(file);
-            let _ = std::fs::remove_file(&output_path);
-            return Err(crate::signer::SignerError::Signing(format!(
-                "не удалось записать файл результата: {error}"
-            )));
-        }
         Ok(crate::signer::SignResult {
-            output_path: output_path.display().to_string(),
+            output_path: final_path.display().to_string(),
             bytes_written: output.len(),
         })
     }
@@ -1209,57 +1198,14 @@ mod ffi {
             }
         };
         let requested = std::path::PathBuf::from(output_path);
-        let mut candidate = requested.clone();
-        let mut attempt = 0u32;
-        let (final_path, mut file) = loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => break (candidate, file),
-                Err(error)
-                    if is_decryption && error.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
-                    attempt += 1;
-                    candidate = suffixed_path(&requested, attempt);
-                }
-                Err(error) => {
-                    return Err(make_error(format!(
-                        "не удалось создать файл результата {action} без перезаписи ({}): {error}",
-                        candidate.display()
-                    )));
-                }
-            }
-        };
-        if let Err(error) = file.write_all(output) {
-            drop(file);
-            let _ = std::fs::remove_file(&final_path);
-            return Err(make_error(format!(
-                "не удалось записать файл результата {action}: {error}"
-            )));
-        }
-        Ok(final_path.display().to_string())
-    }
-
-    fn suffixed_path(path: &std::path::Path, attempt: u32) -> std::path::PathBuf {
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        let (stem, ext) = match path.extension().and_then(|ext| ext.to_str()) {
-            Some(ext) => {
-                let end = file_name.len() - ext.len() - 1;
-                (file_name[..end].to_string(), Some(ext.to_string()))
-            }
-            None => (file_name.to_string(), None),
-        };
-        let name = match ext {
-            Some(ext) => format!("{stem} ({attempt}).{ext}"),
-            None => format!("{stem} ({attempt})"),
-        };
-        parent.join(name)
+        crate::signer::output::write_unique(&requested, output)
+            .map(|path| path.display().to_string())
+            .map_err(|error| {
+                make_error(format!(
+                    "не удалось записать файл результата {action} ({}): {error}",
+                    requested.display()
+                ))
+            })
     }
 
     fn encode_base64(bytes: &[u8]) -> String {

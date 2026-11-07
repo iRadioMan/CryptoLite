@@ -417,7 +417,7 @@ async function signStampDocument() {
       }
       currentInput = result.outputPath;
     }
-    signReportItems.value = [{ inputPath: source.path, outputPath: output, success: true, error: null }];
+    signReportItems.value = [{ inputPath: source.path, outputPath: currentInput, success: true, error: null }];
   } catch (error) {
     succeeded = false;
     signReportItems.value = [{ inputPath: source.path, outputPath: output, success: false, error: String(error) }];

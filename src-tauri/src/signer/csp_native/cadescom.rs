@@ -324,25 +324,16 @@ mod ffi {
         } else {
             decode_base64(&signature_b64)?
         };
-        let output_path = std::path::PathBuf::from(&request.output_path);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)
-            .map_err(|error| {
+        let requested = std::path::PathBuf::from(&request.output_path);
+        let final_path =
+            crate::signer::output::write_unique(&requested, &output).map_err(|error| {
                 format!(
-                    "Не удалось создать файл результата без перезаписи ({}): {error}",
-                    output_path.display()
+                    "Не удалось записать результат CAdES-BES ({}): {error}",
+                    requested.display()
                 )
             })?;
-        use std::io::Write;
-        if let Err(error) = file.write_all(&output) {
-            drop(file);
-            let _ = std::fs::remove_file(&output_path);
-            return Err(format!("Не удалось записать результат CAdES-BES: {error}"));
-        }
         Ok(crate::signer::SignResult {
-            output_path: output_path.display().to_string(),
+            output_path: final_path.display().to_string(),
             bytes_written: output.len(),
         })
     }

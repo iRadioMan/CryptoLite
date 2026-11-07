@@ -4,6 +4,7 @@ mod embed_font;
 mod error;
 mod model;
 pub mod native;
+mod output;
 pub mod pades;
 #[allow(dead_code)]
 pub mod pdf_layer;
