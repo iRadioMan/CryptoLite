@@ -8,6 +8,7 @@ use crate::signer::csp_native;
 use crate::signer::csp_native::windows::digest;
 use crate::signer::pdf_layer::{self, PreparedDocument};
 use crate::signer::{PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
+use crate::tr;
 
 fn signing_error(message: impl Into<String>) -> SignerError {
     SignerError::Signing(message.into())
@@ -25,7 +26,10 @@ fn new_id() -> String {
 pub fn restore(prepared_path: &str) -> Result<PreparedDocument, SignerError> {
     let path = std::path::PathBuf::from(prepared_path);
     let bytes = std::fs::read(&path).map_err(|error| {
-        signing_error(format!("не удалось прочитать подготовленный PDF: {error}"))
+        signing_error(tr!(
+            "не удалось прочитать подготовленный PDF: {error}",
+            "could not read the prepared PDF: {error}"
+        ))
     })?;
     let (offsets_at, contents_at, contents_end) = pdf_layer::locate(&bytes)?;
     Ok(PreparedDocument {

@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 //! Единая точка записи файлов результата: имя подбирается без перезаписи существующих файлов.
 
+use crate::tr;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{ErrorKind, Write};
@@ -42,7 +43,10 @@ fn create_unique(desired: &Path) -> std::io::Result<(File, PathBuf)> {
                 if attempt >= MAX_ATTEMPTS {
                     return Err(std::io::Error::new(
                         ErrorKind::AlreadyExists,
-                        "не удалось подобрать свободное имя файла",
+                        tr!(
+                            "не удалось подобрать свободное имя файла",
+                            "could not find an available file name"
+                        ),
                     ));
                 }
             }
@@ -53,9 +57,12 @@ fn create_unique(desired: &Path) -> std::io::Result<(File, PathBuf)> {
 
 /// Имя с суффиксом: `report.pdf` + 1 → `report (1).pdf`; `report` + 1 → `report (1)`.
 fn suffixed_name(desired: &Path, attempt: u32) -> std::io::Result<OsString> {
-    let stem = desired
-        .file_stem()
-        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "у пути нет имени файла"))?;
+    let stem = desired.file_stem().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            tr!("у пути нет имени файла", "the path has no file name"),
+        )
+    })?;
     let mut name = OsString::from(stem);
     name.push(format!(" ({attempt})"));
     if let Some(extension) = desired.extension() {

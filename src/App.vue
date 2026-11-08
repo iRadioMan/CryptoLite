@@ -156,9 +156,9 @@ onMounted(async () => {
   } catch (error) {
     console.warn('Не удалось подключить обработчик drag-and-drop', error);
   }
-  try { status.value = await invoke<CspStatus>('csp_status'); }
-  catch (error) { status.value = { available: false, cadesAvailable: false, signingAvailable: false, message: String(error) }; }
+  await setBackendLanguage(locale.value);
   await initializeSettings();
+  await refreshCspStatus();
   if (!status.value.available) showAlert.value = true;
 });
 onUnmounted(() => { unlistenDrop?.(); unlistenSystemTheme?.(); });
@@ -168,6 +168,10 @@ watch(appSettings, () => {
   applySettings();
   scheduleSettingsSave();
 }, { deep: true });
+watch(locale, async (language) => {
+  await setBackendLanguage(language);
+  await refreshCspStatus();
+});
 watch([standard, encoding, signatureType, fileType, outputDir], () => {
   if (!settingsLoaded.value) return;
   if (appSettings.value.saveLastSigningSettings) {
@@ -193,17 +197,35 @@ function sameStringList(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+async function setBackendLanguage(language: string) {
+  try {
+    await invoke('set_language', { language });
+  } catch (error) {
+    console.warn('Could not set backend language', error);
+  }
+}
+
+async function refreshCspStatus() {
+  try {
+    status.value = await invoke<CspStatus>('csp_status');
+  } catch (error) {
+    status.value = { available: false, cadesAvailable: false, signingAvailable: false, message: String(error) };
+  }
+}
+
 async function initializeSettings() {
   try {
     const loaded = await invoke<AppSettings>('load_settings');
     appSettings.value = { ...appSettings.value, ...loaded };
     settingsLoaded.value = true;
     applySettings();
+    await setBackendLanguage(locale.value);
     await refreshSettingsCertificates();
   } catch (error) {
     settingsError.value = t('settings.loadErrorDetail', { error: String(error) });
     settingsLoaded.value = true;
     applySettings();
+    await setBackendLanguage(locale.value);
   }
 }
 function applySettings() {

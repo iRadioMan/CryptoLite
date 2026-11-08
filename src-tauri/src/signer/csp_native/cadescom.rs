@@ -2,6 +2,7 @@
 
 #[allow(unsafe_code)]
 mod ffi {
+    use crate::tr;
     use std::{mem::ManuallyDrop, ptr};
     use windows::core::{Interface, BSTR, GUID, PCWSTR};
     use windows::Win32::Globalization::LOCALE_USER_DEFAULT;
@@ -18,8 +19,9 @@ mod ffi {
         fn initialize() -> Result<Self, String> {
             let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             if result.is_err() {
-                return Err(format!(
+                return Err(tr!(
                     "Не удалось инициализировать COM apartment: HRESULT 0x{:08X}",
+                    "Could not initialize the COM apartment: HRESULT 0x{:08X}",
                     result.0 as u32
                 ));
             }
@@ -38,14 +40,26 @@ mod ffi {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
-        let clsid = unsafe { CLSIDFromProgID(PCWSTR(prog_id.as_ptr())) }
-            .map_err(|error| format!("Не зарегистрирован COM объект {display_name}: {error}"))?;
+        let clsid = unsafe { CLSIDFromProgID(PCWSTR(prog_id.as_ptr())) }.map_err(|error| {
+            tr!(
+                "Не зарегистрирован COM объект {display_name}: {error}",
+                "COM object {display_name} is not registered: {error}"
+            )
+        })?;
         let unknown = unsafe {
             CoCreateInstance::<_, windows::core::IUnknown>(&clsid, None, CLSCTX_INPROC_SERVER)
         }
-        .map_err(|error| format!("Не удалось создать COM объект {display_name}: {error}"))?;
+        .map_err(|error| {
+            tr!(
+                "Не удалось создать COM объект {display_name}: {error}",
+                "Could not create COM object {display_name}: {error}"
+            )
+        })?;
         unknown.cast::<IDispatch>().map_err(|error| {
-            format!("COM объект {display_name} не поддерживает IDispatch: {error}")
+            tr!(
+                "COM объект {display_name} не поддерживает IDispatch: {error}",
+                "COM object {display_name} does not support IDispatch: {error}"
+            )
         })
     }
 
@@ -65,7 +79,12 @@ mod ffi {
         unsafe {
             object.GetIDsOfNames(&GUID::zeroed(), &name_ptr, 1, LOCALE_USER_DEFAULT, &mut id)
         }
-        .map_err(|error| format!("CAdESCOM не предоставляет метод/свойство {name:?}: {error}"))?;
+        .map_err(|error| {
+            tr!(
+                "CAdESCOM не предоставляет метод/свойство {name:?}: {error}",
+                "CAdESCOM does not expose method/property {name:?}: {error}"
+            )
+        })?;
         Ok(id)
     }
 
@@ -99,7 +118,12 @@ mod ffi {
                 None,
             )
         }
-        .map_err(|error| format!("Ошибка вызова CAdESCOM.{name}: {error}"))?;
+        .map_err(|error| {
+            tr!(
+                "Ошибка вызова CAdESCOM.{name}: {error}",
+                "CAdESCOM.{name} call failed: {error}"
+            )
+        })?;
         Ok(result)
     }
 
@@ -148,17 +172,29 @@ mod ffi {
         } else {
             invoke_put(DISPATCH_PROPERTYPUT)
         };
-        result.map_err(|error| format!("Не удалось установить CAdESCOM.{name}: {error}"))
+        result.map_err(|error| {
+            tr!(
+                "Не удалось установить CAdESCOM.{name}: {error}",
+                "Could not set CAdESCOM.{name}: {error}"
+            )
+        })
     }
 
     fn as_dispatch(value: &VARIANT) -> Result<IDispatch, String> {
-        IDispatch::try_from(value)
-            .map_err(|error| format!("CAdESCOM вернул неожиданный тип объекта: {error}"))
+        IDispatch::try_from(value).map_err(|error| {
+            tr!(
+                "CAdESCOM вернул неожиданный тип объекта: {error}",
+                "CAdESCOM returned an unexpected object type: {error}"
+            )
+        })
     }
 
     fn as_string(value: &VARIANT) -> Result<String, String> {
         if value.vt() != VT_BSTR {
-            return Err("CAdESCOM вернул значение не типа BSTR".to_owned());
+            return Err(tr!(
+                "CAdESCOM вернул значение не типа BSTR",
+                "CAdESCOM returned a value that is not a BSTR"
+            ));
         }
         let bstr = unsafe { ManuallyDrop::clone(&value.Anonymous.Anonymous.Anonymous.bstrVal) };
         Ok(String::from_utf16_lossy(&bstr))
@@ -170,7 +206,10 @@ mod ffi {
                 VT_I2 => Ok(value.Anonymous.Anonymous.Anonymous.iVal as i32),
                 VT_I4 => Ok(value.Anonymous.Anonymous.Anonymous.lVal),
                 VT_UI4 => Ok(value.Anonymous.Anonymous.Anonymous.ulVal as i32),
-                _ => Err("CAdESCOM вернул значение не целого типа".to_owned()),
+                _ => Err(tr!(
+                    "CAdESCOM вернул значение не целого типа",
+                    "CAdESCOM returned a value that is not an integer"
+                )),
             }
         }
     }
@@ -181,7 +220,12 @@ mod ffi {
         let wanted = certificate_id
             .rsplit_once(':')
             .map(|(_, serial)| serial)
-            .ok_or_else(|| "Неверный идентификатор выбранного сертификата".to_owned())?;
+            .ok_or_else(|| {
+                tr!(
+                    "Неверный идентификатор выбранного сертификата",
+                    "Invalid selected certificate identifier"
+                )
+            })?;
         let wanted_reverse = reverse_hex_bytes(wanted);
         for index in 1..=count {
             // ICertificates.Item is a parameterized property getter, not an IDispatch method.
@@ -211,13 +255,16 @@ mod ffi {
                     // HasPrivateKey may be false until CAdESCOM explicitly binds the
                     // certificate to a CSP container. FindPrivateKey performs that lookup.
                     invoke(&certificate, "FindPrivateKey", vec![]).map_err(|error| {
-                        format!("CAdESCOM не смог связать сертификат с закрытым ключом: {error}")
+                        tr!(
+                            "CAdESCOM не смог связать сертификат с закрытым ключом: {error}",
+                            "CAdESCOM could not bind the certificate to a private key: {error}"
+                        )
                     })?;
                 }
                 return Ok(certificate);
             }
         }
-        Err("Выбранный сертификат не найден в CAdESCOM CurrentUser store; проверьте установку CryptoPro ЭЦП SDK.".to_owned())
+        Err(tr!("Выбранный сертификат не найден в CAdESCOM CurrentUser store; проверьте установку CryptoPro ЭЦП SDK.", "The selected certificate was not found in the CAdESCOM CurrentUser store; check the CryptoPro EDS SDK installation."))
     }
 
     /// Хэш-алгоритм CAdESCOM (`CADESCOM_HASH_ALGORITHM`) по ключу сертификата.
@@ -241,21 +288,25 @@ mod ffi {
                 let object = as_dispatch(&value)?;
                 as_string(&get(&object, "Algorithm")?)
             })
-            .map_err(|error| format!("OID открытого ключа: {error}"))?;
+            .map_err(|error| tr!("OID открытого ключа: {error}", "Public key OID: {error}"))?;
         match algorithm.as_str() {
             "1.2.643.7.1.1.1.1" => Ok(HASH_GOST_2012_256),
             "1.2.643.7.1.1.1.2" => Ok(HASH_GOST_2012_512),
             // ГОСТ Р 34.10-2001: тот же 256-битный Стрибог, что и у ГОСТ 2012-256.
             "1.2.643.2.2.19" => Ok(HASH_GOST_2012_256),
-            other => Err(format!(
-                "алгоритм открытого ключа {other} не поддерживается для встроенной подписи PDF"
+            other => Err(tr!(
+                "алгоритм открытого ключа {other} не поддерживается для встроенной подписи PDF",
+                "public key algorithm {other} is not supported for embedded PDF signatures"
             )),
         }
     }
 
     fn content_hex(value: &VARIANT) -> Result<String, String> {
         if value.vt() != VT_BSTR {
-            return Err("CAdESCOM вернул неожиданный тип хэш-значения".to_owned());
+            return Err(tr!(
+                "CAdESCOM вернул неожиданный тип хэш-значения",
+                "CAdESCOM returned an unexpected hash value type"
+            ));
         }
         let bstr = unsafe { ManuallyDrop::clone(&value.Anonymous.Anonymous.Anonymous.bstrVal) };
         Ok(String::from_utf16_lossy(&bstr))
@@ -281,18 +332,24 @@ mod ffi {
         request: crate::signer::SignRequest,
     ) -> Result<crate::signer::SignResult, String> {
         if request.certificate_ids.len() != 1 {
-            return Err(
-                "CAdES-BES пока поддерживает подпись ровно одним сертификатом; для нескольких подписантов выберите CMS / PKCS#7".to_owned(),
-            );
+            return Err(tr!(
+                "CAdES-BES пока поддерживает подпись ровно одним сертификатом; для нескольких подписантов выберите CMS / PKCS#7",
+                "CAdES-BES currently supports signing with exactly one certificate; for multiple signers, choose CMS / PKCS#7"
+            ));
         }
-        let certificate_id = request
-            .certificate_ids
-            .first()
-            .cloned()
-            .ok_or_else(|| "не выбран сертификат подписи".to_owned())?;
+        let certificate_id = request.certificate_ids.first().cloned().ok_or_else(|| {
+            tr!(
+                "не выбран сертификат подписи",
+                "no signing certificate selected"
+            )
+        })?;
         let _apartment = Apartment::initialize()?;
-        let content = std::fs::read(&request.input_path)
-            .map_err(|error| format!("Не удалось прочитать исходный файл: {error}"))?;
+        let content = std::fs::read(&request.input_path).map_err(|error| {
+            tr!(
+                "Не удалось прочитать исходный файл: {error}",
+                "Could not read the source file: {error}"
+            )
+        })?;
         let store = create("CAdESCOM.Store")?;
         // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
         invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
@@ -327,8 +384,9 @@ mod ffi {
         let requested = std::path::PathBuf::from(&request.output_path);
         let final_path =
             crate::signer::output::write_unique(&requested, &output).map_err(|error| {
-                format!(
+                tr!(
                     "Не удалось записать результат CAdES-BES ({}): {error}",
+                    "Could not write the CAdES-BES result ({}): {error}",
                     requested.display()
                 )
             })?;
@@ -374,7 +432,12 @@ mod ffi {
                 b'+' => 62,
                 b'/' => 63,
                 b'=' => 64,
-                _ => return Err("CAdESCOM вернул некорректную Base64 подпись".to_owned()),
+                _ => {
+                    return Err(tr!(
+                        "CAdESCOM вернул некорректную Base64 подпись",
+                        "CAdESCOM returned an invalid Base64 signature"
+                    ))
+                }
             };
             used += 1;
             if used == 4 {
@@ -389,7 +452,10 @@ mod ffi {
             }
         }
         if used != 0 {
-            return Err("CAdESCOM вернул Base64 подпись с неверной длиной".to_owned());
+            return Err(tr!(
+                "CAdESCOM вернул Base64 подпись с неверной длиной",
+                "CAdESCOM returned a Base64 signature with an invalid length"
+            ));
         }
         Ok(output)
     }

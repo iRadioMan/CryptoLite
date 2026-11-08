@@ -3,6 +3,8 @@ use crate::signer::{
     CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult, SignRequest,
     SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
 };
+#[cfg(not(target_os = "windows"))]
+use crate::tr;
 
 pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerError> {
     #[cfg(target_os = "windows")]
@@ -12,9 +14,10 @@ pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerEr
     #[cfg(not(target_os = "windows"))]
     {
         let _ = request;
-        Err(SignerError::Signing(
-            "Проверка CMS пока реализована только для Windows".to_owned(),
-        ))
+        Err(SignerError::Signing(tr!(
+            "Проверка CMS пока реализована только для Windows",
+            "CMS verification is currently implemented only for Windows"
+        )))
     }
 }
 
@@ -26,9 +29,10 @@ pub fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, SignerErro
     #[cfg(not(target_os = "windows"))]
     {
         let _ = request;
-        Err(SignerError::Encryption(
-            "Шифрование пока реализовано только для Windows".to_owned(),
-        ))
+        Err(SignerError::Encryption(tr!(
+            "Шифрование пока реализовано только для Windows",
+            "Encryption is currently implemented only for Windows"
+        )))
     }
 }
 
@@ -40,9 +44,10 @@ pub fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, SignerErro
     #[cfg(not(target_os = "windows"))]
     {
         let _ = request;
-        Err(SignerError::Decryption(
-            "Расшифрование пока реализовано только для Windows".to_owned(),
-        ))
+        Err(SignerError::Decryption(tr!(
+            "Расшифрование пока реализовано только для Windows",
+            "Decryption is currently implemented only for Windows"
+        )))
     }
 }
 
@@ -79,7 +84,10 @@ impl Signer for NativeSigner {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>();
             if found.is_empty() {
-                CspStatus::unavailable("Библиотеки КриптоПро CSP не найдены. Для проверки нестандартного каталога задайте CPSIGNER_CSP_LIB_DIR.")
+                CspStatus::unavailable(tr!(
+                    "Библиотеки КриптоПро CSP не найдены. Для проверки нестандартного каталога задайте CPSIGNER_CSP_LIB_DIR.",
+                    "CryptoPro CSP libraries not found. Set CPSIGNER_CSP_LIB_DIR to check a non-standard directory."
+                ))
             } else {
                 CspStatus {
                     available: true,
@@ -87,8 +95,9 @@ impl Signer for NativeSigner {
                     signing_available: false,
                     provider_type: None,
                     version: None,
-                    message: format!(
+                    message: tr!(
                         "Обнаружены библиотеки, но интеграция API ещё не подключена: {}",
+                        "Libraries were found, but the API integration is not connected yet: {}",
                         found.join(", ")
                     ),
                 }
@@ -97,7 +106,10 @@ impl Signer for NativeSigner {
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
-            CspStatus::unavailable("Эта операционная система не поддерживается.")
+            CspStatus::unavailable(tr!(
+                "Эта операционная система не поддерживается.",
+                "This operating system is not supported."
+            ))
         }
     }
 
@@ -130,9 +142,10 @@ impl Signer for NativeSigner {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = request;
-            Err(SignerError::Signing(
-                "CMS-подписание пока реализовано только для Windows".to_owned(),
-            ))
+            Err(SignerError::Signing(tr!(
+                "CMS-подписание пока реализовано только для Windows",
+                "CMS signing is currently implemented only for Windows"
+            )))
         }
     }
 }

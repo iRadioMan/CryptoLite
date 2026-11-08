@@ -22,6 +22,7 @@ use lopdf::{Dictionary, Document, IncrementalDocument, Object, Stream, StringFor
 
 use crate::signer::embed_font;
 use crate::signer::{CertInfo, PdfSignaturePayload, PdfSignPrepareResult, PdfStampSpec, SignResult, SignerError};
+use crate::tr;
 
 /// Ширина `/ByteRange`-заглушки. Настоящие смещения пишутся в это поле через пробелы
 /// (как у КриптоПро PDF: `[ 0 64180 166598 14908]`), поэтому длина файла при подписи не меняется.
@@ -75,21 +76,27 @@ pub fn prepare(
     _new_id: &str,
 ) -> Result<PreparedDocument, SignerError> {
     if !source.is_file() {
-        return Err(signing_error(format!(
+        return Err(signing_error(tr!(
             "документ {} не найден",
+            "document {} not found",
             source.display()
         )));
     }
     let signer = certificate_info(certificate_id)?;
-    let source_bytes = std::fs::read(source)
-        .map_err(|error| signing_error(format!("не удалось прочитать документ: {error}")))?;
+    let source_bytes = std::fs::read(source).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать документ: {error}",
+            "could not read the document: {error}"
+        ))
+    })?;
     let (bytes, page_count) = prepare_bytes(source_bytes, stamp, &signer)?;
     let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
     let path = staging_path(source);
     if let Err(error) = std::fs::write(&path, &bytes) {
         let _ = std::fs::remove_file(&path);
-        return Err(signing_error(format!(
-            "не удалось записать временный файл: {error}"
+        return Err(signing_error(tr!(
+            "не удалось записать временный файл: {error}",
+            "could not write the temporary file: {error}"
         )));
     }
     Ok(PreparedDocument {
@@ -108,31 +115,52 @@ fn prepare_bytes(
     stamp: &PdfStampSpec,
     signer: &CertInfo,
 ) -> Result<(Vec<u8>, usize), SignerError> {
-    let document = Document::load_mem(&source_bytes)
-        .map_err(|error| signing_error(format!("не удалось прочитать PDF: {error}")))?;
+    let document = Document::load_mem(&source_bytes).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать PDF: {error}",
+            "could not read the PDF: {error}"
+        ))
+    })?;
     if document.is_encrypted() {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "PDF защищён паролем: встроенная подпись такого документа пока не поддерживается",
-        ));
+            "the PDF is password-protected: embedded signing of such documents is not supported yet"
+        )));
     }
     if document.xref_start == 0 || document.xref_recovery.is_some() {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "PDF требует восстановления таблицы ссылок; инкрементальная подпись отменена",
-        ));
+            "the PDF requires cross-reference recovery; incremental signing was cancelled"
+        )));
     }
     let catalog_id = document
         .trailer
         .get(b"Root")
         .and_then(Object::as_reference)
-        .map_err(|error| signing_error(format!("не найден каталог PDF: {error}")))?;
+        .map_err(|error| {
+            signing_error(tr!(
+                "не найден каталог PDF: {error}",
+                "PDF catalog not found: {error}"
+            ))
+        })?;
     let catalog = document
         .get_dictionary(catalog_id)
-        .map_err(|error| signing_error(format!("не удалось прочитать каталог PDF: {error}")))?
+        .map_err(|error| {
+            signing_error(tr!(
+                "не удалось прочитать каталог PDF: {error}",
+                "could not read the PDF catalog: {error}"
+            ))
+        })?
         .clone();
     let pages_id = catalog
         .get(b"Pages")
         .and_then(Object::as_reference)
-        .map_err(|error| signing_error(format!("не найдено дерево страниц PDF: {error}")))?;
+        .map_err(|error| {
+            signing_error(tr!(
+                "не найдено дерево страниц PDF: {error}",
+                "PDF page tree not found: {error}"
+            ))
+        })?;
     let page_id = page_object_id(&document, pages_id, stamp.page)?;
     let (page_x, page_y, page_width, page_height) = page_box(&document, pages_id, page_id)?;
     let rotation = page_rotation(&document, pages_id, page_id);
@@ -167,7 +195,12 @@ fn prepare_bytes(
     let field_name = unique_field_name(&document, &fields);
     let page = document
         .get_dictionary(page_id)
-        .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?
+        .map_err(|error| {
+            signing_error(tr!(
+                "не удалось прочитать страницу PDF: {error}",
+                "could not read the PDF page: {error}"
+            ))
+        })?
         .clone();
     let mut annots = existing_array(&document, &page, b"Annots")?;
     let mut new_page = page;
@@ -336,8 +369,12 @@ fn prepare_bytes(
     }
 
     let mut bytes = Vec::new();
-    incremental.save_to(&mut bytes)
-        .map_err(|error| signing_error(format!("не удалось записать ревизию PDF: {error}")))?;
+    incremental.save_to(&mut bytes).map_err(|error| {
+        signing_error(tr!(
+            "не удалось записать ревизию PDF: {error}",
+            "could not write the PDF revision: {error}"
+        ))
+    })?;
     Ok((bytes, page_count))
 }
 
@@ -347,24 +384,32 @@ fn reserved_contents_bytes() -> usize {
     16 * 1024
 }
 
-
 /// Абсолютные позиции `/ByteRange`, `<` и `>` поля подписи.
 ///
 /// В документе бывает несколько `/Contents` (например, содержимое страницы), поэтому поле
 /// ищется по последнему `/Contents<` и соседнему `/ByteRange` нашего writer.
 pub fn locate(bytes: &[u8]) -> Result<(usize, usize, usize), SignerError> {
     let contents_at = locate_contents(bytes).ok_or_else(|| {
-        signing_error("не удалось найти поле подписи в подготовленном PDF")
+        signing_error(tr!(
+            "не удалось найти поле подписи в подготовленном PDF",
+            "could not find the signature field in the prepared PDF"
+        ))
     })?;
     let mut contents_end = contents_at + 1;
     while contents_end < bytes.len() && bytes[contents_end] != b'>' {
         if !bytes[contents_end].is_ascii_hexdigit() {
-            return Err(signing_error("повреждено поле /Contents подписи PDF"));
+            return Err(signing_error(tr!(
+                "повреждено поле /Contents подписи PDF",
+                "the PDF signature /Contents field is corrupted"
+            )));
         }
         contents_end += 1;
     }
     if contents_end >= bytes.len() {
-        return Err(signing_error("не закрыто поле /Contents подписи PDF"));
+        return Err(signing_error(tr!(
+            "не закрыто поле /Contents подписи PDF",
+            "the PDF signature /Contents field is not closed"
+        )));
     }
     let marker = b"/ByteRange";
     let before = contents_at.saturating_sub(1024)..contents_at;
@@ -374,7 +419,12 @@ pub fn locate(bytes: &[u8]) -> Result<(usize, usize, usize), SignerError> {
             find_subsequence(&bytes[contents_end..after_end], marker).map(|p| contents_end + p)
         })
         .map(|at| at + marker.len())
-        .ok_or_else(|| signing_error("не удалось найти диапазон подписи в PDF"))?;
+        .ok_or_else(|| {
+            signing_error(tr!(
+                "не удалось найти диапазон подписи в PDF",
+                "could not find the signature byte range in the PDF"
+            ))
+        })?;
     Ok((offsets_at, contents_at, contents_end))
 }
 
@@ -397,8 +447,9 @@ pub fn signed_slices(
     contents_end: usize,
 ) -> Result<(&[u8], &[u8]), SignerError> {
     if contents_end >= bytes.len() || contents_at == 0 || contents_at > contents_end {
-        return Err(signing_error(format!(
+        return Err(signing_error(tr!(
             "поле подписи вне документа: <{} .. {}>, файл {} байт",
+            "signature field is outside the document: <{} .. {}>, file is {} bytes",
             contents_at,
             contents_end,
             bytes.len()
@@ -430,18 +481,23 @@ pub fn assemble_document(
 ) -> Result<Vec<u8>, SignerError> {
     let (offsets_at, located_at, located_end) = locate(staged)?;
     if located_at != contents_at || located_end != contents_end {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "подпись относится к другому положению поля PDF",
-        ));
+            "the signature belongs to a different PDF field position"
+        )));
     }
     if cms.is_empty() {
-        return Err(signing_error("пустая CMS подписи PDF"));
+        return Err(signing_error(tr!(
+            "пустая CMS подписи PDF",
+            "the PDF signature CMS is empty"
+        )));
     }
     let cms = trim_der(cms)?;
     let capacity = contents_end.saturating_sub(contents_at + 1);
     if cms.len() * 2 > capacity {
-        return Err(signing_error(format!(
+        return Err(signing_error(tr!(
             "подпись не помещается в зарезервированное поле PDF: {} > {} байт",
+            "the signature does not fit the reserved PDF field: {} > {} bytes",
             cms.len(),
             capacity / 2
         )));
@@ -468,15 +524,17 @@ pub fn finish(
 ) -> Result<SignResult, SignerError> {
     let (_, contents_at, contents_end) = locate(&prepared.bytes)?;
     if payload.contents_at != contents_at {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "подпись относится к другому положению поля PDF",
-        ));
+            "the signature belongs to a different PDF field position"
+        )));
     }
     let bytes = assemble_document(&prepared.bytes, contents_at, contents_end, &payload.cms)?;
 
     let final_path = super::output::write_unique(output_path, &bytes).map_err(|error| {
-        signing_error(format!(
+        signing_error(tr!(
             "не удалось записать подписанный PDF ({}): {error}",
+            "could not write the signed PDF ({}): {error}",
             output_path.display()
         ))
     })?;
@@ -522,7 +580,10 @@ fn certificate_info(certificate_id: &str) -> Result<CertInfo, SignerError> {
         .into_iter()
         .find(|certificate| certificate.id == certificate_id)
         .ok_or_else(|| {
-            signing_error("выбранный сертификат больше не найден в Windows Personal")
+            signing_error(tr!(
+                "выбранный сертификат больше не найден в Windows Personal",
+                "the selected certificate is no longer present in the Windows Personal store"
+            ))
         })
 }
 
@@ -541,7 +602,10 @@ fn staging_path(source: &Path) -> PathBuf {
 /// Обрезает хвост после DER-структуры CMS (буфер мог прийти с нулевым запасом).
 fn trim_der(cms: &[u8]) -> Result<&[u8], SignerError> {
     if cms.len() < 2 || cms[0] != 0x30 {
-        return Err(signing_error("CMS не начинается с DER SEQUENCE"));
+        return Err(signing_error(tr!(
+            "CMS не начинается с DER SEQUENCE",
+            "the CMS does not start with a DER SEQUENCE"
+        )));
     }
     let (header, len) = match cms[1] {
         n if n < 0x80 => (2, n as usize),
@@ -549,7 +613,10 @@ fn trim_der(cms: &[u8]) -> Result<&[u8], SignerError> {
         n => {
             let k = (n & 0x7F) as usize;
             if k > 4 || cms.len() < 2 + k {
-                return Err(signing_error("некорректная длина CMS"));
+                return Err(signing_error(tr!(
+                    "некорректная длина CMS",
+                    "invalid CMS length"
+                )));
             }
             let len = cms[2..2 + k].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
             (2 + k, len)
@@ -557,7 +624,10 @@ fn trim_der(cms: &[u8]) -> Result<&[u8], SignerError> {
     };
     let total = header + len;
     if total > cms.len() {
-        return Err(signing_error("CMS короче, чем заявлено в заголовке"));
+        return Err(signing_error(tr!(
+            "CMS короче, чем заявлено в заголовке",
+            "the CMS is shorter than declared in its header"
+        )));
     }
     Ok(&cms[..total])
 }
@@ -571,12 +641,18 @@ fn write_byte_range(
 ) -> Result<(), SignerError> {
     let br_len = OFFSETS.len();
     if out.get(offsets_at) != Some(&b'[') || out.get(offsets_at + br_len - 1) != Some(&b']') {
-        return Err(signing_error("заглушка /ByteRange не на своём месте"));
+        return Err(signing_error(tr!(
+            "заглушка /ByteRange не на своём месте",
+            "the /ByteRange placeholder is not in place"
+        )));
     }
     let tail_start = contents_end + 1;
     let text = format!("[0 {} {} {}", contents_at, tail_start, out.len() - tail_start);
     if text.len() >= br_len {
-        return Err(signing_error("диапазон подписи не помещается в заглушку"));
+        return Err(signing_error(tr!(
+            "диапазон подписи не помещается в заглушку",
+            "the signature byte range does not fit the placeholder"
+        )));
     }
     let mut field = text.into_bytes();
     field.resize(br_len - 1, b' ');
@@ -596,8 +672,12 @@ pub fn with_byte_range(staged: &[u8]) -> Result<(Vec<u8>, usize, usize), SignerE
 pub fn export_prepared(mut prepared: PreparedDocument) -> Result<PdfSignPrepareResult, SignerError> {
     let (bytes, contents_at, contents_end) = with_byte_range(&prepared.bytes)?;
     let signed_bytes = signed_content(&bytes, contents_at, contents_end)?;
-    let path = prepared.path.take()
-        .ok_or_else(|| signing_error("не найден временный файл подготовленного PDF"))?;
+    let path = prepared.path.take().ok_or_else(|| {
+        signing_error(tr!(
+            "не найден временный файл подготовленного PDF",
+            "prepared PDF temporary file not found"
+        ))
+    })?;
     Ok(PdfSignPrepareResult {
         prepared_path: path.display().to_string(),
         signed_bytes,
@@ -655,8 +735,9 @@ fn page_object_id(
     let mut pages = Vec::new();
     collect_pages(document, pages_id, &mut pages, 0)?;
     pages.get(index).copied().ok_or_else(|| {
-        signing_error(format!(
+        signing_error(tr!(
             "в PDF нет страницы {} (всего {})",
+            "the PDF has no page {} ({} total)",
             index + 1,
             pages.len()
         ))
@@ -672,11 +753,17 @@ fn collect_pages(
     depth: usize,
 ) -> Result<(), SignerError> {
     if depth > 64 {
-        return Err(signing_error("дерево страниц PDF вложено слишком глубоко"));
+        return Err(signing_error(tr!(
+            "дерево страниц PDF вложено слишком глубоко",
+            "the PDF page tree is nested too deeply"
+        )));
     }
-    let dictionary = document
-        .get_dictionary(node)
-        .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?;
+    let dictionary = document.get_dictionary(node).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать страницу PDF: {error}",
+            "could not read the PDF page: {error}"
+        ))
+    })?;
     let kind = dictionary
         .get(b"Type")
         .and_then(Object::as_name)
@@ -685,7 +772,12 @@ fn collect_pages(
         let kids = dictionary
             .get(b"Kids")
             .and_then(Object::as_array)
-            .map_err(|error| signing_error(format!("нет /Kids в дереве страниц: {error}")))?;
+            .map_err(|error| {
+                signing_error(tr!(
+                    "нет /Kids в дереве страниц: {error}",
+                    "no /Kids in the page tree: {error}"
+                ))
+            })?;
         for kid in kids {
             if let Ok(kid) = kid.as_reference() {
                 collect_pages(document, kid, pages, depth + 1)?;
@@ -723,21 +815,37 @@ fn page_box(
     pages_id: lopdf::ObjectId,
     page_id: lopdf::ObjectId,
 ) -> Result<(f64, f64, f64, f64), SignerError> {
-    let page = document
-        .get_dictionary(page_id)
-        .map_err(|error| signing_error(format!("не удалось прочитать страницу PDF: {error}")))?;
+    let page = document.get_dictionary(page_id).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать страницу PDF: {error}",
+            "could not read the PDF page: {error}"
+        ))
+    })?;
     let media = inheritable(document, page, pages_id, b"MediaBox")
         .or_else(|| inheritable(document, page, pages_id, b"CropBox"))
         .and_then(|value| value.as_array().ok().cloned())
-        .ok_or_else(|| signing_error("в странице PDF нет MediaBox"))?;
+        .ok_or_else(|| {
+            signing_error(tr!(
+                "в странице PDF нет MediaBox",
+                "the PDF page has no MediaBox"
+            ))
+        })?;
     if media.len() != 4 {
-        return Err(signing_error("некорректный MediaBox страницы PDF"));
+        return Err(signing_error(tr!(
+            "некорректный MediaBox страницы PDF",
+            "invalid PDF page MediaBox"
+        )));
     }
     let values = media
         .iter()
         .map(|value| value.as_float().map(f64::from))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| signing_error("некорректный MediaBox страницы PDF"))?;
+        .map_err(|_| {
+            signing_error(tr!(
+                "некорректный MediaBox страницы PDF",
+                "invalid PDF page MediaBox"
+            ))
+        })?;
     let (left, bottom) = (values[0].min(values[2]), values[1].min(values[3]));
     let (right, top) = (values[2].max(values[0]), values[3].max(values[1]));
     Ok((left, bottom, right - left, top - bottom))
@@ -778,18 +886,20 @@ fn box_in_page(
     let width = mm_to_points(stamp.width_mm);
     let height = mm_to_points(stamp.height_mm);
     if width <= 0.0 || height <= 0.0 {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "область отметки пуста: нарисуйте прямоугольник штампа",
-        ));
+            "the signature mark area is empty: draw a stamp rectangle"
+        )));
     }
     if left < -0.5
         || top < -0.5
         || left + width > display_width + 0.5
         || top + height > display_height + 0.5
     {
-        return Err(signing_error(
+        return Err(signing_error(tr!(
             "область отметки выходит за пределы страницы PDF",
-        ));
+            "the signature mark area is outside the PDF page"
+        )));
     }
     if !rotated {
         let bottom = display_height - (top + height);

@@ -2,6 +2,7 @@ use crate::signer::{
     CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
     SignBatchItemResult, SignRequest, SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
 };
+use crate::tr;
 use std::path::PathBuf;
 use tauri::Manager;
 
@@ -9,14 +10,31 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|directory| directory.join("settings.json"))
-        .map_err(|error| format!("Не удалось определить каталог настроек: {error}"))
+        .map_err(|error| {
+            tr!(
+                "Не удалось определить каталог настроек: {error}",
+                "Could not determine the settings directory: {error}"
+            )
+        })
+}
+
+#[tauri::command]
+pub fn set_language(language: String) {
+    if let Some(language) = crate::i18n::Language::from_tag(&language) {
+        crate::i18n::set(language);
+    }
 }
 
 #[tauri::command]
 pub async fn load_settings(app: tauri::AppHandle) -> Result<crate::signer::AppSettings, String> {
     tokio::task::spawn_blocking(move || load_settings_sync(&app))
         .await
-        .map_err(|error| format!("Ошибка загрузки настроек: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Ошибка загрузки настроек: {error}",
+                "Could not load settings: {error}"
+            )
+        })?
 }
 
 #[cfg(windows)]
@@ -26,16 +44,24 @@ fn load_settings_sync(app: &tauri::AppHandle) -> Result<crate::signer::AppSettin
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     match hkcu.open_subkey("Software\\CryptoLite") {
         Ok(key) => match key.get_value::<String, _>("Settings") {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|error| format!("Не удалось прочитать настройки из HKCU: {error}")),
+            Ok(json) => serde_json::from_str(&json).map_err(|error| {
+                tr!(
+                    "Не удалось прочитать настройки из HKCU: {error}",
+                    "Could not read settings from HKCU: {error}"
+                )
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 migrate_legacy_settings(app)
             }
-            Err(error) => Err(format!("Не удалось прочитать настройки из HKCU: {error}")),
+            Err(error) => Err(tr!(
+                "Не удалось прочитать настройки из HKCU: {error}",
+                "Could not read settings from HKCU: {error}"
+            )),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => migrate_legacy_settings(app),
-        Err(error) => Err(format!(
-            "Не удалось открыть HKCU\\Software\\CryptoLite: {error}"
+        Err(error) => Err(tr!(
+            "Не удалось открыть HKCU\\Software\\CryptoLite: {error}",
+            "Could not open HKCU\\Software\\CryptoLite: {error}"
         )),
     }
 }
@@ -45,15 +71,25 @@ fn migrate_legacy_settings(app: &tauri::AppHandle) -> Result<crate::signer::AppS
     let path = settings_path(app)?;
     match std::fs::read(&path) {
         Ok(contents) => {
-            let settings: crate::signer::AppSettings = serde_json::from_slice(&contents)
-                .map_err(|error| format!("Не удалось прочитать {}: {error}", path.display()))?;
+            let settings: crate::signer::AppSettings =
+                serde_json::from_slice(&contents).map_err(|error| {
+                    tr!(
+                        "Не удалось прочитать {}: {error}",
+                        "Could not read {}: {error}",
+                        path.display()
+                    )
+                })?;
             save_settings_sync(&settings)?;
             Ok(settings)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(crate::signer::AppSettings::default())
         }
-        Err(error) => Err(format!("Не удалось прочитать {}: {error}", path.display())),
+        Err(error) => Err(tr!(
+            "Не удалось прочитать {}: {error}",
+            "Could not read {}: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -61,12 +97,21 @@ fn migrate_legacy_settings(app: &tauri::AppHandle) -> Result<crate::signer::AppS
 fn load_settings_sync(app: &tauri::AppHandle) -> Result<crate::signer::AppSettings, String> {
     let path = settings_path(app)?;
     match std::fs::read(&path) {
-        Ok(contents) => serde_json::from_slice(&contents)
-            .map_err(|error| format!("Не удалось прочитать {}: {error}", path.display())),
+        Ok(contents) => serde_json::from_slice(&contents).map_err(|error| {
+            tr!(
+                "Не удалось прочитать {}: {error}",
+                "Could not read {}: {error}",
+                path.display()
+            )
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(crate::signer::AppSettings::default())
         }
-        Err(error) => Err(format!("Не удалось прочитать {}: {error}", path.display())),
+        Err(error) => Err(tr!(
+            "Не удалось прочитать {}: {error}",
+            "Could not read {}: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -82,11 +127,22 @@ pub async fn save_settings(
         || !["sig", "p7s"].contains(&settings.default_signature_extension.as_str())
         || !["attached", "detached", "stamp"].contains(&settings.default_signature_type.as_str())
     {
-        return Err("Настройки содержат неподдерживаемые значения".to_owned());
+        return Err(tr!(
+            "Настройки содержат неподдерживаемые значения",
+            "Settings contain unsupported values"
+        ));
+    }
+    if let Some(language) = crate::i18n::Language::from_tag(&settings.language) {
+        crate::i18n::set(language);
     }
     tokio::task::spawn_blocking(move || save_settings_sync_for_app(&app, &settings))
         .await
-        .map_err(|error| format!("Ошибка сохранения настроек: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Ошибка сохранения настроек: {error}",
+                "Could not save settings: {error}"
+            )
+        })?
 }
 
 fn save_settings_sync_for_app(
@@ -112,11 +168,24 @@ fn save_settings_sync(settings: &crate::signer::AppSettings) -> Result<(), Strin
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu
         .create_subkey("Software\\CryptoLite")
-        .map_err(|error| format!("Не удалось создать HKCU\\Software\\CryptoLite: {error}"))?;
-    let json = serde_json::to_string(settings)
-        .map_err(|error| format!("Не удалось сериализовать настройки: {error}"))?;
-    key.set_value("Settings", &json)
-        .map_err(|error| format!("Не удалось сохранить настройки в HKCU: {error}"))
+        .map_err(|error| {
+            tr!(
+                "Не удалось создать HKCU\\Software\\CryptoLite: {error}",
+                "Could not create HKCU\\Software\\CryptoLite: {error}"
+            )
+        })?;
+    let json = serde_json::to_string(settings).map_err(|error| {
+        tr!(
+            "Не удалось сериализовать настройки: {error}",
+            "Could not serialize settings: {error}"
+        )
+    })?;
+    key.set_value("Settings", &json).map_err(|error| {
+        tr!(
+            "Не удалось сохранить настройки в HKCU: {error}",
+            "Could not save settings to HKCU: {error}"
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -125,38 +194,59 @@ fn save_settings_file(
     settings: &crate::signer::AppSettings,
 ) -> Result<(), String> {
     {
-        let directory = path
-            .parent()
-            .ok_or_else(|| "Не удалось определить каталог настроек".to_owned())?;
-        std::fs::create_dir_all(directory)
-            .map_err(|error| format!("Не удалось создать каталог настроек: {error}"))?;
-        let contents = serde_json::to_vec_pretty(settings)
-            .map_err(|error| format!("Не удалось сериализовать настройки: {error}"))?;
+        let directory = path.parent().ok_or_else(|| {
+            tr!(
+                "Не удалось определить каталог настроек",
+                "Could not determine the settings directory"
+            )
+        })?;
+        std::fs::create_dir_all(directory).map_err(|error| {
+            tr!(
+                "Не удалось создать каталог настроек: {error}",
+                "Could not create the settings directory: {error}"
+            )
+        })?;
+        let contents = serde_json::to_vec_pretty(settings).map_err(|error| {
+            tr!(
+                "Не удалось сериализовать настройки: {error}",
+                "Could not serialize settings: {error}"
+            )
+        })?;
         let temporary_path = path.with_extension("json.tmp");
-        std::fs::write(&temporary_path, contents)
-            .map_err(|error| format!("Не удалось записать настройки: {error}"))?;
+        std::fs::write(&temporary_path, contents).map_err(|error| {
+            tr!(
+                "Не удалось записать настройки: {error}",
+                "Could not write settings: {error}"
+            )
+        })?;
         match std::fs::rename(&temporary_path, &path) {
             Ok(()) => Ok(()),
             Err(first_error) if path.exists() => {
                 // Windows rename does not replace an existing destination.
                 std::fs::remove_file(&path).map_err(|error| {
                     let _ = std::fs::remove_file(&temporary_path);
-                    format!(
+                    tr!(
                         "Не удалось заменить файл настроек {}: {error}",
+                        "Could not replace the settings file {}: {error}",
                         path.display()
                     )
                 })?;
                 std::fs::rename(&temporary_path, &path).map_err(|error| {
                     let _ = std::fs::remove_file(&temporary_path);
-                    format!(
+                    tr!(
                         "Не удалось сохранить {} (предыдущая ошибка: {first_error}): {error}",
+                        "Could not save {} (previous error: {first_error}): {error}",
                         path.display()
                     )
                 })
             }
             Err(error) => {
                 let _ = std::fs::remove_file(&temporary_path);
-                Err(format!("Не удалось сохранить {}: {error}", path.display()))
+                Err(tr!(
+                    "Не удалось сохранить {}: {error}",
+                    "Could not save {}: {error}",
+                    path.display()
+                ))
             }
         }
     }
@@ -167,7 +257,10 @@ pub async fn csp_status() -> CspStatus {
     tokio::task::spawn_blocking(|| crate::signer::native::NativeSigner.csp_status())
         .await
         .unwrap_or_else(|error| {
-            CspStatus::unavailable(format!("Ошибка запуска проверки CSP: {error}"))
+            CspStatus::unavailable(tr!(
+                "Ошибка запуска проверки CSP: {error}",
+                "Could not start the CSP check: {error}"
+            ))
         })
 }
 
@@ -175,7 +268,12 @@ pub async fn csp_status() -> CspStatus {
 pub async fn list_certs() -> Result<Vec<CertInfo>, String> {
     tokio::task::spawn_blocking(|| crate::signer::native::NativeSigner.list_certs())
         .await
-        .map_err(|error| format!("Не удалось запустить перечисление сертификатов: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Не удалось запустить перечисление сертификатов: {error}",
+                "Could not start certificate enumeration: {error}"
+            )
+        })?
         .map_err(|error: SignerError| error.to_string())
 }
 
@@ -183,7 +281,12 @@ pub async fn list_certs() -> Result<Vec<CertInfo>, String> {
 pub async fn sign_file(request: SignRequest) -> Result<SignResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::NativeSigner.sign_file(request))
         .await
-        .map_err(|error| format!("Не удалось запустить подписание: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Не удалось запустить подписание: {error}",
+                "Could not start signing: {error}"
+            )
+        })?
         .map_err(|error: SignerError| error.to_string())
 }
 
@@ -213,7 +316,12 @@ pub async fn sign_files(requests: Vec<SignRequest>) -> Result<Vec<SignBatchItemR
             .collect()
     })
     .await
-    .map_err(|error| format!("Не удалось запустить пакетное подписание: {error}"))
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить пакетное подписание: {error}",
+            "Could not start batch signing: {error}"
+        )
+    })
 }
 
 #[tauri::command]
@@ -229,14 +337,26 @@ pub async fn remove_temp_pdf(path: String) -> Result<(), String> {
         let parent = candidate.parent().and_then(|p| p.canonicalize().ok());
         let temp = std::env::temp_dir().canonicalize().ok();
         if parent.is_some() && parent == temp && name.contains(".signing-") {
-            std::fs::remove_file(&candidate)
-                .map_err(|error| format!("Не удалось удалить промежуточный файл: {error}"))
+            std::fs::remove_file(&candidate).map_err(|error| {
+                tr!(
+                    "Не удалось удалить промежуточный файл: {error}",
+                    "Could not delete the temporary file: {error}"
+                )
+            })
         } else {
-            Err("Удаление разрешено только для промежуточных файлов подписи".to_owned())
+            Err(tr!(
+                "Удаление разрешено только для промежуточных файлов подписи",
+                "Only temporary PDF signing files may be deleted"
+            ))
         }
     })
     .await
-    .map_err(|error| format!("Не удалось запустить удаление: {error}"))?
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить удаление: {error}",
+            "Could not start deletion: {error}"
+        )
+    })?
 }
 #[tauri::command]
 pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResult, String> {
@@ -249,7 +369,12 @@ pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResu
         )
     })
     .await
-    .map_err(|error| format!("Не удалось запустить подпись PDF: {error}"))?
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить подпись PDF: {error}",
+            "Could not start PDF signing: {error}"
+        )
+    })?
     .map_err(|error: SignerError| error.to_string())
 }
 
@@ -266,7 +391,12 @@ pub async fn sign_pdf_prepare(
         crate::signer::pdf_layer::export_prepared(prepared)
     })
     .await
-    .map_err(|error| format!("Не удалось запустить подготовку поля подписи: {error}"))?
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить подготовку поля подписи: {error}",
+            "Could not start signature field preparation: {error}"
+        )
+    })?
     .map_err(|error: SignerError| error.to_string())
 }
 
@@ -279,7 +409,12 @@ pub async fn sign_pdf_finish(
         crate::signer::pades::finish_signed(&prepared, &request.payload, &request.output_path)
     })
     .await
-    .map_err(|error| format!("Не удалось запустить встраивание подписи: {error}"))?
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить встраивание подписи: {error}",
+            "Could not start signature embedding: {error}"
+        )
+    })?
     .map_err(|error: SignerError| error.to_string())
 }
 
@@ -287,7 +422,12 @@ pub async fn sign_pdf_finish(
 pub async fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::verify_signature(request))
         .await
-        .map_err(|error| format!("Не удалось запустить проверку подписи: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Не удалось запустить проверку подписи: {error}",
+                "Could not start signature verification: {error}"
+            )
+        })?
         .map_err(|error| error.to_string())
 }
 
@@ -295,7 +435,12 @@ pub async fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, St
 pub async fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::encrypt_file(request))
         .await
-        .map_err(|error| format!("Не удалось запустить шифрование: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Не удалось запустить шифрование: {error}",
+                "Could not start encryption: {error}"
+            )
+        })?
         .map_err(|error| error.to_string())
 }
 
@@ -303,6 +448,11 @@ pub async fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, Stri
 pub async fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::decrypt_file(request))
         .await
-        .map_err(|error| format!("Не удалось запустить расшифрование: {error}"))?
+        .map_err(|error| {
+            tr!(
+                "Не удалось запустить расшифрование: {error}",
+                "Could not start decryption: {error}"
+            )
+        })?
         .map_err(|error| error.to_string())
 }

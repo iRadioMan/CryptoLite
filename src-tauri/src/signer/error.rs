@@ -1,24 +1,97 @@
 #![deny(unsafe_code)]
-use thiserror::Error;
+use crate::tr;
+use std::fmt;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum SignerError {
-    #[error("КриптоПро CSP не найден: {0}")]
     CspNotFound(String),
-    #[error("В системе не найдена библиотека {0}")]
     MissingLibrary(String),
-    #[error("Не удалось загрузить библиотеку {library}: {details}")]
     LoadFailure { library: String, details: String },
-    #[error("Не удалось прочитать личное хранилище сертификатов Windows: {0}")]
     CertificateStore(String),
-    #[error("Не удалось подписать файл: {0}")]
     Signing(String),
-    #[error("Не удалось подписать PDF: {0}")]
     Pdf(String),
-    #[error("Не удалось зашифровать файл: {0}")]
     Encryption(String),
-    #[error("Не удалось расшифровать файл: {0}")]
     Decryption(String),
-    #[error("Перечисление сертификатов пока не поддерживается на этой платформе")]
     CertificateEnumerationUnsupported,
 }
+
+impl fmt::Display for SignerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CspNotFound(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "КриптоПро CSP не найден: {detail}",
+                    "CryptoPro CSP not found: {detail}"
+                )
+            ),
+            Self::MissingLibrary(library) => write!(
+                f,
+                "{}",
+                tr!(
+                    "В системе не найдена библиотека {library}",
+                    "Library not found on the system: {library}"
+                )
+            ),
+            Self::LoadFailure { library, details } => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось загрузить библиотеку {library}: {details}",
+                    "Could not load library {library}: {details}"
+                )
+            ),
+            Self::CertificateStore(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось прочитать личное хранилище сертификатов Windows: {detail}",
+                    "Could not read the Windows personal certificate store: {detail}"
+                )
+            ),
+            Self::Signing(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось подписать файл: {detail}",
+                    "Could not sign the file: {detail}"
+                )
+            ),
+            Self::Pdf(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось подписать PDF: {detail}",
+                    "Could not sign the PDF: {detail}"
+                )
+            ),
+            Self::Encryption(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось зашифровать файл: {detail}",
+                    "Could not encrypt the file: {detail}"
+                )
+            ),
+            Self::Decryption(detail) => write!(
+                f,
+                "{}",
+                tr!(
+                    "Не удалось расшифровать файл: {detail}",
+                    "Could not decrypt the file: {detail}"
+                )
+            ),
+            Self::CertificateEnumerationUnsupported => write!(
+                f,
+                "{}",
+                tr!(
+                    "Перечисление сертификатов пока не поддерживается на этой платформе",
+                    "Certificate enumeration is not supported on this platform yet"
+                )
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SignerError {}

@@ -59,9 +59,10 @@ mod ffi {
         } else if hash_oid == DIGEST_OID_GOST_2001 {
             Ok(DIGEST_OID_GOST_2001)
         } else {
-            Err(crate::signer::SignerError::Signing(
-                "неизвестный OID алгоритма хэша сертификата".to_owned(),
-            ))
+            Err(crate::signer::SignerError::Signing(tr!(
+                "неизвестный OID алгоритма хэша сертификата",
+                "unknown certificate hash algorithm OID"
+            )))
         }
     }
 
@@ -120,6 +121,7 @@ mod ffi {
         }
     }
 
+    use crate::tr;
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Security::Cryptography::{
@@ -170,7 +172,10 @@ mod ffi {
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         let certificate = find_certificate(&store, certificate_id)?;
         let hash_oid = hash_oid_for_certificate(certificate.as_ptr())?;
@@ -197,8 +202,9 @@ mod ffi {
             )
         };
         if ok == 0 || key_info_len == 0 {
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "у сертификата подписанта нет сведений о закрытом ключе (код Windows 0x{:08X})",
+                "the signer certificate has no private key information (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -212,8 +218,9 @@ mod ffi {
             )
         };
         if ok == 0 {
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось прочитать сведения о закрытом ключе (код Windows 0x{:08X})",
+                "could not read private key information (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -229,8 +236,9 @@ mod ffi {
             )
         };
         if acquired == 0 {
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось открыть контейнер закрытого ключа подписанта (код Windows 0x{:08X})",
+                "could not open the signer's private key container (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -273,8 +281,9 @@ mod ffi {
         if container_has_key(provider, AT_KEYEXCHANGE) {
             return Ok(AT_KEYEXCHANGE);
         }
-        Err(crate::signer::SignerError::Signing(format!(
+        Err(crate::signer::SignerError::Signing(tr!(
             "в контейнере закрытого ключа не найден ни ключ подписи, ни ключ обмена (код Windows 0x{:08X})",
+            "neither a signature key nor an exchange key was found in the private key container (Windows code 0x{:08X})",
             unsafe { GetLastError() }
         )))
     }
@@ -319,7 +328,7 @@ mod ffi {
             expires_at,
             expired,
             has_private_key,
-            source: "Windows · Личное хранилище".to_owned(),
+            source: tr!("Windows · Личное хранилище", "Windows · Personal store"),
             serial_number: hex_upper(&serial_id),
             not_before,
             not_after,
@@ -357,7 +366,10 @@ mod ffi {
     ) -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         let mut certificates = Vec::new();
         let mut previous = ptr::null();
@@ -379,18 +391,23 @@ mod ffi {
         request: crate::signer::SignRequest,
     ) -> Result<crate::signer::SignResult, crate::signer::SignerError> {
         let input = std::fs::read(&request.input_path).map_err(|error| {
-            crate::signer::SignerError::Signing(format!(
-                "не удалось прочитать исходный файл: {error}"
+            crate::signer::SignerError::Signing(tr!(
+                "не удалось прочитать исходный файл: {error}",
+                "could not read the source file: {error}"
             ))
         })?;
         if request.certificate_ids.is_empty() {
-            return Err(crate::signer::SignerError::Signing(
-                "выберите хотя бы один сертификат для подписания".to_owned(),
-            ));
+            return Err(crate::signer::SignerError::Signing(tr!(
+                "выберите хотя бы один сертификат для подписания",
+                "select at least one certificate for signing"
+            )));
         }
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         // Resolve every selected certificate; all sign the same content into one CMS.
         let certificates = request
@@ -410,8 +427,9 @@ mod ffi {
         let requested = std::path::PathBuf::from(&request.output_path);
         let final_path =
             crate::signer::output::write_unique(&requested, &output).map_err(|error| {
-                crate::signer::SignerError::Signing(format!(
+                crate::signer::SignerError::Signing(tr!(
                     "не удалось записать файл результата ({}): {error}",
+                    "could not write the result file ({}): {error}",
                     requested.display()
                 ))
             })?;
@@ -426,8 +444,9 @@ mod ffi {
     ) -> Result<crate::signer::VerifyResult, crate::signer::SignerError> {
         let signature_path = request.signature_path.clone();
         let signature = std::fs::read(&request.signature_path).map_err(|error| {
-            crate::signer::SignerError::Signing(format!(
-                "не удалось прочитать файл подписи: {error}"
+            crate::signer::SignerError::Signing(tr!(
+                "не удалось прочитать файл подписи: {error}",
+                "could not read the signature file: {error}"
             ))
         })?;
         let signature = if request.base64 {
@@ -438,21 +457,24 @@ mod ffi {
         let content_path = request.content_path.clone();
         let content = match content_path.as_ref() {
             Some(path) => Some(std::fs::read(path).map_err(|error| {
-                crate::signer::SignerError::Signing(format!(
-                    "не удалось прочитать исходный документ: {error}"
+                crate::signer::SignerError::Signing(tr!(
+                    "не удалось прочитать исходный документ: {error}",
+                    "could not read the source document: {error}"
                 ))
             })?),
             None => None,
         };
         if request.detached && content.is_none() {
-            return Err(crate::signer::SignerError::Signing(
-                "для отсоединённой подписи выберите исходный документ".to_owned(),
-            ));
+            return Err(crate::signer::SignerError::Signing(tr!(
+                "для отсоединённой подписи выберите исходный документ",
+                "select the source document for a detached signature"
+            )));
         }
         let signature_len = u32::try_from(signature.len()).map_err(|_| {
-            crate::signer::SignerError::Signing(
-                "файл подписи слишком велик для CryptoAPI".to_owned(),
-            )
+            crate::signer::SignerError::Signing(tr!(
+                "файл подписи слишком велик для CryptoAPI",
+                "the signature file is too large for CryptoAPI"
+            ))
         })?;
         let mut parameters = CRYPT_VERIFY_MESSAGE_PARA::default();
         parameters.cbSize = std::mem::size_of::<CRYPT_VERIFY_MESSAGE_PARA>() as u32;
@@ -461,9 +483,10 @@ mod ffi {
             .as_ref()
             .map(|bytes| {
                 u32::try_from(bytes.len()).map_err(|_| {
-                    crate::signer::SignerError::Signing(
-                        "исходный документ слишком велик для CryptoAPI".to_owned(),
-                    )
+                    crate::signer::SignerError::Signing(tr!(
+                        "исходный документ слишком велик для CryptoAPI",
+                        "the source document is too large for CryptoAPI"
+                    ))
                 })
             })
             .transpose()?;
@@ -502,7 +525,11 @@ mod ffi {
                 } // CRYPT_E_NO_SIGNER
                 return Ok(crate::signer::VerifyResult {
                     valid: false, signature_path, content_path, signers,
-                    message: format!("Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).", signer_index + 1),
+                    message: tr!(
+                        "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
+                        "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
+                        signer_index + 1
+                    ),
                 });
             }
             let signer_context = CertificateContext(signer);
@@ -531,8 +558,10 @@ mod ffi {
                     signature_path,
                     content_path,
                     signers,
-                    message: "В CMS найдено больше 127 подписантов; проверка остановлена."
-                        .to_owned(),
+                    message: tr!(
+                        "В CMS найдено больше 127 подписантов; проверка остановлена.",
+                        "More than 127 signers were found in the CMS; verification stopped."
+                    ),
                 });
             }
         }
@@ -541,7 +570,10 @@ mod ffi {
             signature_path,
             content_path,
             signers,
-            message: "Криптографические подписи всех подписантов верны.".to_owned(),
+            message: tr!(
+                "Криптографические подписи всех подписантов верны.",
+                "The cryptographic signatures of all signers are valid."
+            ),
         })
     }
 
@@ -565,7 +597,10 @@ mod ffi {
             let code = unsafe { GetLastError() };
             return (
                 false,
-                format!("Windows не смог построить цепочку сертификата (0x{code:08X})."),
+                tr!(
+                    "Windows не смог построить цепочку сертификата (0x{code:08X}).",
+                    "Windows could not build the certificate chain (0x{code:08X})."
+                ),
             );
         }
         let mut policy_parameters = CERT_CHAIN_POLICY_PARA::default();
@@ -584,10 +619,13 @@ mod ffi {
         if checked != 0 && policy_status.dwError == 0 {
             (
                 true,
-                "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.".to_owned(),
+                tr!(
+                    "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.",
+                    "The trust chain was confirmed by Windows; revocation was not checked."
+                ),
             )
         } else {
-            (false, format!("Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.", policy_status.dwError))
+            (false, tr!("Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.", "Windows did not confirm the trust chain (code 0x{:08X}); revocation was not checked.", policy_status.dwError))
         }
     }
 
@@ -653,9 +691,10 @@ mod ffi {
         base64::engine::general_purpose::STANDARD
             .decode(compact)
             .map_err(|_| {
-                crate::signer::SignerError::Signing(
-                    "файл не является корректной Base64/PEM подписью".to_owned(),
-                )
+                crate::signer::SignerError::Signing(tr!(
+                    "файл не является корректной Base64/PEM подписью",
+                    "the file is not a valid Base64/PEM signature"
+                ))
             })
     }
 
@@ -674,9 +713,10 @@ mod ffi {
             }
             previous = current;
         }
-        Err(crate::signer::SignerError::Signing(
-            "выбранный сертификат больше не найден в Windows Personal".to_owned(),
-        ))
+        Err(crate::signer::SignerError::Signing(tr!(
+            "выбранный сертификат больше не найден в Windows Personal",
+            "the selected certificate is no longer present in the Windows Personal store"
+        )))
     }
 
     unsafe fn certificate_id(context: *const CERT_CONTEXT) -> Option<String> {
@@ -706,19 +746,26 @@ mod ffi {
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         let certificate = find_certificate_by_id(&store, id)?;
         let info = unsafe { certificate.as_ptr().as_ref() }
             .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             .ok_or_else(|| {
-                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+                crate::signer::SignerError::Signing(tr!(
+                    "повреждённый сертификат",
+                    "corrupt certificate"
+                ))
             })?;
         let oid = info.SubjectPublicKeyInfo.Algorithm.pszObjId;
         if oid.is_null() {
-            return Err(crate::signer::SignerError::Signing(
-                "в сертификате отсутствует OID открытого ключа".to_owned(),
-            ));
+            return Err(crate::signer::SignerError::Signing(tr!(
+                "в сертификате отсутствует OID открытого ключа",
+                "the certificate has no public key OID"
+            )));
         }
         Ok(unsafe { CStr::from_ptr(oid.cast()) }.to_bytes().to_vec())
     }
@@ -729,13 +776,17 @@ mod ffi {
         let info = unsafe { context.as_ref() }
             .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             .ok_or_else(|| {
-                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+                crate::signer::SignerError::Signing(tr!(
+                    "повреждённый сертификат",
+                    "corrupt certificate"
+                ))
             })?;
         let public_key_oid_ptr = info.SubjectPublicKeyInfo.Algorithm.pszObjId;
         if public_key_oid_ptr.is_null() {
-            return Err(crate::signer::SignerError::Signing(
-                "в сертификате отсутствует OID открытого ключа".to_owned(),
-            ));
+            return Err(crate::signer::SignerError::Signing(tr!(
+                "в сертификате отсутствует OID открытого ключа",
+                "the certificate has no public key OID"
+            )));
         }
         let public_key_oid = unsafe { CStr::from_ptr(public_key_oid_ptr.cast()) }.to_bytes();
         let hash_oid: &[u8] = match public_key_oid {
@@ -743,8 +794,9 @@ mod ffi {
             b"1.2.643.7.1.1.1.2" => DIGEST_OID_GOST_2012_512,
             b"1.2.643.2.2.19" => DIGEST_OID_GOST_2001,
             _ => {
-                return Err(crate::signer::SignerError::Signing(format!(
+                return Err(crate::signer::SignerError::Signing(tr!(
                     "алгоритм сертификата пока не поддерживается (OID {})",
+                    "the certificate algorithm is not supported yet (OID {})",
                     String::from_utf8_lossy(public_key_oid)
                 )))
             }
@@ -771,13 +823,19 @@ mod ffi {
             let cert_info = unsafe { context.as_ref() }
                 .and_then(|ctx| unsafe { ctx.pCertInfo.as_ref() })
                 .ok_or_else(|| {
-                    crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+                    crate::signer::SignerError::Signing(tr!(
+                        "повреждённый сертификат",
+                        "corrupt certificate"
+                    ))
                 })?;
 
             // Embed this certificate's DER encoding into the signed message so verifiers can
             // locate the signer's certificate.
             let cert_context = unsafe { context.as_ref() }.ok_or_else(|| {
-                crate::signer::SignerError::Signing("повреждённый сертификат".to_owned())
+                crate::signer::SignerError::Signing(tr!(
+                    "повреждённый сертификат",
+                    "corrupt certificate"
+                ))
             })?;
             cert_blobs.push(CRYPT_INTEGER_BLOB {
                 cbData: cert_context.cbCertEncoded,
@@ -794,8 +852,9 @@ mod ffi {
                 )
             };
             if ok == 0 || key_info_len == 0 {
-                return Err(crate::signer::SignerError::Signing(format!(
+                return Err(crate::signer::SignerError::Signing(tr!(
                     "у сертификата подписанта нет сведений о закрытом ключе (код Windows 0x{:08X})",
+                    "the signer certificate has no private key information (Windows code 0x{:08X})",
                     unsafe { GetLastError() }
                 )));
             }
@@ -809,8 +868,9 @@ mod ffi {
                 )
             };
             if ok == 0 {
-                return Err(crate::signer::SignerError::Signing(format!(
+                return Err(crate::signer::SignerError::Signing(tr!(
                     "не удалось прочитать сведения о закрытом ключе (код Windows 0x{:08X})",
+                    "could not read private key information (Windows code 0x{:08X})",
                     unsafe { GetLastError() }
                 )));
             }
@@ -827,8 +887,9 @@ mod ffi {
                 )
             };
             if acquired == 0 {
-                return Err(crate::signer::SignerError::Signing(format!(
+                return Err(crate::signer::SignerError::Signing(tr!(
                     "не удалось открыть контейнер закрытого ключа подписанта (код Windows 0x{:08X})",
+                    "could not open the signer's private key container (Windows code 0x{:08X})",
                     unsafe { GetLastError() }
                 )));
             }
@@ -847,8 +908,9 @@ mod ffi {
                 let has_exchange =
                     unsafe { CryptGetUserKey(provider, AT_KEYEXCHANGE, &mut exchange_key) };
                 if has_exchange == 0 {
-                    return Err(crate::signer::SignerError::Signing(format!(
+                    return Err(crate::signer::SignerError::Signing(tr!(
                         "в контейнере закрытого ключа не найден ни ключ подписи, ни ключ обмена (код Windows 0x{:08X})",
+                        "neither a signature key nor an exchange key was found in the private key container (Windows code 0x{:08X})",
                         unsafe { GetLastError() }
                     )));
                 }
@@ -878,10 +940,16 @@ mod ffi {
         }
 
         let signer_count = u32::try_from(signer_infos.len()).map_err(|_| {
-            crate::signer::SignerError::Signing("слишком много сертификатов подписантов".to_owned())
+            crate::signer::SignerError::Signing(tr!(
+                "слишком много сертификатов подписантов",
+                "too many signer certificates"
+            ))
         })?;
         let cert_count = u32::try_from(cert_blobs.len()).map_err(|_| {
-            crate::signer::SignerError::Signing("слишком много сертификатов подписантов".to_owned())
+            crate::signer::SignerError::Signing(tr!(
+                "слишком много сертификатов подписантов",
+                "too many signer certificates"
+            ))
         })?;
         let signed_encode_info = CMSG_SIGNED_ENCODE_INFO {
             cbSize: std::mem::size_of::<CMSG_SIGNED_ENCODE_INFO>() as u32,
@@ -908,22 +976,25 @@ mod ffi {
             )
         };
         if message.is_null() {
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось открыть CMS-сообщение для подписания (код Windows 0x{:08X})",
+                "could not open the CMS message for signing (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
 
         let content_length = u32::try_from(content.len()).map_err(|_| {
-            crate::signer::SignerError::Signing(
-                "исходный файл превышает лимит CryptoAPI".to_owned(),
-            )
+            crate::signer::SignerError::Signing(tr!(
+                "исходный файл превышает лимит CryptoAPI",
+                "the source file exceeds the CryptoAPI limit"
+            ))
         })?;
         let updated = unsafe { CryptMsgUpdate(message, content.as_ptr(), content_length, 1) };
         if updated == 0 {
             unsafe { CryptMsgClose(message) };
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось добавить данные в CMS-сообщение (код Windows 0x{:08X})",
+                "could not add data to the CMS message (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -940,8 +1011,9 @@ mod ffi {
         };
         if sized == 0 || encoded_length == 0 {
             unsafe { CryptMsgClose(message) };
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось определить размер CMS-подписи (код Windows 0x{:08X})",
+                "could not determine the CMS signature size (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -957,8 +1029,9 @@ mod ffi {
         };
         unsafe { CryptMsgClose(message) };
         if got == 0 {
-            return Err(crate::signer::SignerError::Signing(format!(
+            return Err(crate::signer::SignerError::Signing(tr!(
                 "не удалось получить закодированную CMS-подпись (код Windows 0x{:08X})",
+                "could not obtain the encoded CMS signature (Windows code 0x{:08X})",
                 unsafe { GetLastError() }
             )));
         }
@@ -970,18 +1043,23 @@ mod ffi {
         request: crate::signer::EncryptRequest,
     ) -> Result<crate::signer::EncryptResult, crate::signer::SignerError> {
         let input = std::fs::read(&request.input_path).map_err(|error| {
-            crate::signer::SignerError::Encryption(format!(
-                "не удалось прочитать исходный файл: {error}"
+            crate::signer::SignerError::Encryption(tr!(
+                "не удалось прочитать исходный файл: {error}",
+                "could not read the source file: {error}"
             ))
         })?;
         if request.certificate_ids.is_empty() {
-            return Err(crate::signer::SignerError::Encryption(
-                "выберите хотя бы один сертификат получателя".to_owned(),
-            ));
+            return Err(crate::signer::SignerError::Encryption(tr!(
+                "выберите хотя бы один сертификат получателя",
+                "select at least one recipient certificate"
+            )));
         }
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         // Resolve each recipient certificate and keep them alive for the CryptoAPI call.
         let recipients = request
@@ -995,7 +1073,7 @@ mod ffi {
             output = encode_base64(&output).into_bytes();
         }
 
-        let final_path = write_result(&request.output_path, &output, "шифрования", false)?;
+        let final_path = write_result(&request.output_path, &output, ResultFileKind::Encryption)?;
         Ok(crate::signer::EncryptResult {
             output_path: final_path,
             bytes_written: output.len(),
@@ -1006,8 +1084,9 @@ mod ffi {
         request: crate::signer::DecryptRequest,
     ) -> Result<crate::signer::DecryptResult, crate::signer::SignerError> {
         let input = std::fs::read(&request.input_path).map_err(|error| {
-            crate::signer::SignerError::Decryption(format!(
-                "не удалось прочитать зашифрованный файл: {error}"
+            crate::signer::SignerError::Decryption(tr!(
+                "не удалось прочитать зашифрованный файл: {error}",
+                "could not read the encrypted file: {error}"
             ))
         })?;
         let input = if request.base64 {
@@ -1017,10 +1096,13 @@ mod ffi {
         };
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
-            crate::signer::SignerError::CertificateStore(format!("код Windows 0x{code:08X}"))
+            crate::signer::SignerError::CertificateStore(tr!(
+                "код Windows 0x{code:08X}",
+                "Windows code 0x{code:08X}"
+            ))
         })?;
         let output = decrypt_message(&store, &input)?;
-        let final_path = write_result(&request.output_path, &output, "расшифрования", true)?;
+        let final_path = write_result(&request.output_path, &output, ResultFileKind::Decryption)?;
         Ok(crate::signer::DecryptResult {
             output_path: final_path,
             bytes_written: output.len(),
@@ -1039,9 +1121,10 @@ mod ffi {
                 Some(oid) if oid.starts_with(b"1.2.643.7.1.1.1") => saw_gost_2012 = true,
                 Some(_) => {}
                 None => {
-                    return Err(crate::signer::SignerError::Encryption(
-                        "не удалось определить алгоритм ключа получателя".to_owned(),
-                    ))
+                    return Err(crate::signer::SignerError::Encryption(tr!(
+                        "не удалось определить алгоритм ключа получателя",
+                        "could not determine the recipient key algorithm"
+                    )))
                 }
             }
         }
@@ -1080,12 +1163,16 @@ mod ffi {
             ..Default::default()
         };
         let content_length = u32::try_from(content.len()).map_err(|_| {
-            crate::signer::SignerError::Encryption(
-                "исходный файл превышает лимит CryptoAPI".to_owned(),
-            )
+            crate::signer::SignerError::Encryption(tr!(
+                "исходный файл превышает лимит CryptoAPI",
+                "the source file exceeds the CryptoAPI limit"
+            ))
         })?;
         let recipient_count = u32::try_from(recipient_pointers.len()).map_err(|_| {
-            crate::signer::SignerError::Encryption("слишком много получателей".to_owned())
+            crate::signer::SignerError::Encryption(tr!(
+                "слишком много получателей",
+                "too many recipients"
+            ))
         })?;
         let mut encrypted_length = 0u32;
         let measured = unsafe {
@@ -1101,8 +1188,9 @@ mod ffi {
         };
         if measured == 0 {
             let code = unsafe { GetLastError() };
-            return Err(crate::signer::SignerError::Encryption(format!(
-                "не удалось подготовить CMS EnvelopedData (код Windows 0x{code:08X})"
+            return Err(crate::signer::SignerError::Encryption(tr!(
+                "не удалось подготовить CMS EnvelopedData (код Windows 0x{code:08X})",
+                "could not prepare CMS EnvelopedData (Windows code 0x{code:08X})"
             )));
         }
         let mut encrypted = vec![0u8; encrypted_length as usize];
@@ -1119,8 +1207,9 @@ mod ffi {
         };
         if created == 0 {
             let code = unsafe { GetLastError() };
-            return Err(crate::signer::SignerError::Encryption(format!(
-                "CryptoAPI не смог создать CMS EnvelopedData (код Windows 0x{code:08X})"
+            return Err(crate::signer::SignerError::Encryption(tr!(
+                "CryptoAPI не смог создать CMS EnvelopedData (код Windows 0x{code:08X})",
+                "CryptoAPI could not create CMS EnvelopedData (Windows code 0x{code:08X})"
             )));
         }
         encrypted.truncate(encrypted_length as usize);
@@ -1138,9 +1227,10 @@ mod ffi {
         parameters.cCertStore = 1;
         parameters.rghCertStore = &mut store_handle;
         let encrypted_length = u32::try_from(encrypted.len()).map_err(|_| {
-            crate::signer::SignerError::Decryption(
-                "зашифрованный файл слишком велик для CryptoAPI".to_owned(),
-            )
+            crate::signer::SignerError::Decryption(tr!(
+                "зашифрованный файл слишком велик для CryptoAPI",
+                "the encrypted file is too large for CryptoAPI"
+            ))
         })?;
         let mut decrypted_length = 0u32;
         let measured = unsafe {
@@ -1155,8 +1245,9 @@ mod ffi {
         };
         if measured == 0 {
             let code = unsafe { GetLastError() };
-            return Err(crate::signer::SignerError::Decryption(format!(
-                "не удалось определить размер расшифрованных данных (код Windows 0x{code:08X})"
+            return Err(crate::signer::SignerError::Decryption(tr!(
+                "не удалось определить размер расшифрованных данных (код Windows 0x{code:08X})",
+                "could not determine the decrypted data size (Windows code 0x{code:08X})"
             )));
         }
         let mut decrypted = vec![0u8; decrypted_length as usize];
@@ -1173,8 +1264,9 @@ mod ffi {
         };
         if decoded == 0 {
             let code = unsafe { GetLastError() };
-            return Err(crate::signer::SignerError::Decryption(format!(
-                "не удалось расшифровать файл (код Windows 0x{code:08X})"
+            return Err(crate::signer::SignerError::Decryption(tr!(
+                "не удалось расшифровать файл (код Windows 0x{code:08X})",
+                "could not decrypt the file (Windows code 0x{code:08X})"
             )));
         }
         if !decrypted_cert.is_null() {
@@ -1184,27 +1276,38 @@ mod ffi {
         Ok(decrypted)
     }
 
+    #[derive(Clone, Copy)]
+    enum ResultFileKind {
+        Encryption,
+        Decryption,
+    }
+
     fn write_result(
         output_path: &str,
         output: &[u8],
-        action: &str,
-        is_decryption: bool,
+        kind: ResultFileKind,
     ) -> Result<String, crate::signer::SignerError> {
-        let make_error = |message: String| {
-            if is_decryption {
-                crate::signer::SignerError::Decryption(message)
-            } else {
-                crate::signer::SignerError::Encryption(message)
-            }
+        let make_error = |message: String| match kind {
+            ResultFileKind::Decryption => crate::signer::SignerError::Decryption(message),
+            ResultFileKind::Encryption => crate::signer::SignerError::Encryption(message),
         };
         let requested = std::path::PathBuf::from(output_path);
         crate::signer::output::write_unique(&requested, output)
             .map(|path| path.display().to_string())
             .map_err(|error| {
-                make_error(format!(
-                    "не удалось записать файл результата {action} ({}): {error}",
-                    requested.display()
-                ))
+                let message = match kind {
+                    ResultFileKind::Encryption => tr!(
+                        "не удалось записать файл результата шифрования ({}): {error}",
+                        "could not write the encryption result file ({}): {error}",
+                        requested.display()
+                    ),
+                    ResultFileKind::Decryption => tr!(
+                        "не удалось записать файл результата расшифрования ({}): {error}",
+                        "could not write the decryption result file ({}): {error}",
+                        requested.display()
+                    ),
+                };
+                make_error(message)
             })
     }
 
@@ -1260,6 +1363,8 @@ mod ffi {
     }
 }
 
+use crate::tr;
+
 pub fn probe() -> crate::signer::CspStatus {
     // CryptoPro documents 75/80/81 for GOST 2001, GOST 2012-256 and 2012-512.
     // CRYPT_VERIFYCONTEXT checks provider initialization without opening keys.
@@ -1284,15 +1389,24 @@ pub fn probe() -> crate::signer::CspStatus {
         let cades_result = if cades_library_present() {
             super::cadescom::probe()
         } else {
-            Err("CAdESCOM DLL не найдена".to_owned())
+            Err(tr!("CAdESCOM DLL не найдена", "CAdESCOM DLL not found"))
         };
         let cades_available = cades_result.is_ok();
         let message = if cades_available {
-            "КриптоПро CSP и CAdESCOM обнаружены. Доступны CMS/PKCS#7 и CAdES-BES."
+            tr!(
+                "КриптоПро CSP и CAdESCOM обнаружены. Доступны CMS/PKCS#7 и CAdES-BES.",
+                "CryptoPro CSP and CAdESCOM detected. CMS/PKCS#7 and CAdES-BES are available."
+            )
         } else if cades_library_present() {
-            "КриптоПро CSP обнаружен, но COM объект CAdESCOM не активировался. CMS/PKCS#7 доступна."
+            tr!(
+                "КриптоПро CSP обнаружен, но COM объект CAdESCOM не активировался. CMS/PKCS#7 доступна.",
+                "CryptoPro CSP detected, but the CAdESCOM COM object did not activate. CMS/PKCS#7 is available."
+            )
         } else {
-            "КриптоПро CSP обнаружен. Доступна подпись CMS/PKCS#7; CAdES-библиотека x64 не найдена."
+            tr!(
+                "КриптоПро CSP обнаружен. Доступна подпись CMS/PKCS#7; CAdES-библиотека x64 не найдена.",
+                "CryptoPro CSP detected. CMS/PKCS#7 signing is available; the x64 CAdES library was not found."
+            )
         };
         crate::signer::CspStatus {
             available: true,
@@ -1300,11 +1414,12 @@ pub fn probe() -> crate::signer::CspStatus {
             signing_available: true,
             provider_type: Some(provider_type),
             version: csp_version,
-            message: message.to_owned(),
+            message,
         }
     } else {
-        crate::signer::CspStatus::unavailable(format!(
-            "Не удалось открыть провайдеры Crypto-Pro CSP типов 80, 81 или 75 (код Windows 0x{last_error:08X})."
+        crate::signer::CspStatus::unavailable(tr!(
+            "Не удалось открыть провайдеры Crypto-Pro CSP типов 80, 81 или 75 (код Windows 0x{last_error:08X}).",
+            "Could not open CryptoPro CSP providers of type 80, 81, or 75 (Windows code 0x{last_error:08X})."
         ))
     }
 }

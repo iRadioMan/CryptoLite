@@ -1,6 +1,18 @@
 # CryptoLite — handoff
 
-## Последняя сессия: белая подложка штампа и автоподбор кегля (2026-11-07)
+## Последняя сессия: локализация сообщений backend языком интерфейса (2026-11-08)
+
+- Новый модуль `src-tauri/src/i18n.rs`: `Language::{Ru, En}` в `AtomicU8`, `from_tag` (строго `ru`/`en`), `set`, `current` и макрос `tr!("RU", "EN", args…)`. Макрос подставляет литерал в `format!` на месте вызова, поэтому работают неявные захваты (`{error}`, `{code:08X}`). До первого вызова `set_language` язык русский.
+- Tauri-команда `set_language(language: String)` (зарегистрирована в `lib.rs` перед `load_settings`) переключает `i18n::set` для известных тегов и молча игнорирует `system`/неизвестные; `save_settings` синхронизирует язык после валидации. `system` разрешает frontend через существующий `applySettings`.
+- `SignerError` переведён с `thiserror` на ручной `Display` через `tr!` (зависимость `thiserror` удалена из `Cargo.toml`, `Cargo.lock` обновлён): префиксы ошибок следуют языку в момент отображения.
+- Все пользовательские сообщения `commands.rs`, `signer/native.rs`, `signer/csp_native/windows/mod.rs`, `signer/csp_native/cadescom.rs`, `signer/csp_native/windows/digest/mod.rs`, `signer/output.rs`, `signer/pades.rs`, `signer/pdf_layer.rs` переведены на `tr!`. `windows::write_result` вместо `action: &str` + `is_decryption` принимает `ResultFileKind::{Encryption, Decryption}`, поэтому «шифрования»/«расшифрования» больше не склеивается в рантайме.
+- Намеренно оставлены на русском видимая отметка об ЭП и её `/Reason` в `pdf_layer.rs` (`Документ подписан электронной подписью`, `ДОКУМЕНТ ПОДПИСАН`, `ЭЛЕКТРОННОЙ ПОДПИСЬЮ`, `Сертификат {}`, `Владелец {}`, `Действителен с {} по {}`) — это содержимое документа по ГОСТ Р 7.0.97-2025, а не сообщение интерфейса. `signer/pdf_cms.rs` в `signer/mod.rs` не объявлен и не компилируется, поэтому не тронут.
+- Frontend (`src/App.vue`): `setBackendLanguage()` и `refreshCspStatus()`; вызов при старте в `onMounted`, после каждого `applySettings()` в `initializeSettings` и в новом `watch(locale, …)`. Смена языка в «Настройках» или кнопкой в сайдбаре сразу переключает backend и перезапрашивает сообщение CSP. Уже показанные результаты прошлых операций (отчёт подписи, готовый результат проверки, ошибка выбора сертификата) задним числом не переводятся — их заменяет следующая операция.
+- Тесты: `cargo test --lib` — 23 passed, 1 ignored (`real_pdf_signing`). Новые `i18n::tests::language_tags_are_strict` и `i18n::tests::messages_follow_current_language` (один и тот же `SignerError` рендерится по-русски и по-английски). `npm run build` (`vue-tsc --noEmit` + Vite) проходит.
+- Сквозная проверка backend без кликов по UI: временный тест вызывал `set_language`, затем `NativeSigner.csp_status()` и `verify_signature` на мусорном `.sig` — тексты менялись (`Could not open CryptoPro CSP providers…` / `Не удалось открыть провайдеры…`, `The signature of signer #1 failed…` / `Подпись подписанта №1 не прошла…`); тест после проверки удалён. Ветка «CSP обнаружен» проверена только компиляцией: КриптоПро CSP в окружении нет. Собранный `target/debug/cryptolite.exe` запускается.
+- `cargo fmt --all` в репозитории применять по-прежнему нельзя: `csp_native`, `pades.rs`, `pdf_layer.rs` расходятся с rustfmt. Новый код написан сразу в стиле rustfmt, лишних расхождений не добавляет; dead-code warnings остались прежние.
+
+## Предыдущая сессия: белая подложка штампа и автоподбор кегля (2026-11-07)
 
 - Поток формы отметки (`/AP /N`, `pdf_layer::appearance_content`) начинается с белой заливки всего `BBox`: текст документа под штампом больше не просвечивает.
 - Кегли строк подбираются единым масштабом `fit_scale`: минимум из ограничения по ширине (`width − 2·4.5 pt`, самая широкая строка) и по высоте (`ascent + межстрочные интервалы 1.2·кегль + descent` в пределах `height − 2·3 pt`), сверху ограничен `1.0`. Номинальные кегли ГОСТ (`FONT_SCALE = 1.4`) только уменьшаются, но не растут.
@@ -38,9 +50,9 @@
 ## Стек и дерево
 
 - Frontend: Vue 3 Composition API, TypeScript, Vite, Tailwind CSS 3 (только `@tailwind base` как reset), vue-i18n. Интерфейсный шрифт — Inter 400–600, локально в `src/assets/fonts` (подмножества cyrillic/latin, WOFF2), внешних загрузок нет.
-- Desktop/backend: Tauri 2, Rust stable; `libloading`, `tokio`, `thiserror`, `tracing` уже объявлены.
+- Desktop/backend: Tauri 2, Rust stable; `libloading`, `tokio`, `tracing` уже объявлены (`thiserror` удалён: `SignerError` форматируется вручную через `tr!`).
 - Иконки интерфейса — собственный монохромный SVG-набор: `src/components/icons.ts` (пути `path d`) и `src/components/AppIcon.vue`. Эмодзи в разметке не используются.
-- Основные файлы: `src/App.vue` (рабочий экран подписи и навигация), `src/main.ts` (RU/EN), `src/style.css` (токены дизайна, светлая/тёмная тема, все компоненты), `src-tauri/src/lib.rs` и `commands.rs` (Tauri commands), `src-tauri/src/signer/` (трейт, модели, обнаружение CSP и перечисление сертификатов), `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json`.
+- Основные файлы: `src/App.vue` (рабочий экран подписи и навигация), `src/main.ts` (RU/EN), `src/style.css` (токены дизайна, светлая/тёмная тема, все компоненты), `src-tauri/src/lib.rs` и `commands.rs` (Tauri commands), `src-tauri/src/i18n.rs` (язык backend-сообщений и макрос `tr!`), `src-tauri/src/signer/` (трейт, модели, обнаружение CSP и перечисление сертификатов), `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json`.
 - `README.md`, `LICENSE`, `NOTICE` созданы.
 
 ## Что работает на текущем этапе
