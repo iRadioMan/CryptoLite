@@ -165,7 +165,7 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .alert-modal h2{margin:0 0 var(--sp-2);font-size:var(--fs-20);line-height:var(--lh-20);font-weight:600;color:var(--text-1)}
 .alert-modal p{margin:0;color:var(--text-2);font-size:var(--fs-14);line-height:var(--lh-14)}
 .alert-detail{margin-top:var(--sp-3);padding:var(--sp-3);border-radius:var(--r-sm);background:var(--surface-hover);color:var(--text-3);font-size:var(--fs-12);line-height:var(--lh-12);text-align:left;overflow-wrap:anywhere}
-.alert-modal .sign-button{height:var(--h-input);margin-top:var(--sp-4)}
+.alert-modal .sign-button{height:var(--h-input)}
 .confirm-modal{text-align:left}
 .confirm-modal h2,.confirm-modal>p{text-align:center}
 .confirm-cert-list{max-height:140px;overflow:auto;margin:var(--sp-4) 0 0;padding:var(--sp-3) var(--sp-3) var(--sp-3) 28px;border-radius:var(--r-sm);background:var(--surface-hover);color:var(--text-2);font-size:var(--fs-12);line-height:var(--lh-16)}

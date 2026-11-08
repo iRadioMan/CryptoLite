@@ -27,14 +27,18 @@ pub fn set_language(language: String) {
 
 #[tauri::command]
 pub async fn load_settings(app: tauri::AppHandle) -> Result<crate::signer::AppSettings, String> {
-    tokio::task::spawn_blocking(move || load_settings_sync(&app))
+    let mut settings = tokio::task::spawn_blocking(move || load_settings_sync(&app))
         .await
         .map_err(|error| {
             tr!(
                 "Ошибка загрузки настроек: {error}",
                 "Could not load settings: {error}"
             )
-        })?
+        })??;
+    if settings.tsp_server.trim().is_empty() {
+        settings.tsp_server = crate::signer::AppSettings::default().tsp_server;
+    }
+    Ok(settings)
 }
 
 #[cfg(windows)]

@@ -213,7 +213,7 @@ impl Default for AppSettings {
             default_certificate_ids: Vec::new(),
             default_output_directory: String::new(),
             save_last_signing_settings: true,
-            tsp_server: String::new(),
+            tsp_server: "http://pki.tax.gov.ru/tsp/tsp.srf".to_owned(),
         }
     }
 }

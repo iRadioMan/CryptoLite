@@ -25,7 +25,7 @@ const page = ref('sign');
 const navIcons: Record<string, IconName> = { sign: 'pen', encrypt: 'lock', verify: 'shield', settings: 'sliders', about: 'info' };
 const documents = ref<Doc[]>([]);
 const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, message: t('checkingCsp') });
-const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureType: 'detached', defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: 'http://pki.tax.gov.ru/tsp/tsp.srf' });
+const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureType: 'detached', defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: '' });
 const settingsLoaded = ref(false);
 const settingsSaveState = ref<'saving' | 'saved' | ''>('');
 const settingsError = ref('');
@@ -192,6 +192,10 @@ watch(selectedCertIds, () => {
   }
   else scheduleSettingsSave();
 }, { deep: true });
+watch(() => appSettings.value.defaultSignatureType, (type) => {
+  // Встроенная подпись PDF всегда CAdES-BES: в режиме штампа другие стандарты недоступны.
+  if (type === 'stamp') appSettings.value.defaultStandard = 'cades-bes';
+});
 
 function sameStringList(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -233,6 +237,7 @@ function applySettings() {
   encoding.value = appSettings.value.defaultEncoding;
   signatureType.value = appSettings.value.defaultSignatureType
     || (appSettings.value.defaultDetached ? 'detached' : 'attached');
+  if (signatureType.value === 'stamp') standard.value = 'cades-bes';
   fileType.value = appSettings.value.defaultSignatureExtension;
   outputDir.value = appSettings.value.defaultOutputDirectory;
   selectedCertIds.value = [...appSettings.value.defaultCertificateIds];
@@ -455,13 +460,16 @@ async function signStampDocument() {
 const stampMode = computed(() => signatureType.value === 'stamp');
 const stampDocuments = computed(() => documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name)));
 
+watch(stampMode, (isStamp) => {
+  // Встроенная подпись PDF всегда CAdES-BES.
+  if (isStamp) standard.value = 'cades-bes';
+}, { immediate: true });
+
 async function startStampSigning() {
   if (!stampMode.value || !selectedCertIds.value.length || signingInProgress.value) return;
   const candidates = stampDocuments.value;
   if (!candidates.length) { signingMessage.value = t('signPage.stampOnlyPdf'); return; }
   if (candidates.length > 1) { signingMessage.value = t('signPage.stampSingleDoc'); return; }
-  // Стандарт для встроенной подписи PDF всегда CAdES-BES — отдельного пункта в интерфейсе нет.
-  standard.value = 'cades-bes';
   await openStampEditor(candidates[0]);
 }
 
@@ -620,7 +628,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card">
           <div class="card-heading"><h2>{{ t('signPage.paramsTitle') }}</h2></div>
           <div class="form-grid">
-            <label class="field"><span>{{ t('standard') }}</span><select v-model="standard"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option><option value="cms">CMS / PKCS#7</option></select></label>
+            <label class="field"><span>{{ t('standard') }}</span><select v-model="standard" :disabled="stampMode"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option><option value="cms">CMS / PKCS#7</option></select></label>
             <label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
             <label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
@@ -733,9 +741,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card">
           <div class="card-heading"><h2>{{ t('settings.signingDefaults') }}</h2></div>
           <div class="form-grid settings-grid">
-            <label class="field"><span>{{ t('standard') }}</span><select v-model="appSettings.defaultStandard"><option value="cms">CMS / PKCS#7</option><option value="cades-bes">CAdES-BES</option><option value="cades-t">CAdES-T</option></select></label>
+            <label class="field"><span>{{ t('standard') }}</span><select v-model="appSettings.defaultStandard" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="cms">CMS / PKCS#7</option><option value="cades-bes">CAdES-BES</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option></select></label>
             <label class="field"><span>{{ t('encoding') }}</span><select v-model="appSettings.defaultEncoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
-            <label class="field"><span>{{ t('signatureType') }}</span><select v-model="appSettings.defaultDetached"><option :value="true">{{ t('detached') }}</option><option :value="false">{{ t('attached') }}</option></select></label>
+            <label class="field"><span>{{ t('signatureType') }}</span><select v-model="appSettings.defaultSignatureType" @change="appSettings.defaultDetached = appSettings.defaultSignatureType === 'detached'"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
             <label class="field"><span>{{ t('settings.extension') }}</span><select v-model="appSettings.defaultSignatureExtension"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
             <label class="field settings-output"><span>{{ t('settings.outputFolder') }}</span><input v-model="appSettings.defaultOutputDirectory" :placeholder="t('settings.outputPlaceholder')"/></label>
           </div>
@@ -753,7 +761,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" :alt="t('brandName')"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.5</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" :alt="t('brandName')"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.7</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
