@@ -908,7 +908,8 @@ fn fit_scale(encoded: &[embed_font::EncodedLine], width: f64, height: f64) -> f6
 ///
 /// Текст пишется CID-кодами Identity-H встроенного DejaVu, поэтому кириллица отображается
 /// на любой машине. Все строки выводятся единым масштабом `fit_scale`, поэтому ни одна
-/// строка не теряется и пропорции глифов не искажаются.
+/// строка не теряется и пропорции глифов не искажаются. Блок строк центрируется
+/// по вертикали внутри рамки; по горизонтали текст остаётся от левого поля.
 fn appearance_content(encoded: &[embed_font::EncodedLine], width: f64, height: f64) -> Vec<u8> {
     let font = embed_font::font();
     let mut content = String::new();
@@ -924,11 +925,17 @@ fn appearance_content(encoded: &[embed_font::EncodedLine], width: f64, height: f
     ));
     let scale = fit_scale(encoded, width, height);
     let ascent = f64::from(font.ascent) / f64::from(font.units_per_em);
-    let mut y = height
-        - STAMP_PADDING_Y
-        - encoded
-            .first()
-            .map_or(0.0, |line| ascent * line.font_size * scale);
+    let descent = -f64::from(font.descent) / f64::from(font.units_per_em);
+    let (Some(first), Some(last)) = (encoded.first(), encoded.last()) else {
+        return content.into_bytes();
+    };
+    let gaps: f64 = encoded
+        .windows(2)
+        .map(|pair| pair[0].font_size * STAMP_LEADING)
+        .sum();
+    // Блок строк центрируется по вертикали: поля сверху и снизу равны.
+    let block_height = (ascent * first.font_size + gaps + descent * last.font_size) * scale;
+    let mut y = (height + block_height) / 2.0 - ascent * first.font_size * scale;
     for line in encoded {
         let size = line.font_size * scale;
         // Защита от недопустимого `Tf 0` в вырожденных областях.
@@ -1249,6 +1256,31 @@ mod tests {
             "блок выше области: {} > {}",
             block * scale,
             height - 2.0 * STAMP_PADDING_Y
+        );
+        // Блок центрирован по вертикали: верхнее и нижнее поля совпадают.
+        let baselines: Vec<f64> = content
+            .lines()
+            .filter(|line| line.contains("/F0 "))
+            .map(|line| {
+                line.split(" Td")
+                    .next()
+                    .unwrap()
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(baselines.len(), encoded.len(), "{content}");
+        let ascent = f64::from(font.ascent) / units;
+        let descent = -f64::from(font.descent) / units;
+        let top_gap = height - (baselines[0] + ascent * encoded[0].font_size * scale);
+        let bottom_gap =
+            baselines[encoded.len() - 1] - descent * encoded[encoded.len() - 1].font_size * scale;
+        assert!(
+            (top_gap - bottom_gap).abs() < 1e-2,
+            "блок не по центру: сверху {top_gap}, снизу {bottom_gap}"
         );
         // На большой области кегли остаются номинальными: увеличения нет.
         assert_eq!(fit_scale(&encoded, 400.0, 200.0), 1.0);
