@@ -134,7 +134,7 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .sign-button{height:var(--h-lg);display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-2);padding:0 var(--sp-5);border-radius:var(--r-sm);background:var(--accent);color:var(--on-accent);font-size:var(--fs-14);line-height:var(--lh-14);font-weight:600;white-space:nowrap;transition:background-color .12s}
 .sign-button:hover:not(:disabled){background:var(--accent-hover)}
 .sign-button:disabled{background:var(--surface);border:1px solid var(--border);color:var(--text-3)}
-.outline-button{height:var(--h-md);padding:0 var(--sp-3);border:1px solid var(--border-input);border-radius:var(--r-sm);background:var(--surface);color:var(--text-2);font-size:var(--fs-14);line-height:var(--lh-14);transition:background-color .12s}
+.outline-button{height:var(--h-md);padding:0 var(--sp-3);border:1px solid var(--border-input);border-radius:var(--r-sm);background:var(--surface);color:var(--text-2);font-size:var(--fs-14);line-height:var(--lh-14);transition:background-color .12s;min-width: 179px}
 .outline-button:hover:not(:disabled){background:var(--surface-hover);color:var(--text-1)}
 .outline-button:disabled{opacity:.5}
 
@@ -175,7 +175,7 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .confirm-actions .sign-button,.confirm-actions .outline-button{height:var(--h-input);min-width:96px}
 
 /* certificate picker */
-.certificate-modal{width:min(640px,calc(100vw - 48px));max-height:min(680px,calc(100vh - 48px));display:flex;flex-direction:column;padding:var(--sp-5);border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-modal)}
+.certificate-modal{width:min(680px,calc(100vw - 48px));max-height:min(720px,calc(100vh - 48px));display:flex;flex-direction:column;padding:var(--sp-5);border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-modal)}
 .certificate-header{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--sp-4);margin-bottom:var(--sp-4)}
 .certificate-header h2{margin:0;font-size:var(--fs-20);line-height:var(--lh-20);font-weight:600;color:var(--text-1)}
 .certificate-search{height:var(--h-input);display:flex;align-items:center;gap:var(--sp-2);padding:0 var(--sp-3);border:1px solid var(--border-input);border-radius:var(--r-sm);color:var(--text-3)}

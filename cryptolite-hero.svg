@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 540" width="1200" height="540" role="img" aria-labelledby="cryptolite-hero-title cryptolite-hero-desc">
+  <title id="cryptolite-hero-title">КриптоЛайт: скачал — запустил — подписал</title>
+  <desc id="cryptolite-hero-desc">Мультяшный офисный работник сидит за компьютером. Над ним облако с текстом: «Зачем платить за сложные программы, если есть КриптоЛайт? Скачал — запустил — подписал — и в ус не дуешь! Даже устанавливать не нужно»</desc>
+  <defs>
+    <linearGradient id="cryptolite-brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0B7BD6"/>
+      <stop offset="1" stop-color="#2F6DF1"/>
+    </linearGradient>
+  </defs>
+
+  <path d="M 90 20 H 1110 A 40 40 0 0 1 1150 60 V 264 A 40 40 0 0 1 1110 304 H 90 A 40 40 0 0 1 50 264 V 60 A 40 40 0 0 1 90 20 Z" transform="translate(10 -2)" fill="#DCE9FF"/>
+  <path d="M 90 20 H 1110 A 40 40 0 0 1 1150 60 V 264 A 40 40 0 0 1 1110 304 H 990 C 980 330 968 342 950 348 C 932 342 920 330 910 304 H 90 A 40 40 0 0 1 50 264 V 60 A 40 40 0 0 1 90 20 Z" transform="translate(0 -12)" fill="#FFFFFF" stroke="#1F2733" stroke-width="4"/>
+
+  <g transform="translate(0 -12)" font-family="Segoe UI, Helvetica Neue, Arial, Liberation Sans, sans-serif" fill="#1F2733">
+    <text x="100" y="88" font-size="42" font-weight="700" letter-spacing="-0.6">Зачем платить за сложные программы,</text>
+    <text x="100" y="140" font-size="42" font-weight="700" letter-spacing="-0.6">если есть <tspan fill="url(#cryptolite-brand)">КриптоЛайт</tspan>?</text>
+    <text x="100" y="200" font-size="28" fill="#4B5563"><tspan fill="#2F6DF1" font-weight="600">Скачал</tspan><tspan fill="#7A8496"> — </tspan><tspan fill="#2F6DF1" font-weight="600">запустил</tspan><tspan fill="#7A8496"> — </tspan><tspan fill="#2F6DF1" font-weight="600">подписал</tspan><tspan fill="#4B5563"> — и в ус не дуешь!</tspan></text>
+    <text x="100" y="256" font-size="28" fill="#4B5563">Даже устанавливать <tspan font-weight="700" fill="#1F7A4D">не нужно</tspan></text>
+  </g>
+
+  <g stroke="#3E4C63" stroke-width="4" stroke-linejoin="round" stroke-linecap="round">
+    <ellipse cx="600" cy="532" rx="430" ry="10" fill="#e8f0ffd0" stroke="none"/>
+    <rect x="170" y="492" width="16" height="42" rx="5" fill="#C9D6EA"/>
+    <rect x="1014" y="492" width="16" height="42" rx="5" fill="#C9D6EA"/>
+    <rect x="895" y="352" width="110" height="124" rx="28" fill="#E8F0FF"/>
+    <rect x="905" y="410" width="90" height="72" rx="26" fill="#2F6DF1"/>
+    <circle cx="914" cy="376" r="8" fill="#FFD9B8" stroke-width="3"/>
+    <circle cx="986" cy="376" r="8" fill="#FFD9B8" stroke-width="3"/>
+    <circle cx="950" cy="376" r="36" fill="#FFD9B8"/>
+    <path d="M 916 370 C 914 344 936 336 950 336 C 966 336 986 346 984 370 C 972 360 964 356 950 356 C 936 356 928 360 916 370 Z" fill="#8A5A44" stroke-width="3"/>
+    <circle cx="938" cy="374" r="10" fill="none" stroke-width="2.5"/>
+    <circle cx="962" cy="374" r="10" fill="none" stroke-width="2.5"/>
+    <path d="M 948 374 H 952" fill="none" stroke-width="2.5"/>
+    <circle cx="935" cy="374" r="3.2" fill="#3E4C63" stroke="none"/>
+    <circle cx="959" cy="374" r="3.2" fill="#3E4C63" stroke="none"/>
+    <path d="M 942 392 Q 950 400 958 392" fill="none" stroke-width="3"/>
+
+    <rect x="100" y="476" width="1000" height="18" rx="9" fill="#E9EEF7"/>
+
+    <rect x="250" y="312" width="280" height="164" rx="14" fill="#2F6DF1"/>
+    <rect x="262" y="324" width="256" height="140" rx="8" fill="#EEF3FB" stroke="none"/>
+    <rect x="286" y="338" width="150" height="100" rx="6" fill="#FFFFFF" stroke="#C9D6EA" stroke-width="2"/>
+    <path d="M 302 362 H 400 M 302 380 H 420 M 302 398 H 388" stroke="#9AA3AF" stroke-width="4"/>
+    <path d="M 304 422 C 314 410 322 430 332 416 C 342 404 350 428 362 414" fill="none" stroke="#2F6DF1" stroke-width="3"/>
+    <circle cx="418" cy="418" r="16" fill="#1F7A4D" stroke="none"/>
+    <path d="M 410 418 L 416 424 L 427 410" fill="none" stroke="#FFFFFF" stroke-width="3.5"/>
+
+    <rect x="150" y="442" width="44" height="34" rx="6" fill="#DCE9FF"/>
+    <path d="M 172 442 C 160 426 162 410 172 400 C 182 412 182 428 172 442 Z" fill="#1F7A4D" stroke-width="2.5"/>
+    <path d="M 172 442 C 158 432 148 418 152 406 C 166 414 174 428 172 442 Z" fill="#2E9A63" stroke-width="2.5"/>
+    <path d="M 172 442 C 184 430 196 420 194 408 C 180 414 172 426 172 442 Z" fill="#2E9A63" stroke-width="2.5"/>
+
+    <path d="M 530 340 C 540 350 544 356 548 362" fill="none" stroke-width="2.5"/>
+    <g transform="rotate(-12 564 371)">
+      <rect x="536" y="356" width="56" height="30" rx="8" fill="#E6F7EF" stroke="#1F7A4D" stroke-width="3"/>
+      <text x="564" y="377" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="16" font-weight="700" fill="#1F7A4D" stroke="none">0 ₽</text>
+    </g>
+
+    <rect x="640" y="460" width="160" height="16" rx="5" fill="#FFFFFF"/>
+    <path d="M 650 466 H 790 M 650 471 H 790" stroke="#C9D6EA" stroke-width="2" opacity=".8"/>
+    <ellipse cx="828" cy="468" rx="14" ry="9" fill="#FFFFFF"/>
+
+    <path d="M 912 426 L 872 448 L 842 464" fill="none" stroke-width="22"/>
+    <path d="M 912 426 L 872 448 L 842 464" fill="none" stroke="#2F6DF1" stroke-width="14"/>
+    <circle cx="838" cy="466" r="10" fill="#FFD9B8" stroke-width="3"/>
+
+    <path d="M 995 428 L 1018 440 L 1034 440" fill="none" stroke-width="22"/>
+    <path d="M 995 428 L 1018 440 L 1034 440" fill="none" stroke="#2F6DF1" stroke-width="14"/>
+    <rect x="1000" y="418" width="32" height="34" rx="6" fill="#FFFFFF"/>
+    <path d="M 1032 426 C 1044 426 1044 444 1032 444" fill="none" stroke-width="3"/>
+    <path d="M 1008 414 C 1004 406 1012 402 1008 394" fill="none" stroke="#8A94A6" stroke-width="3" opacity=".8"/>
+    <path d="M 1022 414 C 1018 406 1026 402 1022 394" fill="none" stroke="#8A94A6" stroke-width="3" opacity=".8"/>
+    <circle cx="1038" cy="440" r="10" fill="#FFD9B8" stroke-width="3"/>
+  </g>
+</svg>
