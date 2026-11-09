@@ -10,6 +10,9 @@ mod ffi {
         CryptAcquireContextW, CryptGetProvParam, CryptReleaseContext, CRYPT_VERIFYCONTEXT,
     };
 
+    /// PP_LICENSE из `WinCryptEx.h`: состояние лицензии установленного КриптоПро CSP.
+    const PP_LICENSE: u32 = 158;
+
     /// CALG_GR3411_2012_256 (0x800C), см. документацию КриптоПро по хэш-алгоритмам CSP.
     const HASH_ALG_GOST_2012_256: u32 = 0x0000_800C;
     /// CALG_GR3411_2012_512 (0x800D).
@@ -119,6 +122,25 @@ mod ffi {
                 CryptReleaseContext(self.0, 0);
             }
         }
+    }
+
+    /// Есть ли у провайдера действующая лицензия КриптоПро CSP.
+    ///
+    /// Читается только признак наличия: содержимое лицензии (в том числе серийный номер)
+    /// не сохраняется и не логируется.
+    pub(super) fn provider_has_license(provider: &ProviderContext) -> bool {
+        let mut length = 0u32;
+        let sized = unsafe {
+            CryptGetProvParam(provider.0, PP_LICENSE, ptr::null_mut(), &mut length, 0)
+        };
+        if sized == 0 || length == 0 {
+            return false;
+        }
+        let mut buffer = vec![0u8; length as usize];
+        let read = unsafe {
+            CryptGetProvParam(provider.0, PP_LICENSE, buffer.as_mut_ptr(), &mut length, 0)
+        };
+        read != 0 && length > 0
     }
 
     use crate::tr;
@@ -1370,51 +1392,66 @@ pub fn probe() -> crate::signer::CspStatus {
     // CRYPT_VERIFYCONTEXT checks provider initialization without opening keys.
     let mut last_error = 0;
     let mut csp_version = None;
-    let provider_type =
-        [80, 81, 75].into_iter().find(|provider_type| {
-            match ffi::acquire_provider(*provider_type) {
-                Ok(provider) => {
-                    csp_version = ffi::provider_version(&provider);
-                    drop(provider);
-                    true
-                }
-                Err(code) => {
-                    last_error = code;
-                    false
-                }
+    let mut selected = None;
+    for provider_type in [80, 81, 75] {
+        match ffi::acquire_provider(provider_type) {
+            Ok(provider) => {
+                csp_version = ffi::provider_version(&provider);
+                selected = Some((provider_type, provider));
+                break;
             }
-        });
+            Err(code) => last_error = code,
+        }
+    }
 
-    if let Some(provider_type) = provider_type {
-        let cades_result = if cades_library_present() {
+    if let Some((provider_type, context)) = selected {
+        // Лицензия спрашивается у открытого провайдера: проверка не открывает ключи.
+        let license_available = ffi::provider_has_license(&context);
+        drop(context);
+        let library_present = cades_library_present();
+        let cades_result = if library_present {
             super::cadescom::probe()
         } else {
             Err(tr!("CAdESCOM DLL не найдена", "CAdESCOM DLL not found"))
         };
         let cades_available = cades_result.is_ok();
-        let message = if cades_available {
+        let license = if license_available {
+            tr!("лицензия действительна", "the license is valid")
+        } else {
             tr!(
-                "КриптоПро CSP и CAdESCOM обнаружены. Доступны CMS/PKCS#7 и CAdES-BES.",
-                "CryptoPro CSP and CAdESCOM detected. CMS/PKCS#7 and CAdES-BES are available."
+                "действующая лицензия не найдена, подпись может быть недоступна",
+                "no valid license was found, signing may be unavailable"
             )
-        } else if cades_library_present() {
+        };
+        let cades = if cades_available {
             tr!(
-                "КриптоПро CSP обнаружен, но COM объект CAdESCOM не активировался. CMS/PKCS#7 доступна.",
-                "CryptoPro CSP detected, but the CAdESCOM COM object did not activate. CMS/PKCS#7 is available."
+                "CMS/PKCS#7 и CAdES-BES доступны",
+                "CMS/PKCS#7 and CAdES-BES are available"
+            )
+        } else if library_present {
+            tr!(
+                "CAdESCOM не активировался; доступна CMS/PKCS#7",
+                "CAdESCOM did not activate; CMS/PKCS#7 is available"
             )
         } else {
             tr!(
-                "КриптоПро CSP обнаружен. Доступна подпись CMS/PKCS#7; CAdES-библиотека x64 не найдена.",
-                "CryptoPro CSP detected. CMS/PKCS#7 signing is available; the x64 CAdES library was not found."
+                "CAdES-библиотека x64 не найдена; доступна CMS/PKCS#7",
+                "the x64 CAdES library was not found; CMS/PKCS#7 is available"
             )
         };
         crate::signer::CspStatus {
             available: true,
             cades_available,
+            // Отсутствие лицензии в хранилище не блокирует подпись: лицензия может быть
+            // встроена в носитель ключа, а окончательную проверку даёт сама операция подписи.
             signing_available: true,
+            license_available,
             provider_type: Some(provider_type),
             version: csp_version,
-            message,
+            message: tr!(
+                "КриптоПро CSP обнаружен: {license}. {cades}.",
+                "CryptoPro CSP detected: {license}. {cades}."
+            ),
         }
     } else {
         crate::signer::CspStatus::unavailable(tr!(

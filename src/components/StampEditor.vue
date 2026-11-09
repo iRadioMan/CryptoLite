@@ -43,6 +43,9 @@ const nextSigner = computed(() => {
 });
 const pageRects = computed(() => props.rects.filter((rect) => rect.page === activePage.value));
 const mmPerPixel = computed(() => (25.4 / 72) / cssScale.value);
+/** Минимальная область отметки: меньше шести строк ГОСТ в неё не помещаются читаемо. */
+const MIN_STAMP_WIDTH_MM = 50;
+const MIN_STAMP_HEIGHT_MM = 25;
 
 function base64ToBytes(base64: string): Uint8Array {
   const binary = atob(base64);
@@ -128,12 +131,16 @@ function onPointerUp(event: MouseEvent) {
   const width = Math.abs(end.x - current.x0);
   const height = Math.abs(end.y - current.y0);
   if (width < 16 || height < 10 || !nextSigner.value) return;
+  const pageWidthMm = viewWidth.value * mmPerPixel.value;
+  const pageHeightMm = viewHeight.value * mmPerPixel.value;
+  const widthMm = Math.min(Math.max(width * mmPerPixel.value, MIN_STAMP_WIDTH_MM), pageWidthMm);
+  const heightMm = Math.min(Math.max(height * mmPerPixel.value, MIN_STAMP_HEIGHT_MM), pageHeightMm);
   const rect: StampRect = {
     page: activePage.value,
-    leftMm: left * mmPerPixel.value,
-    topMm: top * mmPerPixel.value,
-    widthMm: width * mmPerPixel.value,
-    heightMm: height * mmPerPixel.value,
+    leftMm: Math.max(0, Math.min(left * mmPerPixel.value, pageWidthMm - widthMm)),
+    topMm: Math.max(0, Math.min(top * mmPerPixel.value, pageHeightMm - heightMm)),
+    widthMm,
+    heightMm,
     certificateId: nextSigner.value,
   };
   // Один подписант — ровно одна область, и только пока у него её нет.
@@ -187,15 +194,16 @@ onBeforeUnmount(() => {
         <span>{{ t('stampEditor.page', { current: activePage + 1, total: pageCount || 1 }) }}</span>
         <button class="outline-button" :disabled="activePage + 1 >= pageCount" :aria-label="t('stampEditor.nextPage')" @click="changePage(1)"><AppIcon name="chevron-right" :size="16" /></button>
       </div>
+      <button class="outline-button stamp-clear" :disabled="!pageRects.length" @click="clearPage">
+        {{ t('stampEditor.clearPage') }}
+      </button>
       <p class="stamp-hint">
         {{ nextSigner ? t('stampEditor.hint', { signer: signerLabels[nextSigner] ?? nextSigner }) : t('stampEditor.allPlaced') }}
       </p>
-      <span v-if="nextSigner" class="stamp-counter">
-        {{ t('stampEditor.placedCount', { placed: placedCount(nextSigner), max: 1 }) }}
-      </span>
-      <button class="outline-button" :disabled="!pageRects.length" @click="clearPage">
-        {{ t('stampEditor.clearPage') }}
-      </button>
+      <div class="stamp-meta">
+        <span v-if="nextSigner" class="stamp-counter">{{ t('stampEditor.placedCount', { placed: placedCount(nextSigner), max: 1 }) }}</span>
+        <span class="stamp-counter">{{ t('stampEditor.minSize') }}</span>
+      </div>
     </header>
 
     <div class="stamp-stage">

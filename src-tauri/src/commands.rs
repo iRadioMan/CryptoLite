@@ -362,6 +362,25 @@ pub async fn remove_temp_pdf(path: String) -> Result<(), String> {
         )
     })?
 }
+
+/// Оставляет только пути к файлам: папки и недоступные пути отбрасываются.
+#[tauri::command]
+pub async fn filter_file_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|path| std::path::Path::new(path).is_file())
+            .collect::<Vec<String>>()
+    })
+    .await
+    .map_err(|error| {
+        tr!(
+            "Не удалось проверить пути к файлам: {error}",
+            "Could not check file paths: {error}"
+        )
+    })
+}
+
 #[tauri::command]
 pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResult, String> {
     tokio::task::spawn_blocking(move || {

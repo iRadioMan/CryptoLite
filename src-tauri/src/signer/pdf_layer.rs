@@ -40,6 +40,9 @@ const STAMP_PADDING_Y: f64 = 3.0;
 /// Межстрочный интервал в долях кегля.
 const STAMP_LEADING: f64 = 1.2;
 
+/// Предел символов в строке ФИО владельца: длинное имя переносится по пробелам.
+const OWNER_NAME_LINE_LIMIT: usize = 45;
+
 /// Подготовленный PDF и позиции его полей подписи.
 pub struct PreparedDocument {
     pub path: Option<PathBuf>,
@@ -809,7 +812,32 @@ fn inheritable(
     None
 }
 
-/// `/MediaBox` и `/CropBox` страницы: начало координат и размер видимой области.
+/// Приводит `/MediaBox`/`/CropBox` к `(x0, y0, x1, y1)` независимо от порядка углов.
+fn normalized_box(value: Object, name: &str) -> Result<(f64, f64, f64, f64), SignerError> {
+    let invalid = || {
+        signing_error(tr!(
+            "некорректный {name} страницы PDF",
+            "invalid PDF page {name}"
+        ))
+    };
+    let arrays = value.as_array().map_err(|_| invalid())?;
+    let values = arrays
+        .iter()
+        .map(|value| value.as_float().map(f64::from))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if values.len() != 4 {
+        return Err(invalid());
+    }
+    Ok((
+        values[0].min(values[2]),
+        values[1].min(values[3]),
+        values[0].max(values[2]),
+        values[1].max(values[3]),
+    ))
+}
+
+/// Видимая область страницы: `(x0, y0, ширина, высота)` из `/CropBox` ∩ `/MediaBox`.
 fn page_box(
     document: &Document,
     pages_id: lopdf::ObjectId,
@@ -821,62 +849,64 @@ fn page_box(
             "could not read the PDF page: {error}"
         ))
     })?;
-    let media = inheritable(document, page, pages_id, b"MediaBox")
+    let media_value = inheritable(document, page, pages_id, b"MediaBox")
         .or_else(|| inheritable(document, page, pages_id, b"CropBox"))
-        .and_then(|value| value.as_array().ok().cloned())
         .ok_or_else(|| {
             signing_error(tr!(
                 "в странице PDF нет MediaBox",
                 "the PDF page has no MediaBox"
             ))
         })?;
-    if media.len() != 4 {
+    let (media_x0, media_y0, media_x1, media_y1) = normalized_box(media_value, "MediaBox")?;
+    // Битый CropBox игнорируется, как и в просмотрщиках: остаётся MediaBox.
+    let Some((crop_x0, crop_y0, crop_x1, crop_y1)) =
+        inheritable(document, page, pages_id, b"CropBox")
+            .and_then(|value| normalized_box(value, "CropBox").ok())
+    else {
+        return Ok((media_x0, media_y0, media_x1 - media_x0, media_y1 - media_y0));
+    };
+    let (x0, y0) = (media_x0.max(crop_x0), media_y0.max(crop_y0));
+    let (x1, y1) = (media_x1.min(crop_x1), media_y1.min(crop_y1));
+    if x1 <= x0 || y1 <= y0 {
         return Err(signing_error(tr!(
-            "некорректный MediaBox страницы PDF",
-            "invalid PDF page MediaBox"
+            "видимая область страницы PDF пуста (CropBox не пересекает MediaBox)",
+            "the PDF page's visible area is empty (CropBox does not intersect MediaBox)"
         )));
     }
-    let values = media
-        .iter()
-        .map(|value| value.as_float().map(f64::from))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            signing_error(tr!(
-                "некорректный MediaBox страницы PDF",
-                "invalid PDF page MediaBox"
-            ))
-        })?;
-    let (left, bottom) = (values[0].min(values[2]), values[1].min(values[3]));
-    let (right, top) = (values[2].max(values[0]), values[3].max(values[1]));
-    Ok((left, bottom, right - left, top - bottom))
+    Ok((x0, y0, x1 - x0, y1 - y0))
 }
 
 fn page_rotation(document: &Document, pages_id: lopdf::ObjectId, page_id: lopdf::ObjectId) -> i64 {
-    document
+    match document
         .get_dictionary(page_id)
         .ok()
         .and_then(|page| inheritable(document, page, pages_id, b"Rotate"))
         .and_then(|value| value.as_i64().ok())
         .unwrap_or(0)
         .rem_euclid(360)
+    {
+        rotation @ (90 | 180 | 270) => rotation,
+        _ => 0,
+    }
 }
 
 fn mm_to_points(mm: f64) -> f64 {
     mm * 72.0 / 25.4
 }
 
-/// Переводит прямоугольник (мм от левого верхнего угла отображаемой страницы) в координаты PDF.
+/// Переводит прямоугольник (мм от левого верхнего угла видимой области страницы) в координаты PDF.
 ///
-/// Повёрнутая страница показывается в Reader повёрнутой, поэтому отметка размещается в той
-/// же видимой точке: координаты считаются в системе «после поворота» и переводятся обратно.
+/// `page_width`/`page_height` — размер видимой области (`/CropBox`), на который вызывающий код
+/// уже накладывает её начало координат. Видимая сторона страницы может быть повёрнута на
+/// 0/90/180/270, поэтому координаты считаются в системе «после поворота» и переводятся обратно.
 fn box_in_page(
     stamp: &PdfStampSpec,
     page_width: f64,
     page_height: f64,
     rotation: i64,
 ) -> Result<(f64, f64, f64, f64), SignerError> {
-    let rotated = rotation == 90 || rotation == 270;
-    let (display_width, display_height) = if rotated {
+    let swapped = rotation == 90 || rotation == 270;
+    let (display_width, display_height) = if swapped {
         (page_height, page_width)
     } else {
         (page_width, page_height)
@@ -901,7 +931,7 @@ fn box_in_page(
             "the signature mark area is outside the PDF page"
         )));
     }
-    if !rotated {
+    if rotation == 0 {
         let bottom = display_height - (top + height);
         return Ok((left, bottom, left + width, display_height - top));
     }
@@ -963,6 +993,29 @@ fn civil_from_epoch(timestamp: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
+/// Делит ФИО владельца на строки не длиннее `limit` символов, разрывая только по пробелам.
+///
+/// Слово длиннее `limit` не разрезается: оно занимает отдельную строку целиком.
+fn wrap_owner_name(name: &str, limit: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in name.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= limit {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// Строки отметки по ГОСТ Р 7.0.97-2025, п. 5.23: текст и кегль.
 fn stamp_lines(stamp: &PdfStampSpec, signer: &CertInfo) -> Vec<(String, f64)> {
     let mut lines: Vec<(String, f64)> = vec![
@@ -975,7 +1028,14 @@ fn stamp_lines(stamp: &PdfStampSpec, signer: &CertInfo) -> Vec<(String, f64)> {
     if !signer.serial_number.is_empty() {
         lines.push((format!("Сертификат {}", signer.serial_number), 5.5));
     }
-    lines.push((format!("Владелец {}", signer.owner_name), 5.5));
+    let mut owner_lines = wrap_owner_name(&signer.owner_name, OWNER_NAME_LINE_LIMIT);
+    if owner_lines.is_empty() {
+        owner_lines.push(String::new());
+    }
+    for (index, chunk) in owner_lines.into_iter().enumerate() {
+        let text = if index == 0 { format!("Владелец {chunk}") } else { chunk };
+        lines.push((text, 5.5));
+    }
     if !signer.not_before.is_empty() && !signer.not_after.is_empty() {
         lines.push((
             format!("Действителен с {} по {}", signer.not_before, signer.not_after),
@@ -1279,6 +1339,16 @@ mod tests {
         }
     }
 
+    /// Прямоугольник страницы для `/CropBox` в тестах.
+    fn box_array(x0: i64, y0: i64, x1: i64, y1: i64) -> Object {
+        Object::Array(vec![
+            Object::Integer(x0),
+            Object::Integer(y0),
+            Object::Integer(x1),
+            Object::Integer(y1),
+        ])
+    }
+
     fn test_signer() -> CertInfo {
         CertInfo {
             id: "test".into(), subject: String::new(), issuer: String::new(),
@@ -1311,6 +1381,22 @@ mod tests {
             .skip(1)
             .map(|rest| rest.split(" Tf").next().unwrap().parse().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn owner_name_wraps_at_spaces_only() {
+        let mut signer = test_signer();
+        signer.owner_name =
+            "Бурцева Ольга Андреевна Заместитель начальника отдела информационных технологий".into();
+        let lines: Vec<String> = stamp_lines(&test_stamp(), &signer)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(lines[3], "Владелец Бурцева Ольга Андреевна Заместитель");
+        assert_eq!(lines[4], "начальника отдела информационных технологий");
+        assert_eq!(lines[5], "Действителен с 2026-01-01 по 2027-01-01");
+        // Слово длиннее лимита остаётся целым.
+        assert_eq!(wrap_owner_name("короткоеимя", 5), vec!["короткоеимя".to_owned()]);
     }
 
     #[test]
@@ -1617,6 +1703,62 @@ mod tests {
         // Верх прямоугольника — 220 мм от верхнего края.
         let top = height - y1;
         assert!((top - 623.62).abs() < 0.2);
+    }
+
+    #[test]
+    fn page_box_uses_crop_box_and_origin() {
+        let mut document =
+            Document::load_mem(&sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false))
+                .unwrap();
+        let pages_id = document.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        let page_id = page_object_id(&document, pages_id, 0).unwrap();
+        document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("CropBox", box_array(50, 60, 545, 782));
+        assert_eq!(
+            page_box(&document, pages_id, page_id).unwrap(),
+            (50.0, 60.0, 495.0, 722.0)
+        );
+    }
+
+    #[test]
+    fn crop_box_is_clipped_by_media_box() {
+        let mut document =
+            Document::load_mem(&sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false))
+                .unwrap();
+        let pages_id = document.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        let page_id = page_object_id(&document, pages_id, 0).unwrap();
+        document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("CropBox", box_array(-10, -20, 700, 900));
+        assert_eq!(
+            page_box(&document, pages_id, page_id).unwrap(),
+            (0.0, 0.0, 595.0, 842.0)
+        );
+    }
+
+    #[test]
+    fn stamp_position_on_180_rotated_page() {
+        let stamp = PdfStampSpec {
+            page: 0,
+            left_mm: 120.0,
+            top_mm: 220.0,
+            width_mm: 60.0,
+            height_mm: 30.0,
+            position: String::new(),
+        };
+        let (x0, y0, x1, y1) = box_in_page(&stamp, 595.0, 842.0, 180).unwrap();
+        // Точка (120; 220) мм от левого верхнего угла видимой стороны у 180° уходит вправо-вниз.
+        assert!((x0 - 84.76).abs() < 0.1, "x0 = {x0}");
+        assert!((y0 - 623.62).abs() < 0.1, "y0 = {y0}");
+        assert!((x1 - 254.84).abs() < 0.1, "x1 = {x1}");
+        assert!((y1 - 708.66).abs() < 0.1, "y1 = {y1}");
     }
 
     #[test]

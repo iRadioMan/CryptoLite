@@ -12,7 +12,7 @@ import type { IconName } from './components/icons';
 import { forgetStampRects, type StampRect } from './signing';
 import { tempDir } from '@tauri-apps/api/path';
 
-type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
+type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; licenseAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
 type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureType: string; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
 type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
 type Doc = { path: string; name: string; selected: boolean };
@@ -24,7 +24,7 @@ const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' 
 const page = ref('sign');
 const navIcons: Record<string, IconName> = { sign: 'pen', encrypt: 'lock', verify: 'shield', settings: 'sliders', about: 'info' };
 const documents = ref<Doc[]>([]);
-const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, message: t('checkingCsp') });
+const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, message: t('checkingCsp') });
 const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureType: 'detached', defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: '' });
 const settingsLoaded = ref(false);
 const settingsSaveState = ref<'saving' | 'saved' | ''>('');
@@ -94,7 +94,17 @@ const outputDir = ref('');
 const isDark = ref(localStorage.getItem('cryptolite.theme') === 'dark');
 let settingsSaveQueue: Promise<unknown> = Promise.resolve();
 const selectedCount = computed(() => documents.value.filter((document) => document.selected).length);
-const selectedCertificates = computed(() => selectedCertIds.value.map((id) => certificates.value.find((certificate) => certificate.id === id)).filter((certificate): certificate is CertInfo => !!certificate && !certificate.expired));
+type CertificateUse = 'signing' | 'defaults' | 'encryption';
+/** Сертификат годится для использования: для подписи и умолчаний нужен привязанный ключ. */
+function certificateMatches(certificate: CertInfo, use: CertificateUse) {
+  if (certificate.expired) return false;
+  return use === 'encryption' || certificate.hasPrivateKey;
+}
+/** Оставляет только идентификаторы пригодных сертификатов: устаревшие ID не «залипают». */
+function filterCertificateIds(ids: string[], use: CertificateUse) {
+  return ids.filter((id) => certificates.value.some((certificate) => certificate.id === id && certificateMatches(certificate, use)));
+}
+const selectedCertificates = computed(() => selectedCertIds.value.map((id) => certificates.value.find((certificate) => certificate.id === id)).filter((certificate): certificate is CertInfo => !!certificate && certificateMatches(certificate, 'signing')));
 const stampSignerLabels = computed<Record<string, string>>(() => Object.fromEntries(
   selectedCertificates.value.map((certificate) => [certificate.id, certificate.ownerName || certificate.subject]),
 ));
@@ -102,16 +112,16 @@ const stampDocument = computed(() => documents.value.find((document) => document
 const stampReady = computed(() => !!stampDocument
   && stampRects.value.length === selectedCertificates.value.length
   && stampRects.value.every((rect) => selectedCertificates.value.filter((certificate) => certificate.id === rect.certificateId).length === 1));
-const defaultCertificateNames = computed(() => certificates.value.filter((certificate) => appSettings.value.defaultCertificateIds.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
+const defaultCertificateNames = computed(() => certificates.value.filter((certificate) => appSettings.value.defaultCertificateIds.includes(certificate.id) && certificateMatches(certificate, 'defaults')).map((certificate) => certificate.subject));
 const canSign = computed(() => {
   if (!status.value.available || !selectedCount.value || signingInProgress.value) return false;
   if (!selectedCertificates.value.length) return false;
   if (stampMode.value) {
-    // Встроенная подпись PDF: CAdES-BES, один документ, по области на каждого подписанта.
+    // Встроенная подпись PDF: CryptoAPI, один документ, по области на каждого подписанта.
     const pdfDocuments = documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name));
-    return status.value.cadesAvailable && pdfDocuments.length === 1;
+    return status.value.signingAvailable && pdfDocuments.length === 1;
   }
-  if (standard.value === 'cades-bes') return status.value.cadesAvailable && selectedCertIds.value.length === 1;
+  if (standard.value === 'cades-bes') return status.value.cadesAvailable && selectedCertificates.value.length === 1;
   if (standard.value === 'cms') return status.value.signingAvailable;
   return false;
 });
@@ -127,11 +137,13 @@ const filteredCertificates = computed(() => {
     .concat(matching.filter((certificate) => !draftIds.has(certificate.id)));
 });
 const cryptoSelectedCount = computed(() => cryptoFiles.value.filter((document) => document.selected).length);
-const cryptoRecipientNames = computed(() => certificates.value.filter((certificate) => cryptoRecipientIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject));
-const canEncrypt = computed(() => status.value.available && cryptoMode.value === 'encrypt' && cryptoSelectedCount.value > 0 && cryptoRecipientIds.value.length > 0 && !cryptoProgress.value);
+const cryptoRecipientNames = computed(() => certificates.value.filter((certificate) => cryptoRecipientIds.value.includes(certificate.id) && certificateMatches(certificate, 'encryption')).map((certificate) => certificate.subject));
+const canEncrypt = computed(() => status.value.available && cryptoMode.value === 'encrypt' && cryptoSelectedCount.value > 0 && cryptoRecipientNames.value.length > 0 && !cryptoProgress.value);
 const canDecrypt = computed(() => status.value.available && cryptoMode.value === 'decrypt' && cryptoSelectedCount.value > 0 && !cryptoProgress.value);
 const cryptoSuccessCount = computed(() => cryptoReportItems.value.filter((item) => item.success).length);
 const cryptoErrorCount = computed(() => cryptoReportItems.value.length - cryptoSuccessCount.value);
+/** Перетаскивание принимают только экраны, которым есть куда добавлять файлы. */
+const dropEnabled = computed(() => page.value === 'sign' || page.value === 'encrypt' || page.value === 'verify');
 
 onMounted(async () => {
   document.documentElement.classList.toggle('dark', isDark.value);
@@ -146,10 +158,11 @@ onMounted(async () => {
   unlistenSystemTheme = () => colorScheme.removeEventListener('change', onSystemThemeChange);
   try {
     unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === 'enter') dragHover.value = true;
+      if (event.payload.type === 'enter') dragHover.value = dropEnabled.value;
       else if (event.payload.type === 'leave') dragHover.value = false;
       else if (event.payload.type === 'drop') {
         dragHover.value = false;
+        if (!dropEnabled.value) return;
         handleDroppedPaths(event.payload.paths);
       }
     });
@@ -165,7 +178,8 @@ onUnmounted(() => { unlistenDrop?.(); unlistenSystemTheme?.(); });
 
 watch(appSettings, () => {
   if (!settingsLoaded.value) return;
-  applySettings();
+  // Изменение умолчаний не должно сбрасывать уже выбранные параметры формы.
+  applyAppearance();
   scheduleSettingsSave();
 }, { deep: true });
 watch(locale, async (language) => {
@@ -173,24 +187,20 @@ watch(locale, async (language) => {
   await refreshCspStatus();
 });
 watch([standard, encoding, signatureType, fileType, outputDir], () => {
-  if (!settingsLoaded.value) return;
-  if (appSettings.value.saveLastSigningSettings) {
-    appSettings.value.defaultStandard = standard.value;
-    appSettings.value.defaultEncoding = encoding.value;
-    appSettings.value.defaultDetached = signatureType.value === 'detached';
-    appSettings.value.defaultSignatureType = signatureType.value;
-    appSettings.value.defaultSignatureExtension = fileType.value;
-    appSettings.value.defaultOutputDirectory = outputDir.value;
-  } else scheduleSettingsSave();
+  // «Не запоминать» означает и «не сохранять»: форма не пишется в настройки.
+  if (!settingsLoaded.value || !appSettings.value.saveLastSigningSettings) return;
+  appSettings.value.defaultStandard = standard.value;
+  appSettings.value.defaultEncoding = encoding.value;
+  appSettings.value.defaultDetached = signatureType.value === 'detached';
+  appSettings.value.defaultSignatureType = signatureType.value;
+  appSettings.value.defaultSignatureExtension = fileType.value;
+  appSettings.value.defaultOutputDirectory = outputDir.value;
 });
 watch(selectedCertIds, () => {
-  if (!settingsLoaded.value) return;
-  if (appSettings.value.saveLastSigningSettings) {
-    if (!sameStringList(appSettings.value.defaultCertificateIds, selectedCertIds.value)) {
-      appSettings.value.defaultCertificateIds = [...selectedCertIds.value];
-    }
+  if (!settingsLoaded.value || !appSettings.value.saveLastSigningSettings) return;
+  if (!sameStringList(appSettings.value.defaultCertificateIds, selectedCertIds.value)) {
+    appSettings.value.defaultCertificateIds = [...selectedCertIds.value];
   }
-  else scheduleSettingsSave();
 }, { deep: true });
 watch(() => appSettings.value.defaultSignatureType, (type) => {
   // Встроенная подпись PDF всегда CAdES-BES: в режиме штампа другие стандарты недоступны.
@@ -213,7 +223,7 @@ async function refreshCspStatus() {
   try {
     status.value = await invoke<CspStatus>('csp_status');
   } catch (error) {
-    status.value = { available: false, cadesAvailable: false, signingAvailable: false, message: String(error) };
+    status.value = { available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, message: String(error) };
   }
 }
 
@@ -232,7 +242,8 @@ async function initializeSettings() {
     await setBackendLanguage(locale.value);
   }
 }
-function applySettings() {
+/** Умолчания подписания: применяются только при загрузке настроек и при их явном выборе. */
+function applySigningDefaults() {
   standard.value = appSettings.value.defaultStandard;
   encoding.value = appSettings.value.defaultEncoding;
   signatureType.value = appSettings.value.defaultSignatureType
@@ -240,8 +251,14 @@ function applySettings() {
   if (signatureType.value === 'stamp') standard.value = 'cades-bes';
   fileType.value = appSettings.value.defaultSignatureExtension;
   outputDir.value = appSettings.value.defaultOutputDirectory;
-  selectedCertIds.value = [...appSettings.value.defaultCertificateIds];
-  certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject);
+  // Пока список сертификатов не загружен, фильтровать нельзя: иначе умолчания обнулятся.
+  selectedCertIds.value = certificates.value.length
+    ? filterCertificateIds(appSettings.value.defaultCertificateIds, 'signing')
+    : [...appSettings.value.defaultCertificateIds];
+  certificateNames.value = selectedCertificates.value.map((certificate) => certificate.subject);
+}
+/** Внешний вид и язык: применяются и при изменении настроек «на лету». */
+function applyAppearance() {
   const language = appSettings.value.language === 'system' ? systemLanguage : appSettings.value.language;
   locale.value = language;
   document.documentElement.lang = language;
@@ -251,6 +268,10 @@ function applySettings() {
   document.documentElement.classList.toggle('dark', dark);
   document.documentElement.classList.toggle('motion-off', !appSettings.value.animations);
   localStorage.setItem('cryptolite.theme', dark ? 'dark' : 'light');
+}
+function applySettings() {
+  applySigningDefaults();
+  applyAppearance();
 }
 function scheduleSettingsSave() {
   settingsSaveState.value = 'saving';
@@ -267,24 +288,35 @@ async function refreshSettingsCertificates() {
   certsError.value = '';
   try {
     certificates.value = await invoke<CertInfo[]>('list_certs');
-    appSettings.value.defaultCertificateIds = appSettings.value.defaultCertificateIds.filter((id) => certificates.value.some((certificate) => certificate.id === id && !certificate.expired));
-    certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject);
+    appSettings.value.defaultCertificateIds = filterCertificateIds(appSettings.value.defaultCertificateIds, 'defaults');
+    selectedCertIds.value = filterCertificateIds(selectedCertIds.value, 'signing');
+    certificateNames.value = selectedCertificates.value.map((certificate) => certificate.subject);
   }
   catch (error) { certsError.value = String(error); }
   finally { certsLoading.value = false; }
 }
 
-function addFiles(paths: string[]) {
-  for (const path of paths) {
+async function addFiles(paths: string[]) {
+  if (!paths.length) return;
+  let files: string[];
+  try {
+    files = await invoke<string[]>('filter_file_paths', { paths });
+  } catch (error) {
+    signingMessage.value = String(error);
+    return;
+  }
+  for (const path of files) {
     if (!documents.value.some((doc) => doc.path === path)) {
       const name = path.split(/[\\/]/).pop() || path;
       documents.value.push({ path, name, selected: true });
     }
   }
+  const skipped = paths.length - files.length;
+  signingMessage.value = skipped > 0 ? t('signPage.pathsSkipped', { count: skipped }) : '';
 }
 async function chooseFiles() {
   const result = await open({ multiple: true, title: t('add') });
-  if (result) addFiles(Array.isArray(result) ? result : [result]);
+  if (result) await addFiles(Array.isArray(result) ? result : [result]);
 }
 async function chooseOutput() {
   const result = await open({ directory: true, title: t('output') });
@@ -315,7 +347,7 @@ async function runVerify() {
 }
 function handleDroppedPaths(paths: string[]) {
   if (page.value === 'sign') {
-    addFiles(paths);
+    void addFiles(paths);
   } else if (page.value === 'encrypt') {
     addCryptoFiles(paths);
   } else if (page.value === 'verify' && paths.length) {
@@ -336,25 +368,26 @@ function toggleTheme() {
 }
 async function openCertificatePicker(mode: 'signing' | 'defaults' = 'signing') {
   certPickerMode.value = mode;
-  pickerDraftCertIds.value = [...(mode === 'defaults' ? appSettings.value.defaultCertificateIds : selectedCertIds.value)];
+  pickerDraftCertIds.value = filterCertificateIds(mode === 'defaults' ? appSettings.value.defaultCertificateIds : selectedCertIds.value, mode);
   certPickerOpen.value = true;
   certFilter.value = '';
   certsError.value = '';
   certsLoading.value = true;
   try {
     certificates.value = await invoke<CertInfo[]>('list_certs');
-    pickerDraftCertIds.value = pickerDraftCertIds.value.filter((id) => certificates.value.some((certificate) => certificate.id === id && !certificate.expired));
-    certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id)).map((certificate) => certificate.subject);
+    pickerDraftCertIds.value = filterCertificateIds(pickerDraftCertIds.value, certPickerMode.value);
+    certificateNames.value = selectedCertificates.value.map((certificate) => certificate.subject);
   }
   catch (error) { certsError.value = String(error); }
   finally { certsLoading.value = false; }
 }
 function confirmCertificates() {
-  const activeIds = pickerDraftCertIds.value.filter((id) => certificates.value.some((certificate) => certificate.id === id && !certificate.expired));
-  if (certPickerMode.value === 'defaults') appSettings.value.defaultCertificateIds = activeIds;
-  else if (certPickerMode.value === 'encryption') cryptoRecipientIds.value = activeIds;
+  const use = certPickerMode.value;
+  const activeIds = filterCertificateIds(pickerDraftCertIds.value, use);
+  if (use === 'defaults') appSettings.value.defaultCertificateIds = activeIds;
+  else if (use === 'encryption') cryptoRecipientIds.value = activeIds;
   else selectedCertIds.value = activeIds;
-  if (certPickerMode.value === 'signing') certificateNames.value = certificates.value.filter((certificate) => selectedCertIds.value.includes(certificate.id) && !certificate.expired).map((certificate) => certificate.subject);
+  certificateNames.value = selectedCertificates.value.map((certificate) => certificate.subject);
   certPickerOpen.value = false;
 }
 function parseDroppedBytes(base64: string): Uint8Array {
@@ -406,15 +439,25 @@ async function signStampDocument() {
   const folder = outputDir.value || source.path.slice(0, separator);
   const slash = source.path.includes('\\') ? '\\' : '/';
   const baseName = source.name.replace(/\.pdf$/i, '');
+  const order = stampOrder();
   signingInProgress.value = true;
   signingMessage.value = '';
   signReportItems.value = [];
+  // Промежуточные файлы партии: удаляются при любом исходе, финальный файл сюда не попадает.
+  const tempFiles = new Set<string>();
+  async function discardTemp(path: string) {
+    try {
+      await invoke('remove_temp_pdf', { path });
+      tempFiles.delete(path);
+    } catch (error) {
+      console.warn('Не удалось удалить промежуточный PDF', error);
+    }
+  }
   let currentInput = source.path;
   let output = '';
-  let succeeded = true;
   try {
-    for (const [index, item] of stampOrder().entries()) {
-      const isLast = index === stampOrder().length - 1;
+    for (const [index, item] of order.entries()) {
+      const isLast = index === order.length - 1;
       const tmp = await tempDir();
       const targetPath = isLast
         ? `${folder ? folder + slash : ''}${baseName}_signed.pdf`
@@ -435,21 +478,19 @@ async function signStampDocument() {
           },
         },
       });
-      if (!isLast) {
-        // Промежуточный файл нужен только для следующего подписанта.
-        const previous = currentInput === source.path ? null : currentInput;
-        if (previous) {
-          await invoke('remove_temp_pdf', { path: previous });
-        }
-      }
+      output = result.outputPath;
+      if (!isLast) tempFiles.add(result.outputPath);
+      // Вход этого шага больше не нужен: удаляем промежуточный файл сразу после успеха.
+      if (currentInput !== source.path) await discardTemp(currentInput);
       currentInput = result.outputPath;
     }
     signReportItems.value = [{ inputPath: source.path, outputPath: currentInput, success: true, error: null }];
   } catch (error) {
-    succeeded = false;
     signReportItems.value = [{ inputPath: source.path, outputPath: output, success: false, error: String(error) }];
+    signingMessage.value = String(error);
   } finally {
-    if (!succeeded) signingMessage.value = '';
+    // Остатки удаляются и после ошибки на любом шаге.
+    for (const path of [...tempFiles]) await discardTemp(path);
     stampOpen.value = false;
     signReportOpen.value = true;
     signingInProgress.value = false;
@@ -466,18 +507,20 @@ watch(stampMode, (isStamp) => {
 }, { immediate: true });
 
 async function startStampSigning() {
-  if (!stampMode.value || !selectedCertIds.value.length || signingInProgress.value) return;
+  if (!stampMode.value || !selectedCertificates.value.length || signingInProgress.value) return;
   const candidates = stampDocuments.value;
   if (!candidates.length) { signingMessage.value = t('signPage.stampOnlyPdf'); return; }
   if (candidates.length > 1) { signingMessage.value = t('signPage.stampSingleDoc'); return; }
+  if (!(await askMultiCertificateConfirmation('signing', selectedCertificates.value.map((certificate) => certificate.id)))) return;
   await openStampEditor(candidates[0]);
 }
 
 async function signSelectedDocument() {
   const selected = documents.value.filter((document) => document.selected);
   if (stampMode.value) { await startStampSigning(); return; }
-  if (!canSign.value || !selected.length || !selectedCertIds.value.length || signingInProgress.value) return;
-  if (!(await askMultiCertificateConfirmation('signing', selectedCertIds.value))) return;
+  const signingIds = selectedCertificates.value.map((certificate) => certificate.id);
+  if (!canSign.value || !selected.length || !signingIds.length || signingInProgress.value) return;
+  if (!(await askMultiCertificateConfirmation('signing', signingIds))) return;
   const requests = selected.map((document) => {
     const separator = Math.max(document.path.lastIndexOf('/'), document.path.lastIndexOf('\\'));
     const folder = outputDir.value || document.path.slice(0, separator);
@@ -492,7 +535,7 @@ async function signSelectedDocument() {
         standard: standard.value,
         inputPath,
         outputPath,
-        certificateIds: [...selectedCertIds.value],
+        certificateIds: [...signingIds],
         detached: signatureType.value === 'detached',
         base64: encoding.value === 'base64',
       })),
@@ -521,7 +564,7 @@ async function chooseCryptoOutput() {
   if (result && typeof result === 'string') cryptoOutputDir.value = result;
 }
 function openRecipientPicker() {
-  pickerDraftCertIds.value = [...cryptoRecipientIds.value];
+  pickerDraftCertIds.value = filterCertificateIds(cryptoRecipientIds.value, 'encryption');
   certPickerMode.value = 'encryption';
   certPickerOpen.value = true;
   certFilter.value = '';
@@ -530,7 +573,7 @@ function openRecipientPicker() {
   invoke<CertInfo[]>('list_certs')
     .then((certs) => {
       certificates.value = certs;
-      pickerDraftCertIds.value = pickerDraftCertIds.value.filter((id) => certs.some((certificate) => certificate.id === id && !certificate.expired));
+      pickerDraftCertIds.value = filterCertificateIds(pickerDraftCertIds.value, 'encryption');
     })
     .catch((error) => { certsError.value = String(error); })
     .finally(() => { certsLoading.value = false; });
@@ -538,8 +581,9 @@ function openRecipientPicker() {
 async function runCrypto() {
   const selected = cryptoFiles.value.filter((document) => document.selected);
   if (cryptoProgress.value || !selected.length) return;
-  if (cryptoMode.value === 'encrypt' && !cryptoRecipientIds.value.length) return;
-  if (cryptoMode.value === 'encrypt' && !(await askMultiCertificateConfirmation('encryption', cryptoRecipientIds.value))) return;
+  const recipients = filterCertificateIds(cryptoRecipientIds.value, 'encryption');
+  if (cryptoMode.value === 'encrypt' && !recipients.length) return;
+  if (cryptoMode.value === 'encrypt' && !(await askMultiCertificateConfirmation('encryption', recipients))) return;
   cryptoProgress.value = true;
   cryptoReportItems.value = [];
   for (const document of selected) {
@@ -555,7 +599,7 @@ async function runCrypto() {
         const result = await invoke<CryptoResult>('encrypt_file', { request: {
           inputPath: document.path,
           outputPath,
-          certificateIds: cryptoRecipientIds.value,
+          certificateIds: recipients,
           base64: cryptoEncoding.value === 'base64',
         } });
         cryptoReportItems.value.push({ inputPath: document.path, outputPath: result.outputPath, success: true, error: null });
@@ -584,8 +628,8 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 </script>
 
 <template>
-  <div class="app-shell" :class="{ 'drag-hover': dragHover }">
-    <div v-if="dragHover" class="drop-overlay">
+  <div class="app-shell" :class="{ 'drag-hover': dragHover && dropEnabled }">
+    <div v-if="dragHover && dropEnabled" class="drop-overlay">
       <span><AppIcon name="upload" :size="24" /></span>
       <b>{{ page==='verify'?t('dropOverlay.verify'):page==='encrypt'?t('dropOverlay.encrypt'):t('dropOverlay.sign') }}</b>
     </div>
@@ -671,7 +715,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         </section>
         <p v-if="signingMessage" class="form-message" role="alert">{{ signingMessage }}</p>
         <footer class="action-bar">
-          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'?t('signPage.cadesNotConnected'):standard==='cades-bes'&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):selectedCertIds.length===0?t('signPage.chooseCerts'):standard==='cades-bes'&&!stampMode&&selectedCertIds.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
+          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'?t('signPage.cadesNotConnected'):standard==='cades-bes'&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):standard==='cades-bes'&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
         </footer>
       </section>
 
@@ -725,7 +769,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
           </div>
           <div v-if="cryptoFiles.length" class="documents-footer">{{ t('selectionSummary', { selected: cryptoSelectedCount, total: cryptoFiles.length }) }}</div>
         </section>
-        <footer class="action-bar"><button class="sign-button" :disabled="cryptoMode==='encrypt'? !canEncrypt : !canDecrypt" :title="!status.available?t('unavailable'):cryptoMode==='encrypt'&&cryptoSelectedCount===0?t('encryptPage.chooseFilesBtn'):cryptoMode==='encrypt'&&!cryptoRecipientIds.length?t('encryptPage.chooseRecipientsBtn'):''" @click="runCrypto">{{ cryptoProgress ? (cryptoMode==='encrypt'?t('encryptPage.encrypting'):t('encryptPage.decrypting')) : (cryptoMode==='encrypt'?t('encryptPage.encrypt'):t('encryptPage.decrypt')) }}</button></footer>
+        <footer class="action-bar"><button class="sign-button" :disabled="cryptoMode==='encrypt'? !canEncrypt : !canDecrypt" :title="!status.available?t('unavailable'):cryptoMode==='encrypt'&&cryptoSelectedCount===0?t('encryptPage.chooseFilesBtn'):cryptoMode==='encrypt'&&!cryptoRecipientNames.length?t('encryptPage.chooseRecipientsBtn'):''" @click="runCrypto">{{ cryptoProgress ? (cryptoMode==='encrypt'?t('encryptPage.encrypting'):t('encryptPage.decrypting')) : (cryptoMode==='encrypt'?t('encryptPage.encrypt'):t('encryptPage.decrypt')) }}</button></footer>
       </section>
 
       <section v-else-if="page==='settings'" class="content-view">
@@ -753,7 +797,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
           <div class="card-heading"><h2>{{ t('settings.defaultCerts') }}</h2></div>
           <div class="default-cert-picker"><div class="default-cert-summary"><template v-if="defaultCertificateNames.length"><b v-for="name in defaultCertificateNames" :key="name">{{ name }}</b></template><span v-else>{{ t('settings.noDefaultCert') }}</span></div><button class="outline-button" @click="openCertificatePicker('defaults')">{{ t('settings.chooseCert') }}</button></div>
         </section>
-        <section class="card">
+        <section class="card settings-tsp">
           <div class="card-heading"><h2>{{ t('settings.tsp') }}</h2></div>
           <label class="field"><span>{{ t('settings.tspServer') }}</span><input v-model="appSettings.tspServer" type="url" placeholder="https://tsa.example.ru/"/></label>
         </section>
@@ -761,9 +805,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" :alt="t('brandName')"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.7</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" :alt="t('brandName')"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.8</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
-          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div></dl></section>
+          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
         </div>
         <section class="card about-license"><div class="card-heading"><h2>{{ t('about.licenseTitle') }}</h2></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
@@ -776,7 +820,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="alert-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="alert-title">{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button class="sign-button" @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
 
-    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }} · {{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.select') }}</button></div></footer></section></div>
+    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey) }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey)"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }}</small><small class="certificate-key">{{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.select') }}</button></div></footer></section></div>
 
     <div v-if="signReportOpen" class="modal-backdrop" @click.self="signReportOpen=false"><section class="sign-report-modal" role="dialog" aria-modal="true" aria-labelledby="sign-report-title"><header class="certificate-header"><div><h2 id="sign-report-title">{{ t('signReport.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="signReportOpen=false"><AppIcon name="x" :size="20" /></button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ signSuccessCount }}</b><span>{{ t('signReport.success') }}</span></div><div class="sign-report-count error"><b>{{ signErrorCount }}</b><span>{{ t('signReport.error') }}</span></div></div><div class="sign-report-list"><article v-for="item in signReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status"><AppIcon :name="item.success?'check':'alert'" :size="14" /></span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ signReportItems.length }} {{ t('signReport.documentsCount') }}</span><button class="sign-button" @click="signReportOpen=false">{{ t('signReport.done') }}</button></footer></section></div>
 

@@ -93,6 +93,7 @@ impl Signer for NativeSigner {
                     available: true,
                     cades_available: found.iter().any(|path| path.contains("cades")),
                     signing_available: false,
+                    license_available: false,
                     provider_type: None,
                     version: None,
                     message: tr!(

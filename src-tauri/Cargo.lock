@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "cryptolite"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.23.1",
  "libloading 0.8.9",

@@ -23,6 +23,7 @@ pub fn run() {
             commands::sign_pdf_prepare,
             commands::sign_pdf_finish,
             commands::remove_temp_pdf,
+            commands::filter_file_paths,
             commands::verify_signature,
             commands::encrypt_file,
             commands::decrypt_file
