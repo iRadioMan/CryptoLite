@@ -206,6 +206,10 @@ watch(() => appSettings.value.defaultSignatureType, (type) => {
   // Встроенная подпись PDF всегда CAdES-BES: в режиме штампа другие стандарты недоступны.
   if (type === 'stamp') appSettings.value.defaultStandard = 'cades-bes';
 });
+watch(cryptoMode, () => {
+  // Файлы одной операции непригодны для другой: при смене режима список очищается.
+  cryptoFiles.value = [];
+});
 
 function sameStringList(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -677,7 +681,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
             <label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
           </div>
-          <div v-if="stampMode" class="stamp-note"><b>{{ t('signPage.stampNoteTitle') }}</b><span>{{ t('signPage.stampNote') }}</span><label class="field stamp-position"><span>{{ t('signPage.stampPosition') }}</span><input v-model="stampPosition" :placeholder="t('signPage.stampPositionPlaceholder')" maxlength="60"/></label></div>
+          <div v-if="stampMode" class="stamp-note"><b>{{ t('signPage.stampNoteTitle') }}</b><span>{{ t('signPage.stampNote') }}</span><label class="field stamp-position" style="display: none;"><span>{{ t('signPage.stampPosition') }}</span><input v-model="stampPosition" :placeholder="t('signPage.stampPositionPlaceholder')" maxlength="60"/></label></div>
           <div class="field-row">
             <div class="field wide-field"><span>{{ t('certificates') }}</span>
               <button class="picker-button" @click="openCertificatePicker('signing')">
@@ -805,7 +809,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><img class="brand-mark about-mark" :src="logoUrl" :alt="t('brandName')"/><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.8</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.8</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
