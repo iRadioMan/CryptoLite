@@ -1,6 +1,6 @@
-<img src="cryptolite-full-logo.png" alt="Логотип КриптоЛайт" style="width: 40%; height: auto;">
+## Настольное приложение на Rust, Tauri 2, Vue 3, TypeScript и Tailwind CSS для подписи и шифрования файлов через установленный в системе КриптоПро CSP
 
-### Настольное приложение на Rust, Tauri 2, Vue 3, TypeScript и Tailwind CSS для подписи и шифрования файлов через установленный в системе КриптоПро CSP
+<img src="cryptolite-screenshot.png" alt="Скриншот КриптоЛайт">
 
 ## Состояние
 
