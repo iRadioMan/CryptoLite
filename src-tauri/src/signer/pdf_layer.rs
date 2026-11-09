@@ -171,6 +171,13 @@ fn prepare_bytes(
     let (x0, y0, x1, y1) = (x0 + page_x, y0 + page_y, x1 + page_x, y1 + page_y);
     let width = x1 - x0;
     let height = y1 - y0;
+    // Стороны отмеченного прямоугольника на видимой стороне страницы: при 90/270
+    // оси страницы переставлены относительно того, как отметку рисует пользователь.
+    let (layout_width, layout_height) = if matches!(rotation, 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    };
 
 
     // Отметка набирается встроенным DejaVu Sans Condensed: кириллица и латиница
@@ -252,6 +259,13 @@ fn prepare_bytes(
         _ => lopdf::Dictionary::new(),
     };
     new_document.set_object(font_id, Object::Dictionary(font_dict));
+    // Appearance аннотации просмотрщик поворачивает вместе со страницей, поэтому поток
+    // компенсирует /Rotate: содержимое рисуется в координатах видимой стороны страницы.
+    let [a, b, c, d, e, f] = appearance_transform(rotation, width, height);
+    let mut content =
+        format!("q {a:.4} {b:.4} {c:.4} {d:.4} {e:.4} {f:.4} cm\n").into_bytes();
+    content.extend_from_slice(&appearance_content(&encoded, layout_width, layout_height));
+    content.extend_from_slice(b"Q\n");
     let appearance = Stream::new(
         Dictionary::from_iter([
             (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
@@ -277,7 +291,7 @@ fn prepare_bytes(
             ),
             (b"FormType".to_vec(), Object::Integer(1)),
         ]),
-        appearance_content(&encoded, width, height),
+        content,
     );
     new_document.set_object(appearance_id, Object::Stream(appearance));
 
@@ -955,6 +969,21 @@ fn box_in_page(
     let y0 = corners.iter().map(|(_, y)| *y).fold(f64::MAX, f64::min);
     let y1 = corners.iter().map(|(_, y)| *y).fold(f64::MIN, f64::max);
     Ok((x0, y0, x1, y1))
+}
+
+/// Матрица перевода системы координат отметки (видимая сторона страницы, ось Y вверх,
+/// начало — левый нижний угол рамки) в координаты страницы PDF.
+///
+/// `width`/`height` — стороны appearance-рамки в координатах страницы. Просмотрщик
+/// поворачивает аннотации вместе со страницей, поэтому без компенсации `/Rotate` текст
+/// встаёт боком, а строки центрируются по перепутанным осям.
+fn appearance_transform(rotation: i64, width: f64, height: f64) -> [f64; 6] {
+    match rotation {
+        90 => [0.0, 1.0, -1.0, 0.0, width, 0.0],
+        180 => [-1.0, 0.0, 0.0, -1.0, width, height],
+        270 => [0.0, -1.0, 1.0, 0.0, 0.0, height],
+        _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    }
 }
 
 fn pdf_date_string() -> Object {
@@ -1759,6 +1788,170 @@ mod tests {
         assert!((y0 - 623.62).abs() < 0.1, "y0 = {y0}");
         assert!((x1 - 254.84).abs() < 0.1, "x1 = {x1}");
         assert!((y1 - 708.66).abs() < 0.1, "y1 = {y1}");
+    }
+
+    /// Видимые координаты (pt, начало сверху-слева) точки страницы при повороте `/Rotate`.
+    ///
+    /// Обратна `box_in_page` и совпадает с pdf.js `PageViewport`: так считает экранная
+    /// система координат, в которой пользователь рисует отметку.
+    fn display_point(x: f64, y: f64, page_width: f64, page_height: f64, rotation: i64) -> (f64, f64) {
+        match rotation {
+            90 => (y, x),
+            180 => (page_width - x, y),
+            270 => (page_height - y, page_width - x),
+            _ => (x, page_height - y),
+        }
+    }
+
+    /// Применяет PDF-матрицу `[a b c d e f]` к точке.
+    fn apply_matrix([a, b, c, d, e, f]: [f64; 6], s: f64, t: f64) -> (f64, f64) {
+        (a * s + c * t + e, b * s + d * t + f)
+    }
+
+    /// Числовое значение объекта PDF.
+    fn number(value: &Object) -> f64 {
+        match value {
+            Object::Integer(number) => *number as f64,
+            Object::Real(number) => f64::from(*number),
+            other => panic!("ожидалось число, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_appearance_is_upright_on_rotated_pages() {
+        let (page_width, page_height) = (595.0, 842.0);
+        // Размеры отметки на видимой стороне страницы (`test_stamp`: 80×35 мм).
+        let (stamp_width, stamp_height) = (mm_to_points(80.0), mm_to_points(35.0));
+        let margin = mm_to_points(20.0);
+        for rotation in [0, 90, 180, 270] {
+            let mut source = Document::load_mem(&sample_pdf(
+                lopdf::xref::XrefType::CrossReferenceTable,
+                false,
+            ))
+            .unwrap();
+            let pages_id = source.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+            let page_id = page_object_id(&source, pages_id, 0).unwrap();
+            source
+                .get_object_mut(page_id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("Rotate", Object::Integer(rotation));
+            let mut rotated = Vec::new();
+            source.save_to(&mut rotated).unwrap();
+
+            let (bytes, _) = prepare_bytes(rotated, &test_stamp(), &test_signer()).unwrap();
+            let signed = Document::load_mem(&bytes).unwrap();
+            let field = signature_fields(&signed)[0].as_reference().unwrap();
+            let widget = signed.get_dictionary(field).unwrap();
+            let rect: Vec<f64> = widget
+                .get(b"Rect")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(number)
+                .collect();
+            let (rect_x0, rect_y0) = (rect[0], rect[1]);
+            let (rect_width, rect_height) = (rect[2] - rect_x0, rect[3] - rect_y0);
+            if rotation == 270 {
+                // Отметка 80×35 мм в 20 мм от левого верхнего края повёрнутой страницы.
+                for (value, expected) in rect.iter().zip([439.094, 558.535, 538.307, 785.307]) {
+                    assert!(
+                        (value - expected).abs() < 0.1,
+                        "rotation 270: Rect {rect:?}, ожидалось значение {expected}"
+                    );
+                }
+            }
+            let appearance = widget
+                .get(b"AP")
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"N")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            let stream = signed.get_object(appearance).unwrap().as_stream().unwrap();
+
+            // `/BBox` описывает ровно нарисованный прямоугольник (хранится как `Real(f32)`).
+            let bbox: Vec<f64> = stream
+                .dict
+                .get(b"BBox")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(number)
+                .collect();
+            assert_eq!((bbox[0], bbox[1]), (0.0, 0.0), "rotation {rotation}: BBox {bbox:?}");
+            assert!(
+                (bbox[2] - rect_width).abs() < 1e-3,
+                "rotation {rotation}: BBox {bbox:?}, ширина прямоугольника {rect_width}"
+            );
+            assert!(
+                (bbox[3] - rect_height).abs() < 1e-3,
+                "rotation {rotation}: BBox {bbox:?}, высота прямоугольника {rect_height}"
+            );
+
+            // Поток начинается с матрицы, компенсирующей поворот страницы.
+            let content = String::from_utf8(stream.content.clone()).unwrap();
+            let mut head = content.lines().next().unwrap().split_whitespace();
+            assert_eq!(head.next(), Some("q"), "rotation {rotation}: нет `q` в начале потока");
+            let matrix: Vec<f64> = (0..6)
+                .map(|_| {
+                    head.next()
+                        .expect("в матрице не хватает чисел")
+                        .parse::<f64>()
+                        .expect("в матрице не число")
+                })
+                .collect();
+            assert_eq!(head.next(), Some("cm"), "rotation {rotation}: нет `cm` после матрицы");
+            let expected = appearance_transform(rotation, rect_width, rect_height);
+            for (index, value) in matrix.iter().enumerate() {
+                assert!(
+                    (value - expected[index]).abs() < 1e-4,
+                    "rotation {rotation}: матрица {matrix:?}, ожидалось {expected:?}"
+                );
+            }
+            let matrix: [f64; 6] = matrix.try_into().unwrap();
+            let visible = |s: f64, t: f64| {
+                let (x, y) = apply_matrix(matrix, s, t);
+                display_point(rect_x0 + x, rect_y0 + y, page_width, page_height, rotation)
+            };
+
+            // Углы области отметки попадают ровно в нарисованный прямоугольник.
+            let corners = [
+                (0.0, 0.0),
+                (stamp_width, 0.0),
+                (0.0, stamp_height),
+                (stamp_width, stamp_height),
+            ];
+            let expected = [
+                (margin, margin + stamp_height),
+                (margin + stamp_width, margin + stamp_height),
+                (margin, margin),
+                (margin + stamp_width, margin),
+            ];
+            for ((s, t), (want_u, want_v)) in corners.into_iter().zip(expected) {
+                let (u, v) = visible(s, t);
+                assert!(
+                    (u - want_u).abs() < 0.05 && (v - want_v).abs() < 0.05,
+                    "rotation {rotation}: точка ({s}; {t}) видна в ({u}; {v}), ожидалось ({want_u}; {want_v})"
+                );
+            }
+            // Базис текста горизонтален и растёт слева-направо.
+            let (start_u, start_v) = visible(0.0, 0.0);
+            let (end_u, end_v) = visible(stamp_width, 0.0);
+            assert!(
+                end_u > start_u + 1.0,
+                "rotation {rotation}: базис текста не растёт вправо ({start_u} → {end_u})"
+            );
+            assert!(
+                (end_v - start_v).abs() < 0.05,
+                "rotation {rotation}: базис текста наклонён ({start_v} → {end_v})"
+            );
+        }
     }
 
     #[test]
