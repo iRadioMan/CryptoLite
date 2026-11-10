@@ -12,6 +12,8 @@ const props = defineProps<{
   /** PDF в Base64 (без data-префикса). */
   pdfBase64: string;
   rects: StampRect[];
+  /** Абсолютный поворот страниц, изменённых пользователем: 0/90/180/270. */
+  rotations: Record<number, number>;
   /** Подписанты в порядке наложения: первая свободная область отдаётся следующему. */
   signerIds: string[];
   signerLabels: Record<string, string>;
@@ -19,6 +21,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'update:rects', value: StampRect[]): void;
+  (event: 'update:rotations', value: Record<number, number>): void;
 }>();
 
 const { t } = useI18n();
@@ -35,7 +38,12 @@ const viewHeight = ref(0);
 /** Сколько CSS-пикселей приходится на 1 pt PDF. */
 const cssScale = ref(1);
 const draft = ref<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+/** Исходный `/Rotate` страниц, прочитанный из PDF при первой отрисовке. */
+const baseRotations = ref<Record<number, number>>({});
+/** Пока страница готовится, размеры и поворот ещё от предыдущей. */
+const rendering = ref(false);
 let renderTask: { cancel: () => void } | null = null;
+let renderToken = 0;
 
 const nextSigner = computed(() => {
   const placed = new Set(props.rects.map((rect) => rect.certificateId));
@@ -43,6 +51,13 @@ const nextSigner = computed(() => {
 });
 const pageRects = computed(() => props.rects.filter((rect) => rect.page === activePage.value));
 const mmPerPixel = computed(() => (25.4 / 72) / cssScale.value);
+/** Итоговый поворот страницы: исходный `/Rotate` плюс выбранный пользователем. */
+function pageRotation(page: number): number {
+  return normalizeAngle(props.rotations[page] ?? baseRotations.value[page] ?? 0);
+}
+function normalizeAngle(angle: number): number {
+  return ((angle % 360) + 360) % 360;
+}
 /** Минимальная область отметки: меньше шести строк ГОСТ в неё не помещаются читаемо. */
 const MIN_STAMP_WIDTH_MM = 50;
 const MIN_STAMP_HEIGHT_MM = 25;
@@ -74,32 +89,43 @@ async function load() {
   }
 }
 
-async function render() {
+async function render(rotationOverride?: number) {
   const loaded = pdf.value;
   const element = canvas.value;
   if (!loaded || !element) return;
+  const token = ++renderToken;
   renderTask?.cancel();
-  const target = await loaded.getPage(activePage.value + 1);
-  pageProxy.value = target;
-  const unscaled = target.getViewport({ scale: 1 });
-  const scale = Math.min(1.5, 760 / unscaled.width);
-  cssScale.value = scale;
-  const viewport = target.getViewport({ scale });
-  viewWidth.value = viewport.width;
-  viewHeight.value = viewport.height;
-  const ratio = Math.min(window.devicePixelRatio || 1, 2);
-  element.width = Math.floor(viewport.width * ratio);
-  element.height = Math.floor(viewport.height * ratio);
-  element.style.width = `${viewport.width}px`;
-  element.style.height = `${viewport.height}px`;
-  const context = element.getContext('2d');
-  if (!context) return;
+  rendering.value = true;
+  try {
+    const target = await loaded.getPage(activePage.value + 1);
+    if (token !== renderToken) return;
+    pageProxy.value = target;
+    baseRotations.value[activePage.value] = normalizeAngle(target.rotate);
+    // Поворот из обработчика кнопки применяется сразу: props обновятся только
+    // со следующим рендером родителя.
+    const rotation = rotationOverride ?? pageRotation(activePage.value);
+    const unscaled = target.getViewport({ scale: 1, rotation });
+    const scale = Math.min(1.5, 760 / unscaled.width);
+    cssScale.value = scale;
+    const viewport = target.getViewport({ scale, rotation });
+    viewWidth.value = viewport.width;
+    viewHeight.value = viewport.height;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    element.width = Math.floor(viewport.width * ratio);
+    element.height = Math.floor(viewport.height * ratio);
+    element.style.width = `${viewport.width}px`;
+    element.style.height = `${viewport.height}px`;
+    const context = element.getContext('2d');
+    if (!context) return;
 
-  renderTask = target.render({
-    canvasContext: context,
-    viewport,
-    transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined,
-  } as never) as unknown as { cancel: () => void; promise: Promise<void> };
+    renderTask = target.render({
+      canvasContext: context,
+      viewport,
+      transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined,
+    } as never) as unknown as { cancel: () => void; promise: Promise<void> };
+  } finally {
+    if (token === renderToken) rendering.value = false;
+  }
 }
 
 function point(event: MouseEvent) {
@@ -168,6 +194,48 @@ function changePage(delta: number) {
   void render();
 }
 
+/** Поворот страницы на ±90°: изменяется только предпросмотр, в PDF попадёт при подписании. */
+function rotatePage(delta: 1 | -1) {
+  const page = activePage.value;
+  if (rendering.value || loading.value || error.value) return;
+  const pageWidthMm = viewWidth.value * mmPerPixel.value;
+  const pageHeightMm = viewHeight.value * mmPerPixel.value;
+  if (!pageWidthMm || !pageHeightMm) return;
+  const rotations = { ...props.rotations };
+  const next = normalizeAngle(pageRotation(page) + delta * 90);
+  if (next === (baseRotations.value[page] ?? 0)) delete rotations[page];
+  else rotations[page] = next;
+  // Области поворачиваются вместе с содержимым, чтобы остаться на том же месте страницы.
+  const rects = props.rects.map((rect) =>
+    rect.page === page ? rotateStampRect(rect, delta, pageWidthMm, pageHeightMm) : rect);
+  if (rects.some((rect, index) => rect !== props.rects[index])) emit('update:rects', rects);
+  emit('update:rotations', rotations);
+  void render(next);
+}
+
+/** Переносит область в систему координат повёрнутой страницы (мм от левого верхнего угла). */
+function rotateStampRect(rect: StampRect, delta: 1 | -1, pageWidthMm: number, pageHeightMm: number): StampRect {
+  const clamp = (value: number, max: number) => Math.min(Math.max(value, 0), Math.max(max, 0));
+  if (delta > 0) {
+    // По часовой стрелке: верхний край страницы уходит вправо.
+    return {
+      ...rect,
+      leftMm: clamp(pageHeightMm - (rect.topMm + rect.heightMm), pageHeightMm - rect.heightMm),
+      topMm: rect.leftMm,
+      widthMm: rect.heightMm,
+      heightMm: rect.widthMm,
+    };
+  }
+  // Против часовой стрелки: верхний край уходит влево.
+  return {
+    ...rect,
+    leftMm: rect.topMm,
+    topMm: clamp(pageWidthMm - (rect.leftMm + rect.widthMm), pageWidthMm - rect.widthMm),
+    widthMm: rect.heightMm,
+    heightMm: rect.widthMm,
+  };
+}
+
 function zoneStyle(rect: StampRect) {
   const factor = 1 / mmPerPixel.value;
   return {
@@ -193,6 +261,10 @@ onBeforeUnmount(() => {
         <button class="outline-button" :disabled="activePage === 0" :aria-label="t('stampEditor.prevPage')" @click="changePage(-1)"><AppIcon name="chevron-left" :size="16" /></button>
         <span>{{ t('stampEditor.page', { current: activePage + 1, total: pageCount || 1 }) }}</span>
         <button class="outline-button" :disabled="activePage + 1 >= pageCount" :aria-label="t('stampEditor.nextPage')" @click="changePage(1)"><AppIcon name="chevron-right" :size="16" /></button>
+        <span class="stamp-rotate-group">
+          <button class="outline-button" :disabled="rendering || loading || !!error" :title="t('stampEditor.rotateCounterClockwise')" :aria-label="t('stampEditor.rotateCounterClockwise')" @click="rotatePage(-1)"><AppIcon name="rotate-left" :size="16" /></button>
+          <button class="outline-button" :disabled="rendering || loading || !!error" :title="t('stampEditor.rotateClockwise')" :aria-label="t('stampEditor.rotateClockwise')" @click="rotatePage(1)"><AppIcon name="rotate-right" :size="16" /></button>
+        </span>
       </div>
       <button class="outline-button stamp-clear" :disabled="!pageRects.length" @click="clearPage">
         {{ t('stampEditor.clearPage') }}

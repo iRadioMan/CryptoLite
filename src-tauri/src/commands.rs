@@ -389,6 +389,7 @@ pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResu
             &request.output_path,
             &request.certificate_id,
             &request.stamp,
+            &request.page_rotations,
         )
     })
     .await
@@ -410,6 +411,7 @@ pub async fn sign_pdf_prepare(
             &request.input_path,
             &request.certificate_id,
             &request.stamp,
+            &request.page_rotations,
         )?;
         crate::signer::pdf_layer::export_prepared(prepared)
     })

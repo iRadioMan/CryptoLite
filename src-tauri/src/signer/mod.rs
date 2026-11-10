@@ -12,8 +12,8 @@ pub use error::SignerError;
 pub use model::{
     AppSettings, CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
     PdfSignFinishRequest, PdfSignPrepareRequest, PdfSignPrepareResult, PdfSignRequest,
-    PdfSignaturePayload, PdfStampSpec, SignBatchItemResult, SignRequest, SignResult, VerifyRequest,
-    VerifyResult, VerifySignerInfo,
+    PdfSignaturePayload, PdfStampSpec, PageRotation, SignBatchItemResult, SignRequest, SignResult,
+    VerifyRequest, VerifyResult, VerifySignerInfo,
 };
 
 pub trait Signer: Send + Sync {

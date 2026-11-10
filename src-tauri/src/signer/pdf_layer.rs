@@ -16,12 +16,13 @@
 //! CMS при этом сама помечена как `id-data` и содержит подписанные атрибуты (CMS v3).
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, Stream, StringFormat};
 
 use crate::signer::embed_font;
-use crate::signer::{CertInfo, PdfSignaturePayload, PdfSignPrepareResult, PdfStampSpec, SignResult, SignerError};
+use crate::signer::{CertInfo, PageRotation, PdfSignaturePayload, PdfSignPrepareResult, PdfStampSpec, SignResult, SignerError};
 use crate::tr;
 
 /// Ширина `/ByteRange`-заглушки. Настоящие смещения пишутся в это поле через пробелы
@@ -74,6 +75,7 @@ fn signing_error(message: impl Into<String>) -> SignerError {
 pub fn prepare(
     source: &Path,
     stamp: &PdfStampSpec,
+    page_rotations: &[PageRotation],
     certificate_id: &str,
     _digest_algorithm: &str,
     _new_id: &str,
@@ -92,7 +94,7 @@ pub fn prepare(
             "could not read the document: {error}"
         ))
     })?;
-    let (bytes, page_count) = prepare_bytes(source_bytes, stamp, &signer)?;
+    let (bytes, page_count) = prepare_bytes(source_bytes, stamp, &signer, page_rotations)?;
     let (offsets_at, contents_at, contents_end) = locate(&bytes)?;
     let path = staging_path(source);
     if let Err(error) = std::fs::write(&path, &bytes) {
@@ -117,6 +119,7 @@ fn prepare_bytes(
     source_bytes: Vec<u8>,
     stamp: &PdfStampSpec,
     signer: &CertInfo,
+    page_rotations: &[PageRotation],
 ) -> Result<(Vec<u8>, usize), SignerError> {
     let document = Document::load_mem(&source_bytes).map_err(|error| {
         signing_error(tr!(
@@ -166,7 +169,37 @@ fn prepare_bytes(
         })?;
     let page_id = page_object_id(&document, pages_id, stamp.page)?;
     let (page_x, page_y, page_width, page_height) = page_box(&document, pages_id, page_id)?;
-    let rotation = page_rotation(&document, pages_id, page_id);
+    // Повороты из запроса применяются в этой же ревизии: страница получает абсолютный
+    // /Rotate, поэтому повторная подпись того же PDF не накапливает угол.
+    let mut rotation_targets = BTreeMap::new();
+    for entry in page_rotations {
+        let target_id = page_object_id(&document, pages_id, entry.page)?;
+        rotation_targets.insert(target_id, normalized_rotation(entry.rotation)?);
+    }
+    let current_rotation = page_rotation(&document, pages_id, page_id);
+    let rotation = rotation_targets
+        .get(&page_id)
+        .copied()
+        .unwrap_or(current_rotation);
+    // Словари остальных повёрнутых страниц готовятся до того, как документ перейдёт
+    // в инкрементальную ревизию: новые версии переопределяют только `/Rotate`.
+    let mut rotated_pages = Vec::new();
+    for (&target_id, &target_rotation) in &rotation_targets {
+        if target_id == page_id || page_rotation(&document, pages_id, target_id) == target_rotation {
+            continue;
+        }
+        let mut rotated_page = document
+            .get_dictionary(target_id)
+            .map_err(|error| {
+                signing_error(tr!(
+                    "не удалось прочитать страницу PDF: {error}",
+                    "could not read the PDF page: {error}"
+                ))
+            })?
+            .clone();
+        rotated_page.set(b"Rotate".to_vec(), Object::Integer(target_rotation));
+        rotated_pages.push((target_id, rotated_page));
+    }
     let (x0, y0, x1, y1) = box_in_page(stamp, page_width, page_height, rotation)?;
     let (x0, y0, x1, y1) = (x0 + page_x, y0 + page_y, x1 + page_x, y1 + page_y);
     let width = x1 - x0;
@@ -371,6 +404,9 @@ fn prepare_bytes(
     // без изменений, новые версии переопределяют `/Annots` и `/AcroForm`.
     annots.push(Object::Reference(widget_id));
     new_page.set(b"Annots".to_vec(), Object::Array(annots));
+    if rotation != current_rotation {
+        new_page.set(b"Rotate".to_vec(), Object::Integer(rotation));
+    }
     new_document.set_object(page_id, Object::Dictionary(new_page));
     fields.push(Object::Reference(widget_id));
     let mut new_acroform = acroform;
@@ -383,6 +419,11 @@ fn prepare_bytes(
         let mut new_catalog = catalog;
         new_catalog.set(b"AcroForm".to_vec(), Object::Reference(acroform_id));
         new_document.set_object(catalog_id, Object::Dictionary(new_catalog));
+    }
+    // Страницы без отметки поворачиваются отдельными словарями: содержимое и аннотации
+    // не трогаются, поэтому старые подписи остаются валидными.
+    for (target_id, rotated_page) in rotated_pages {
+        new_document.set_object(target_id, Object::Dictionary(rotated_page));
     }
 
     let mut bytes = Vec::new();
@@ -904,6 +945,17 @@ fn page_rotation(document: &Document, pages_id: lopdf::ObjectId, page_id: lopdf:
     }
 }
 
+/// Проверяет угол из запроса и приводит его к 0/90/180/270.
+fn normalized_rotation(rotation: i64) -> Result<i64, SignerError> {
+    if rotation.rem_euclid(90) != 0 {
+        return Err(signing_error(tr!(
+            "поворот страницы PDF должен быть кратен 90°: {rotation}",
+            "the PDF page rotation must be a multiple of 90°: {rotation}"
+        )));
+    }
+    Ok(rotation.rem_euclid(360))
+}
+
 fn mm_to_points(mm: f64) -> f64 {
     mm * 72.0 / 25.4
 }
@@ -1306,6 +1358,54 @@ mod tests {
         bytes
     }
 
+    /// PDF из нескольких одинаковых страниц: проверки поворотов по одной странице.
+    fn sample_pdf_with_pages(pages: usize) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        document.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+        let pages_id = document.new_object_id();
+        let content_id = document.add_object(Stream::new(
+            Dictionary::new(),
+            b"0 0 0 RG 72 700 120 40 re S".to_vec(),
+        ));
+        let mut kids = Vec::new();
+        for _ in 0..pages {
+            let page_id = document.add_object(Object::Dictionary(Dictionary::from_iter([
+                (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+                (b"Parent".to_vec(), Object::Reference(pages_id).into()),
+                (
+                    b"MediaBox".to_vec(),
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(595),
+                        Object::Integer(842),
+                    ]),
+                ),
+                (b"Contents".to_vec(), Object::Reference(content_id).into()),
+                (b"Resources".to_vec(), Object::Dictionary(Dictionary::new())),
+            ])));
+            kids.push(Object::Reference(page_id));
+        }
+        document.set_object(
+            pages_id,
+            Object::Dictionary(Dictionary::from_iter([
+                (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+                (b"Kids".to_vec(), Object::Array(kids)),
+                (b"Count".to_vec(), Object::Integer(pages as i64)),
+            ])),
+        );
+        let catalog = document.add_object(Object::Dictionary(Dictionary::from_iter([
+            (b"Type".to_vec(), Object::Name(b"Catalog".to_vec())),
+            (b"Pages".to_vec(), Object::Reference(pages_id).into()),
+        ])));
+        document
+            .trailer
+            .set(b"Root".to_vec(), Object::Reference(catalog));
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
     #[test]
     fn incremental_update_preserves_existing_form_and_generations() {
         for indirect in [false, true] {
@@ -1331,7 +1431,7 @@ mod tests {
             source.get_object_mut(catalog_id).unwrap().as_dict_mut().unwrap().set("AcroForm", form_value);
             let mut original = Vec::new();
             source.save_to(&mut original).unwrap();
-            let (staged, _) = prepare_bytes(original.clone(), &test_stamp(), &test_signer()).unwrap();
+            let (staged, _) = prepare_bytes(original.clone(), &test_stamp(), &test_signer(), &[]).unwrap();
             assert!(staged.starts_with(&original));
             let parsed = Document::load_mem(&staged).unwrap();
             assert_eq!(parsed.get_pages().get(&1), Some(&page_id));
@@ -1353,10 +1453,10 @@ mod tests {
         let source = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
         let mut stamp = test_stamp();
         stamp.page = 1;
-        assert!(matches!(prepare_bytes(source.clone(), &stamp, &test_signer()), Err(SignerError::Pdf(_))));
+        assert!(matches!(prepare_bytes(source.clone(), &stamp, &test_signer(), &[]), Err(SignerError::Pdf(_))));
         stamp.page = 0;
         stamp.width_mm = 0.0;
-        assert!(matches!(prepare_bytes(source, &stamp, &test_signer()), Err(SignerError::Pdf(_))));
+        assert!(matches!(prepare_bytes(source, &stamp, &test_signer(), &[]), Err(SignerError::Pdf(_))));
     }
 
 
@@ -1391,7 +1491,7 @@ mod tests {
     fn sample_staged_pdf() -> Vec<u8> {
         prepare_bytes(
             sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false),
-            &test_stamp(), &test_signer(),
+            &test_stamp(), &test_signer(), &[],
         ).unwrap().0
     }
 
@@ -1523,7 +1623,7 @@ mod tests {
             position: String::new(),
         };
         let signer = test_signer();
-        let (bytes, _) = prepare_bytes(source, &stamp, &signer).unwrap();
+        let (bytes, _) = prepare_bytes(source, &stamp, &signer, &[]).unwrap();
         let document = Document::load_mem(&bytes).unwrap();
         let field = signature_fields(&document)[0].as_reference().unwrap();
         let widget = document.get_dictionary(field).unwrap();
@@ -1565,7 +1665,7 @@ mod tests {
         for kind in [XrefType::CrossReferenceTable, XrefType::CrossReferenceStream] {
             let source = sample_pdf(kind, false);
             let previous = Document::load_mem(&source).unwrap().xref_start;
-            let (staged, pages) = prepare_bytes(source, &test_stamp(), &test_signer()).unwrap();
+            let (staged, pages) = prepare_bytes(source, &test_stamp(), &test_signer(), &[]).unwrap();
             let parsed = Document::load_mem(&staged).unwrap();
             assert_eq!(pages, 1);
             assert!(matches!((parsed.reference_table.cross_reference_type, kind),
@@ -1610,11 +1710,11 @@ mod tests {
                 source.pop();
             }
             source.extend_from_slice(tail);
-            let (staged, _) = prepare_bytes(source.clone(), &test_stamp(), &test_signer()).unwrap();
+            let (staged, _) = prepare_bytes(source.clone(), &test_stamp(), &test_signer(), &[]).unwrap();
             assert_eq!(&staged[..source.len()], source.as_slice(), "tail {tail:?}");
             let (_, at, end) = locate(&staged).unwrap();
             let first = assemble_document(&staged, at, end, &[0x30, 0x00]).unwrap();
-            let (second_staged, _) = prepare_bytes(first.clone(), &test_stamp(), &test_signer()).unwrap();
+            let (second_staged, _) = prepare_bytes(first.clone(), &test_stamp(), &test_signer(), &[]).unwrap();
             let (_, at2, end2) = locate(&second_staged).unwrap();
             let second = assemble_document(&second_staged, at2, end2, &[0x30, 0x00]).unwrap();
             assert_eq!(&second[..first.len()], first.as_slice());
@@ -1649,7 +1749,7 @@ mod tests {
         let original = Document::load_mem(&source).unwrap();
         assert!(original.reference_table.entries.values().any(|entry|
             matches!(entry, lopdf::xref::XrefEntry::Compressed { .. })));
-        let (bytes, count) = prepare_bytes(source, &test_stamp(), &test_signer()).unwrap();
+        let (bytes, count) = prepare_bytes(source, &test_stamp(), &test_signer(), &[]).unwrap();
         let doc = Document::load_mem(&bytes).unwrap();
         assert_eq!(count, 1);
         assert_eq!(doc.get_pages(), original.get_pages());
@@ -1700,13 +1800,13 @@ mod tests {
     #[test]
     fn invalid_pdf_is_rejected() {
         for bytes in [Vec::new(), b"not a PDF".to_vec()] {
-            assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer()), Err(SignerError::Pdf(_))));
+            assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer(), &[]), Err(SignerError::Pdf(_))));
         }
         let mut bytes = sample_pdf(lopdf::xref::XrefType::CrossReferenceTable, false);
         let at = search_back(&bytes, 0..bytes.len(), b"startxref").unwrap() + b"startxref\n".len();
         let end = at + bytes[at..].iter().position(|b| !b.is_ascii_digit()).unwrap();
         bytes[at..end].fill(b'0');
-        assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer()), Err(SignerError::Pdf(_))));
+        assert!(matches!(prepare_bytes(bytes, &test_stamp(), &test_signer(), &[]), Err(SignerError::Pdf(_))));
     }
 
     #[test]
@@ -1840,7 +1940,7 @@ mod tests {
             let mut rotated = Vec::new();
             source.save_to(&mut rotated).unwrap();
 
-            let (bytes, _) = prepare_bytes(rotated, &test_stamp(), &test_signer()).unwrap();
+            let (bytes, _) = prepare_bytes(rotated, &test_stamp(), &test_signer(), &[]).unwrap();
             let signed = Document::load_mem(&bytes).unwrap();
             let field = signature_fields(&signed)[0].as_reference().unwrap();
             let widget = signed.get_dictionary(field).unwrap();
@@ -1974,5 +2074,120 @@ mod tests {
         assert!(encoded[1].cids.iter().any(|glyph| glyph.cid == space_cid));
         // Без явного кегля строки получают DEFAULT_FONT_SIZE.
         assert_eq!(encoded[0].font_size, embed_font::DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn page_rotations_persist_for_unstamped_pages() {
+        let source = sample_pdf_with_pages(3);
+        // Сценарий интерфейса: повернуть первую страницу, переключиться, повернуть
+        // вторую, переключиться и поставить отметку на третьей.
+        let stamp = PdfStampSpec {
+            page: 2, left_mm: 20.0, top_mm: 20.0,
+            width_mm: 80.0, height_mm: 35.0, position: String::new(),
+        };
+        let rotations = [
+            PageRotation { page: 0, rotation: 90 },
+            PageRotation { page: 1, rotation: 270 },
+        ];
+        let (bytes, count) = prepare_bytes(source, &stamp, &test_signer(), &rotations).unwrap();
+        assert_eq!(count, 3);
+        let document = Document::load_mem(&bytes).unwrap();
+        let pages_id = document.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        let page_id = |index: usize| page_object_id(&document, pages_id, index).unwrap();
+        assert_eq!(page_rotation(&document, pages_id, page_id(0)), 90);
+        assert_eq!(page_rotation(&document, pages_id, page_id(1)), 270);
+        assert_eq!(page_rotation(&document, pages_id, page_id(2)), 0);
+        // Новый /Rotate записан в словари самих страниц, а не в дерево /Pages.
+        assert!(document.get_dictionary(page_id(0)).unwrap().get(b"Rotate").is_ok());
+        assert!(document.get_dictionary(page_id(1)).unwrap().get(b"Rotate").is_ok());
+        assert!(document.get_dictionary(page_id(2)).unwrap().get(b"Rotate").is_err());
+        // Отметка осталась на третьей странице: повороты соседних её не сдвинули.
+        let widget = document
+            .get_dictionary(signature_fields(&document)[0].as_reference().unwrap())
+            .unwrap();
+        assert_eq!(widget.get(b"P").unwrap().as_reference().unwrap(), page_id(2));
+    }
+
+    #[test]
+    fn repeated_preparation_keeps_rotations_absolute() {
+        let source = sample_pdf_with_pages(2);
+        let stamp = PdfStampSpec {
+            page: 0, left_mm: 20.0, top_mm: 20.0,
+            width_mm: 80.0, height_mm: 35.0, position: String::new(),
+        };
+        let rotations = [
+            PageRotation { page: 0, rotation: 90 },
+            PageRotation { page: 1, rotation: 180 },
+        ];
+        let (staged, _) = prepare_bytes(source, &stamp, &test_signer(), &rotations).unwrap();
+        let (_, at, end) = locate(&staged).unwrap();
+        let signed = assemble_document(&staged, at, end, &[0x30, 0x00]).unwrap();
+        // Вторая подпись приносит те же целевые углы: они не складываются с прежними.
+        let (again, _) = prepare_bytes(signed, &stamp, &test_signer(), &rotations).unwrap();
+        let document = Document::load_mem(&again).unwrap();
+        let pages_id = document.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        assert_eq!(page_rotation(&document, pages_id, page_object_id(&document, pages_id, 0).unwrap()), 90);
+        assert_eq!(page_rotation(&document, pages_id, page_object_id(&document, pages_id, 1).unwrap()), 180);
+    }
+
+    #[test]
+    fn stamp_uses_requested_rotation() {
+        let source = sample_pdf_with_pages(1);
+        let stamp = PdfStampSpec {
+            page: 0, left_mm: 20.0, top_mm: 20.0,
+            width_mm: 80.0, height_mm: 35.0, position: String::new(),
+        };
+        let rotations = [PageRotation { page: 0, rotation: 90 }];
+        let (bytes, _) = prepare_bytes(source, &stamp, &test_signer(), &rotations).unwrap();
+        let document = Document::load_mem(&bytes).unwrap();
+        let pages_id = document.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        let page_id = page_object_id(&document, pages_id, 0).unwrap();
+        assert_eq!(page_rotation(&document, pages_id, page_id), 90);
+        let widget = document
+            .get_dictionary(signature_fields(&document)[0].as_reference().unwrap())
+            .unwrap();
+        let rect: Vec<f64> = widget
+            .get(b"Rect").unwrap().as_array().unwrap()
+            .iter().map(number).collect();
+        // Прямоугольник считается как для уже повёрнутой страницы.
+        let expected = box_in_page(&stamp, 595.0, 842.0, 90).unwrap();
+        for (actual, expected) in rect.iter().zip([expected.0, expected.1, expected.2, expected.3]) {
+            assert!(
+                (actual - expected).abs() < 0.05,
+                "Rect {rect:?}, ожидалось {expected:?}"
+            );
+        }
+        // Внешний вид компенсирует новый /Rotate: текст печатается прямо.
+        let appearance = widget
+            .get(b"AP").unwrap().as_dict().unwrap()
+            .get(b"N").unwrap().as_reference().unwrap();
+        let stream = document.get_object(appearance).unwrap().as_stream().unwrap();
+        let content = String::from_utf8(stream.content.clone()).unwrap();
+        let matrix: Vec<f64> = content.lines().next().unwrap()
+            .split_whitespace().skip(1).take(6)
+            .map(|value| value.parse().unwrap()).collect();
+        let (rect_width, rect_height) = (rect[2] - rect[0], rect[3] - rect[1]);
+        let expected = appearance_transform(90, rect_width, rect_height);
+        for (index, value) in matrix.iter().enumerate() {
+            assert!(
+                (value - expected[index]).abs() < 1e-4,
+                "матрица {matrix:?}, ожидалось {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_page_rotation_is_rejected() {
+        let source = sample_pdf_with_pages(1);
+        let not_right_angle = [PageRotation { page: 0, rotation: 45 }];
+        assert!(matches!(
+            prepare_bytes(source.clone(), &test_stamp(), &test_signer(), &not_right_angle),
+            Err(SignerError::Pdf(_))
+        ));
+        let missing_page = [PageRotation { page: 1, rotation: 90 }];
+        assert!(matches!(
+            prepare_bytes(source, &test_stamp(), &test_signer(), &missing_page),
+            Err(SignerError::Pdf(_))
+        ));
     }
 }

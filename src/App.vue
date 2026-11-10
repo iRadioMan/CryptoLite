@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
@@ -41,6 +41,7 @@ const certFilter = ref('');
 const certPickerOpen = ref(false);
 const certPickerMode = ref<'signing' | 'defaults' | 'encryption'>('signing');
 const pickerDraftCertIds = ref<string[]>([]);
+const certificateListRef = ref<HTMLElement | null>(null);
 const certsLoading = ref(false);
 const certsError = ref('');
 const signingInProgress = ref(false);
@@ -65,6 +66,8 @@ const multiCertConfirmNames = ref<string[]>([]);
 const stampDocumentPath = ref('');
 const stampPdfBase64 = ref('');
 const stampRects = ref<StampRect[]>([]);
+/** Абсолютные повороты страниц из предпросмотра: попадут в PDF при подписании. */
+const stampPageRotations = ref<Record<number, number>>({});
 const stampOpen = ref(false);
 const stampLoading = ref(false);
 const stampMessage = ref('');
@@ -136,6 +139,11 @@ const filteredCertificates = computed(() => {
     .filter((certificate) => draftIds.has(certificate.id))
     .concat(matching.filter((certificate) => !draftIds.has(certificate.id)));
 });
+/** Отмеченный сертификат переезжает в начало списка, поэтому после отметки прокручиваем список наверх. */
+function scrollCertificateListToTop(event: Event) {
+  if (!(event.target as HTMLInputElement | null)?.checked) return;
+  nextTick(() => { if (certificateListRef.value) certificateListRef.value.scrollTop = 0; });
+}
 const cryptoSelectedCount = computed(() => cryptoFiles.value.filter((document) => document.selected).length);
 const cryptoRecipientNames = computed(() => certificates.value.filter((certificate) => cryptoRecipientIds.value.includes(certificate.id) && certificateMatches(certificate, 'encryption')).map((certificate) => certificate.subject));
 const canEncrypt = computed(() => status.value.available && cryptoMode.value === 'encrypt' && cryptoSelectedCount.value > 0 && cryptoRecipientNames.value.length > 0 && !cryptoProgress.value);
@@ -406,6 +414,7 @@ async function openStampEditor(file: Doc) {
   stampPdfBase64.value = '';
   stampPdfBytes.value = 0;
   stampRects.value = [];
+  stampPageRotations.value = {};
   stampOpen.value = true;
   stampLoading.value = true;
   stampMessage.value = '';
@@ -444,6 +453,10 @@ async function signStampDocument() {
   const slash = source.path.includes('\\') ? '\\' : '/';
   const baseName = source.name.replace(/\.pdf$/i, '');
   const order = stampOrder();
+  // Абсолютные углы страниц передаются на каждом шаге: ревизия получает /Rotate,
+  // а повторная подпись не накапливает поворот.
+  const pageRotations = Object.entries(stampPageRotations.value)
+    .map(([page, rotation]) => ({ page: Number(page), rotation }));
   signingInProgress.value = true;
   signingMessage.value = '';
   signReportItems.value = [];
@@ -480,6 +493,7 @@ async function signStampDocument() {
             heightMm: item.rect.heightMm,
             position: stampPosition.value,
           },
+          pageRotations,
         },
       });
       output = result.outputPath;
@@ -809,7 +823,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.3.8</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.4.9</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
@@ -818,13 +832,13 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
       </section>
     </main>
 
-    <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampOpen=false"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
+    <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampOpen=false"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" v-model:rotations="stampPageRotations" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
 
     <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><div class="alert-icon"><AppIcon name="info" :size="20" /></div><h2 id="confirm-title">{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="outline-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
 
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="alert-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="alert-title">{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button class="sign-button" @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
 
-    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey) }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey)"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }}</small><small class="certificate-key">{{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.confirm') }}</button></div></footer></section></div>
+    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else ref="certificateListRef" class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey) }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey)" @change="scrollCertificateListToTop"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }}</small><small class="certificate-key">{{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.confirm') }}</button></div></footer></section></div>
 
     <div v-if="signReportOpen" class="modal-backdrop" @click.self="signReportOpen=false"><section class="sign-report-modal" role="dialog" aria-modal="true" aria-labelledby="sign-report-title"><header class="certificate-header"><div><h2 id="sign-report-title">{{ t('signReport.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="signReportOpen=false"><AppIcon name="x" :size="20" /></button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ signSuccessCount }}</b><span>{{ t('signReport.success') }}</span></div><div class="sign-report-count error"><b>{{ signErrorCount }}</b><span>{{ t('signReport.error') }}</span></div></div><div class="sign-report-list"><article v-for="item in signReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status"><AppIcon :name="item.success?'check':'alert'" :size="14" /></span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ signReportItems.length }} {{ t('signReport.documentsCount') }}</span><button class="sign-button" @click="signReportOpen=false">{{ t('signReport.done') }}</button></footer></section></div>
 

@@ -7,7 +7,7 @@
 use crate::signer::csp_native;
 use crate::signer::csp_native::windows::digest;
 use crate::signer::pdf_layer::{self, PreparedDocument};
-use crate::signer::{PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
+use crate::signer::{PageRotation, PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
 use crate::tr;
 
 fn signing_error(message: impl Into<String>) -> SignerError {
@@ -48,12 +48,14 @@ pub fn prepare(
     input_path: &str,
     certificate_id: &str,
     stamp: &PdfStampSpec,
+    page_rotations: &[PageRotation],
 ) -> Result<PreparedDocument, SignerError> {
     let public_key_oid = csp_native::windows::pdf_certificate_public_key_oid(certificate_id)?;
     let (_, algorithm) = digest::hash_for_public_key(&public_key_oid).map_err(signing_error)?;
     pdf_layer::prepare(
         std::path::Path::new(input_path),
         stamp,
+        page_rotations,
         certificate_id,
         algorithm,
         &new_id(),
@@ -92,8 +94,9 @@ pub fn sign_document(
     output_path: &str,
     certificate_id: &str,
     stamp: &PdfStampSpec,
+    page_rotations: &[PageRotation],
 ) -> Result<SignResult, SignerError> {
-    let prepared = prepare(input_path, certificate_id, stamp)?;
+    let prepared = prepare(input_path, certificate_id, stamp, page_rotations)?;
     let payload = sign_prepared(&prepared, certificate_id)?;
     finish_signed(&prepared, &payload, output_path)
 }
@@ -279,11 +282,11 @@ mod tests {
             position: String::new(),
         };
         let direct = directory.join("direct.pdf");
-        sign_document(&input.to_string_lossy(), &direct.to_string_lossy(), &certificate.id, &stamp)
+        sign_document(&input.to_string_lossy(), &direct.to_string_lossy(), &certificate.id, &stamp, &[])
             .unwrap_or_else(|_| panic!("direct: signing failed"));
         verify_route("direct", &direct, &directory);
 
-        let prepared = prepare(&input.to_string_lossy(), &certificate.id, &stamp)
+        let prepared = prepare(&input.to_string_lossy(), &certificate.id, &stamp, &[])
             .unwrap_or_else(|_| panic!("external: preparation failed"));
         let exported = pdf_layer::export_prepared(prepared).expect("export preparation");
         let cleanup = StagingCleanup(PathBuf::from(&exported.prepared_path));

@@ -72,6 +72,18 @@ pub struct PdfStampSpec {
     pub position: String,
 }
 
+/// Новый поворот страницы в итоговом документе.
+///
+/// Абсолютный угол на видимой стороне: 0/90/180/270. Так повторная подпись
+/// того же PDF не накапливает поворот — странице задаётся одно и то же значение.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageRotation {
+    /// Номер страницы, считая с нуля.
+    pub page: usize,
+    pub rotation: i64,
+}
+
 /// Содержимое подписи, которым заполняется зарезервированное `/Contents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +102,9 @@ pub struct PdfSignRequest {
     pub output_path: String,
     pub certificate_id: String,
     pub stamp: PdfStampSpec,
+    /// Новые повороты страниц, сохраняются в подписываемой ревизии PDF.
+    #[serde(default)]
+    pub page_rotations: Vec<PageRotation>,
 }
 
 /// Запрос на подготовку поля подписи PDF (нитка «подготовка → подпись → встраивание»).
@@ -99,6 +114,9 @@ pub struct PdfSignPrepareRequest {
     pub input_path: String,
     pub certificate_id: String,
     pub stamp: PdfStampSpec,
+    /// Новые повороты страниц, сохраняются в подписываемой ревизии PDF.
+    #[serde(default)]
+    pub page_rotations: Vec<PageRotation>,
 }
 
 /// Подготовленный PDF: что именно нужно подписать CAdES-BES.

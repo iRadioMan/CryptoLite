@@ -13,6 +13,8 @@ export const ICON_PATHS = {
   file: ['M6.5 3.5h7l5 5v12h-12v-17Z', 'M13.5 3.5v5h5'],
   'chevron-right': ['m9 5 7 7-7 7'],
   'chevron-left': ['m15 5-7 7 7 7'],
+  'rotate-left': ['M3 12a9 9 0 1 0 9-9c-2.52 0-4.93 1-6.74 2.74L3 8', 'M3 3v5h5'],
+  'rotate-right': ['M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8', 'M21 3v5h-5'],
   alert: ['M12 4 3.5 19.5h17L12 4Z', 'M12 10v4', 'M12 17h.01'],
   check: ['m5 12.5 4.5 4.5L19 7.5'],
 } as const;
