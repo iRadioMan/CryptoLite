@@ -7,7 +7,7 @@
 use crate::signer::csp_native;
 use crate::signer::csp_native::windows::digest;
 use crate::signer::pdf_layer::{self, PreparedDocument};
-use crate::signer::{PageRotation, PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
+use crate::signer::{PageRotation, PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyResult, SignResult, SignerError};
 use crate::tr;
 
 fn signing_error(message: impl Into<String>) -> SignerError {
@@ -99,6 +99,124 @@ pub fn sign_document(
     let prepared = prepare(input_path, certificate_id, stamp, page_rotations)?;
     let payload = sign_prepared(&prepared, certificate_id)?;
     finish_signed(&prepared, &payload, output_path)
+}
+
+/// Проверка встроенных подписей PDF (PAdES-BES, штампы).
+///
+/// Каждая подпись проверяется по своему `/ByteRange`, а CMS — тем же CryptoAPI, что и
+/// отдельный файл подписи; цепочка и отзыв считаются для сертификата каждого подписанта.
+pub fn verify_document(path: &str, check_crl: bool) -> Result<PdfVerifyResult, SignerError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать PDF: {error}",
+            "could not read the PDF: {error}"
+        ))
+    })?;
+    let embedded = pdf_layer::embedded_signatures(&bytes)?;
+    let signatures = embedded
+        .into_iter()
+        .map(|signature| check_signature(signature, check_crl))
+        .collect::<Vec<_>>();
+    let valid_count = signatures.iter().filter(|signature| signature.valid).count();
+    let signer_count = signatures
+        .iter()
+        .map(|signature| signature.signers.len())
+        .sum();
+    let message = if signatures.is_empty() {
+        tr!(
+            "В документе нет встроенных подписей.",
+            "The document has no embedded signatures."
+        )
+    } else if valid_count == signatures.len() {
+        tr!("Все подписи PDF верны.", "All PDF signatures are valid.")
+    } else {
+        tr!(
+            "Часть подписей PDF не подтверждена.",
+            "Some PDF signatures are not confirmed."
+        )
+    };
+    Ok(PdfVerifyResult {
+        signatures,
+        valid_count,
+        signer_count,
+        pdf_base64: {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        },
+        message,
+    })
+}
+
+/// Проверяет одну встроенную подпись и описывает её для окна просмотра.
+fn check_signature(signature: pdf_layer::EmbeddedSignature, check_crl: bool) -> PdfSignatureInfo {
+    let (left_mm, top_mm, width_mm, height_mm) = match signature.rect_mm {
+        Some((left, top, width, height)) => (Some(left), Some(top), Some(width), Some(height)),
+        None => (None, None, None, None),
+    };
+    let mut info = PdfSignatureInfo {
+        field_name: signature.field_name,
+        page: signature.page,
+        left_mm,
+        top_mm,
+        width_mm,
+        height_mm,
+        sub_filter: signature.sub_filter,
+        signed_at: signature.signed_at,
+        covers_document: signature.covers_document,
+        valid: false,
+        message: String::new(),
+        signers: Vec::new(),
+    };
+    if let Some(problem) = signature.problem {
+        info.message = problem;
+        return info;
+    }
+    let (Some(cms), Some(content)) = (signature.cms, signature.content) else {
+        info.message = tr!(
+            "подпись PDF неполна: нет CMS или диапазона байт",
+            "the PDF signature is incomplete: no CMS or byte range"
+        )
+        .to_owned();
+        return info;
+    };
+    // Отсоединённая CMS (`ETSI.CAdES.detached`, `adbe.pkcs7.detached`) проверяется по
+    // диапазону файла; присоединённая несёт содержимое внутри себя.
+    let detached = info.sub_filter.ends_with("detached");
+    match crate::signer::native::verify_cms_signers(
+        &cms,
+        if detached { Some(&content) } else { None },
+        detached,
+        check_crl,
+    ) {
+        Ok((signers, failure)) => {
+            let revoked = signers
+                .iter()
+                .any(|signer| signer.revocation_status == "revoked");
+            info.valid = failure.is_none() && !revoked && !signers.is_empty();
+            info.message = match failure {
+                Some((index, code)) => tr!(
+                    "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
+                    "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
+                    index + 1
+                ),
+                None if revoked => tr!(
+                    "Криптографическая подпись верна, но сертификат отозван по CRL.",
+                    "The cryptographic signature is valid, but the certificate is revoked according to the CRL."
+                ),
+                None if check_crl => tr!(
+                    "Криптографическая подпись верна; проверка отзыва по CRL выполнена.",
+                    "The cryptographic signature is valid; revocation was checked against the CRL."
+                ),
+                None => tr!(
+                    "Криптографическая подпись верна.",
+                    "The cryptographic signature is valid."
+                ),
+            };
+            info.signers = signers;
+        }
+        Err(error) => info.message = error.to_string(),
+    }
+    info
 }
 
 #[cfg(all(test, target_os = "windows"))]

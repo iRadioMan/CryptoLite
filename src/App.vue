@@ -7,6 +7,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { readFile } from '@tauri-apps/plugin-fs';
 import logoUrl from './assets/logo.png';
 import StampEditor from './components/StampEditor.vue';
+import StampViewer from './components/StampViewer.vue';
 import AppIcon from './components/AppIcon.vue';
 import type { IconName } from './components/icons';
 import { forgetStampRects, type StampRect } from './signing';
@@ -17,7 +18,10 @@ type AppSettings = { language: string; theme: string; animations: boolean; defau
 type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
 type Doc = { path: string; name: string; selected: boolean };
 type SignBatchItemResult = { inputPath: string; outputPath: string; success: boolean; error: string | null };
-type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string; revocationStatus: 'notChecked' | 'good' | 'revoked' | 'unknown'; revocationMessage: string }[]; message: string };
+type VerifySigner = { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string; revocationStatus: 'notChecked' | 'good' | 'revoked' | 'unknown'; revocationMessage: string };
+type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: VerifySigner[]; message: string };
+type PdfSignatureInfo = { fieldName: string; page: number | null; leftMm: number | null; topMm: number | null; widthMm: number | null; heightMm: number | null; subFilter: string; signedAt: string; coversDocument: boolean; valid: boolean; message: string; signers: VerifySigner[] };
+type PdfVerifyResult = { signatures: PdfSignatureInfo[]; validCount: number; signerCount: number; pdfBase64: string; message: string };
 type CryptoResult = { outputPath: string; bytesWritten: number };
 const { t, locale } = useI18n();
 const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' : 'en';
@@ -50,11 +54,19 @@ const signReportOpen = ref(false);
 const signReportItems = ref<SignBatchItemResult[]>([]);
 const verifySignaturePath = ref('');
 const verifyContentPath = ref('');
-const verifyDetached = ref(true);
+/** Вид подписи: отсоединённая, присоединённая CMS или штамп на PDF. */
+const verifyKind = ref<'detached' | 'attached' | 'stamp'>('detached');
+const verifyPdfPath = ref('');
+const verifyPdfMessage = ref('');
 const verifyCheckCrl = ref(true);
 const verifyBase64 = ref(false);
 const verifyProgress = ref(false);
 const verifyResult = ref<VerifyResult | null>(null);
+const stampViewerOpen = ref(false);
+const stampViewerPdf = ref('');
+const stampViewerSignatures = ref<PdfSignatureInfo[]>([]);
+const stampViewerValid = ref(0);
+const stampViewerSigners = ref(0);
 const dragHover = ref(false);
 const cryptoMode = ref<'encrypt' | 'decrypt'>('encrypt');
 const cryptoFiles = ref<Doc[]>([]);
@@ -347,15 +359,28 @@ async function chooseVerifyContent() {
   const result = await open({ multiple: false, title: t('verifyPage.chooseContentTitle') });
   if (typeof result === 'string') { verifyContentPath.value = result; verifyResult.value = null; }
 }
+async function chooseVerifyPdf() {
+  const result = await open({ multiple: false, title: t('verifyPage.choosePdfTitle'), filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+  if (typeof result === 'string') { verifyPdfPath.value = result; verifyPdfMessage.value = ''; }
+}
+/** Режим проверки встроенных подписей PDF. */
+const verifyStamp = computed(() => verifyKind.value === 'stamp');
+watch(verifyKind, () => {
+  verifyResult.value = null;
+  verifyPdfMessage.value = '';
+});
 async function runVerify() {
-  if (!verifySignaturePath.value || (verifyDetached.value && !verifyContentPath.value) || verifyProgress.value) return;
+  if (verifyProgress.value) return;
+  if (verifyStamp.value) { await runVerifyPdf(); return; }
+  const needContent = verifyKind.value === 'detached';
+  if (!verifySignaturePath.value || (needContent && !verifyContentPath.value)) return;
   verifyProgress.value = true;
   verifyResult.value = null;
   try {
     verifyResult.value = await invoke<VerifyResult>('verify_signature', { request: {
       signaturePath: verifySignaturePath.value,
       contentPath: verifyContentPath.value || null,
-      detached: verifyDetached.value,
+      detached: needContent,
       base64: verifyBase64.value,
       checkCrl: verifyCheckCrl.value,
     } });
@@ -363,19 +388,48 @@ async function runVerify() {
     verifyResult.value = { valid: false, signaturePath: verifySignaturePath.value, contentPath: verifyContentPath.value || null, signers: [], message: String(error) };
   } finally { verifyProgress.value = false; }
 }
+/** Проверка штампов PDF: результат открывается в окне просмотра отметок. */
+async function runVerifyPdf() {
+  if (!verifyPdfPath.value) return;
+  verifyProgress.value = true;
+  verifyPdfMessage.value = '';
+  try {
+    const result = await invoke<PdfVerifyResult>('verify_pdf', { request: {
+      path: verifyPdfPath.value,
+      checkCrl: verifyCheckCrl.value,
+    } });
+    if (!result.signatures.length) { verifyPdfMessage.value = result.message; return; }
+    openStampViewer(result);
+  } catch (error) {
+    verifyPdfMessage.value = String(error);
+  } finally { verifyProgress.value = false; }
+}
+/** PDF приходит из команды в Base64: плагин fs не ограничен scope перетащенных путей. */
+function openStampViewer(result: PdfVerifyResult) {
+  stampViewerSignatures.value = result.signatures;
+  stampViewerValid.value = result.validCount;
+  stampViewerSigners.value = result.signerCount;
+  stampViewerPdf.value = result.pdfBase64;
+  stampViewerOpen.value = true;
+}
 function handleDroppedPaths(paths: string[]) {
   if (page.value === 'sign') {
     void addFiles(paths);
   } else if (page.value === 'encrypt') {
     addCryptoFiles(paths);
   } else if (page.value === 'verify' && paths.length) {
+    if (verifyStamp.value) {
+      const pdf = paths.find((path) => /\.pdf$/i.test(path));
+      if (pdf) { verifyPdfPath.value = pdf; verifyPdfMessage.value = ''; }
+      return;
+    }
     const signatures = paths.filter((path) => /\.(sig|p7s)$/i.test(path));
     const signature = signatures[0] || paths[0];
     const content = paths.find((path) => path !== signature);
     verifySignaturePath.value = signature;
     if (content) {
       verifyContentPath.value = content;
-      verifyDetached.value = true;
+      verifyKind.value = 'detached';
     }
     verifyResult.value = null;
   }
@@ -414,6 +468,15 @@ function parseDroppedBytes(base64: string): Uint8Array {
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }
+/** PDF в Base64 для просмотра в pdf.js: без data-префикса. */
+function base64FromBytes(contents: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let offset = 0; offset < contents.length; offset += chunk) {
+    binary += String.fromCharCode(...contents.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
+}
 
 async function openStampEditor(file: Doc) {
   stampDocumentPath.value = file.path;
@@ -427,12 +490,7 @@ async function openStampEditor(file: Doc) {
   try {
     const contents = await readFile(file.path);
     stampPdfBytes.value = contents.byteLength;
-    let binary = '';
-    const chunk = 0x8000;
-    for (let offset = 0; offset < contents.length; offset += chunk) {
-      binary += String.fromCharCode(...contents.subarray(offset, offset + chunk));
-    }
-    stampPdfBase64.value = btoa(binary);
+    stampPdfBase64.value = base64FromBytes(contents);
     // Разметка прошлого открытия не переносится: области всегда рисуются заново.
     forgetStampRects(file.path, contents.byteLength);
     stampRects.value = [];
@@ -748,20 +806,26 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <div class="page-heading"><div><h1>{{ t('nav.verify') }}</h1><p>{{ t('verifyPage.description') }}</p></div></div>
         <section class="card">
           <div class="card-heading"><h2>{{ t('verifyPage.filesTitle') }}</h2></div>
-          <div class="form-grid"><label class="field"><span>{{ t('verifyPage.signatureKind') }}</span><select v-model="verifyDetached" @change="verifyResult=null"><option :value="true">{{ t('detached') }}</option><option :value="false">{{ t('attached') }}</option></select></label><label class="field"><span>{{ t('verifyPage.encoding') }}</span><select v-model="verifyBase64"><option :value="false">{{ t('verifyPage.derBinary') }}</option><option :value="true">{{ t('verifyPage.base64Pem') }}</option></select></label></div>
+          <div class="form-grid"><label class="field"><span>{{ t('verifyPage.signatureKind') }}</span><select v-model="verifyKind"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label><label v-if="!verifyStamp" class="field"><span>{{ t('verifyPage.encoding') }}</span><select v-model="verifyBase64"><option :value="false">{{ t('verifyPage.derBinary') }}</option><option :value="true">{{ t('verifyPage.base64Pem') }}</option></select></label></div>
           <label class="settings-toggle verify-crl-toggle"><input v-model="verifyCheckCrl" type="checkbox"/><span><b>{{ t('verifyPage.checkCrl') }}</b><small>{{ t('verifyPage.checkCrlHelp') }}</small></span></label>
-          <div class="verify-file-field"><span>{{ t('verifyPage.signatureFile') }}</span>
-            <button class="picker-button" @click="chooseVerifySignature"><span class="picker-leading"><AppIcon name="file" :size="20" /></span><span class="picker-copy"><b>{{ verifySignaturePath || t('verifyPage.chooseSignature') }}</b><small>{{ t('verifyPage.cmsSupported') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
+          <div v-if="verifyStamp" class="verify-file-field"><span>{{ t('verifyPage.pdfFile') }}</span>
+            <button class="picker-button" @click="chooseVerifyPdf"><span class="picker-leading"><AppIcon name="file" :size="20" /></span><span class="picker-copy"><b>{{ verifyPdfPath || t('verifyPage.choosePdf') }}</b><small>{{ t('verifyPage.pdfSupported') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
           </div>
-          <div v-if="verifyDetached" class="verify-file-field"><span>{{ t('verifyPage.sourceDoc') }}</span>
-            <button class="picker-button" @click="chooseVerifyContent"><span class="picker-leading"><AppIcon name="folder" :size="20" /></span><span class="picker-copy"><b>{{ verifyContentPath || t('verifyPage.chooseOriginal') }}</b><small>{{ t('verifyPage.contentCompared') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
-          </div>
+          <template v-else>
+            <div class="verify-file-field"><span>{{ t('verifyPage.signatureFile') }}</span>
+              <button class="picker-button" @click="chooseVerifySignature"><span class="picker-leading"><AppIcon name="file" :size="20" /></span><span class="picker-copy"><b>{{ verifySignaturePath || t('verifyPage.chooseSignature') }}</b><small>{{ t('verifyPage.cmsSupported') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
+            </div>
+            <div v-if="verifyKind==='detached'" class="verify-file-field"><span>{{ t('verifyPage.sourceDoc') }}</span>
+              <button class="picker-button" @click="chooseVerifyContent"><span class="picker-leading"><AppIcon name="folder" :size="20" /></span><span class="picker-copy"><b>{{ verifyContentPath || t('verifyPage.chooseOriginal') }}</b><small>{{ t('verifyPage.contentCompared') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
+            </div>
+          </template>
         </section>
+        <p v-if="verifyPdfMessage" class="form-message" role="alert">{{ verifyPdfMessage }}</p>
         <section v-if="verifyResult" class="verify-result" :class="verifyResult.valid?'valid':'invalid'">
           <header><span class="verify-result-icon"><AppIcon :name="verifyResult.valid?'check':'alert'" :size="20" /></span><div><h2>{{ verifyResult.valid?t('verifyPage.valid'):t('verifyPage.invalid') }}</h2><p>{{ verifyResult.message }}</p></div></header>
           <div v-if="verifyResult.signers.length" class="verify-signer-list"><article v-for="(signer,index) in verifyResult.signers" :key="index" class="verify-signer"><b>{{ signer.subject || t('verifyPage.signer') }}</b><small>{{ t('verifyPage.issuer') }}{{ signer.issuer }}</small><small>{{ t('verifyPage.validUntil') }}{{ signer.expiresAt }}</small><small class="chain-status" :class="signer.chainTrusted?'trusted':'untrusted'">{{ signer.chainMessage }}</small><small class="chain-status" :class="signer.revocationStatus==='good'?'trusted':signer.revocationStatus==='revoked'?'untrusted':'unknown'">{{ signer.revocationMessage }}</small></article></div>
         </section>
-        <footer class="action-bar"><button class="sign-button" :disabled="!status.available || !verifySignaturePath || (verifyDetached && !verifyContentPath) || verifyProgress" @click="runVerify">{{ verifyProgress?t('verifyPage.checking'):t('verifyPage.runVerify') }}</button></footer>
+        <footer class="action-bar"><button class="sign-button" :disabled="!status.available || verifyProgress || (verifyStamp ? !verifyPdfPath : (!verifySignaturePath || (verifyKind==='detached' && !verifyContentPath)))" @click="runVerify">{{ verifyProgress?t('verifyPage.checking'):t('verifyPage.runVerify') }}</button></footer>
       </section>
 
       <section v-else-if="page==='encrypt'" class="content-view">
@@ -831,7 +895,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.4.9</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.5.9</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
@@ -841,6 +905,8 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
     </main>
 
     <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampOpen=false"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" v-model:rotations="stampPageRotations" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
+
+    <div v-if="stampViewerOpen" class="modal-backdrop" @click.self="stampViewerOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-viewer-title"><header class="certificate-header"><div><h2 id="stamp-viewer-title">{{ t('stampViewer.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampViewerOpen=false"><AppIcon name="x" :size="20" /></button></header><StampViewer :pdf-base64="stampViewerPdf" :signatures="stampViewerSignatures"/><footer class="certificate-footer stamp-viewer-footer"><span class="stamp-viewer-signers">{{ t('stampViewer.signers', { count: stampViewerSigners }) }}</span><span class="stamp-viewer-valid" :class="{ 'stamp-warning': stampViewerValid !== stampViewerSignatures.length }">{{ t('stampViewer.valid', { valid: stampViewerValid, total: stampViewerSignatures.length }) }}</span><button class="sign-button" @click="stampViewerOpen=false">{{ t('stampViewer.close') }}</button></footer></section></div>
 
     <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><div class="alert-icon"><AppIcon name="info" :size="20" /></div><h2 id="confirm-title">{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="outline-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
 

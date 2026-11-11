@@ -489,7 +489,69 @@ mod ffi {
             })?),
             None => None,
         };
-        if request.detached && content.is_none() {
+        let (signers, failure) = verify_cms_signers(
+            &signature,
+            content.as_deref(),
+            request.detached,
+            request.check_crl,
+        )?;
+        if let Some((signer_index, code)) = failure {
+            return Ok(crate::signer::VerifyResult {
+                valid: false,
+                signature_path,
+                content_path,
+                signers,
+                message: tr!(
+                    "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
+                    "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
+                    signer_index + 1
+                ),
+            });
+        }
+        let revoked = signers
+            .iter()
+            .any(|signer| signer.revocation_status == "revoked");
+        let message = if revoked {
+            tr!(
+                "Криптографическая подпись верна, но в цепочке есть сертификат, отозванный по CRL.",
+                "The cryptographic signature is valid, but a certificate in the chain is revoked according to the CRL."
+            )
+        } else if request.check_crl {
+            tr!(
+                "Криптографические подписи всех подписантов верны; проверка отзыва по CRL выполнена.",
+                "The cryptographic signatures of all signers are valid; revocation was checked against the CRL."
+            )
+        } else {
+            tr!(
+                "Криптографические подписи всех подписантов верны.",
+                "The cryptographic signatures of all signers are valid."
+            )
+        };
+        Ok(crate::signer::VerifyResult {
+            valid: !signers.is_empty() && !revoked,
+            signature_path,
+            content_path,
+            signers,
+            message,
+        })
+    }
+
+    /// Проверка CMS по байтам: встроенные подписи PDF проверяются этой функцией.
+    ///
+    /// Возвращает подписантов и номер подписанта, не прошедшего проверку, с кодом Windows.
+    pub(super) fn verify_cms_signers(
+        signature: &[u8],
+        content: Option<&[u8]>,
+        detached: bool,
+        check_crl: bool,
+    ) -> Result<
+        (
+            Vec<crate::signer::VerifySignerInfo>,
+            Option<(u32, u32)>,
+        ),
+        crate::signer::SignerError,
+    > {
+        if detached && content.is_none() {
             return Err(crate::signer::SignerError::Signing(tr!(
                 "для отсоединённой подписи выберите исходный документ",
                 "select the source document for a detached signature"
@@ -505,7 +567,6 @@ mod ffi {
         parameters.cbSize = std::mem::size_of::<CRYPT_VERIFY_MESSAGE_PARA>() as u32;
         parameters.dwMsgAndCertEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
         let content_bytes = content
-            .as_ref()
             .map(|bytes| {
                 u32::try_from(bytes.len()).map_err(|_| {
                     crate::signer::SignerError::Signing(tr!(
@@ -517,11 +578,10 @@ mod ffi {
             .transpose()?;
         let mut signers = Vec::new();
         let mut signer_index = 0u32;
-        let check_crl = request.check_crl;
         loop {
             let mut signer = ptr::null_mut();
-            let valid = if request.detached {
-                let bytes = content.as_ref().expect("checked above");
+            let valid = if detached {
+                let bytes = content.expect("checked above");
                 let content_ptr = bytes.as_ptr();
                 unsafe {
                     CryptVerifyDetachedMessageSignature(
@@ -539,7 +599,7 @@ mod ffi {
                 verify_attached_signer(
                     &parameters,
                     signer_index,
-                    &signature,
+                    signature,
                     signature_len,
                     &mut signer,
                 )
@@ -549,14 +609,7 @@ mod ffi {
                 if code == 0x8009_200E && signer_index > 0 {
                     break;
                 } // CRYPT_E_NO_SIGNER
-                return Ok(crate::signer::VerifyResult {
-                    valid: false, signature_path, content_path, signers,
-                    message: tr!(
-                        "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
-                        "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
-                        signer_index + 1
-                    ),
-                });
+                return Ok((signers, Some((signer_index, code))));
             }
             let signer_context = CertificateContext(signer);
             if let Some(cert) = unsafe { signer_context.as_ptr().as_ref() }
@@ -580,44 +633,13 @@ mod ffi {
             }
             signer_index += 1;
             if signer_index >= 128 {
-                return Ok(crate::signer::VerifyResult {
-                    valid: false,
-                    signature_path,
-                    content_path,
-                    signers,
-                    message: tr!(
-                        "В CMS найдено больше 127 подписантов; проверка остановлена.",
-                        "More than 127 signers were found in the CMS; verification stopped."
-                    ),
-                });
+                return Err(crate::signer::SignerError::Signing(tr!(
+                    "В CMS найдено больше 127 подписантов; проверка остановлена.",
+                    "More than 127 signers were found in the CMS; verification stopped."
+                )));
             }
         }
-        let revoked = signers
-            .iter()
-            .any(|signer| signer.revocation_status == "revoked");
-        let message = if revoked {
-            tr!(
-                "Криптографическая подпись верна, но в цепочке есть сертификат, отозванный по CRL.",
-                "The cryptographic signature is valid, but a certificate in the chain is revoked according to the CRL."
-            )
-        } else if check_crl {
-            tr!(
-                "Криптографические подписи всех подписантов верны; проверка отзыва по CRL выполнена.",
-                "The cryptographic signatures of all signers are valid; revocation was checked against the CRL."
-            )
-        } else {
-            tr!(
-                "Криптографические подписи всех подписантов верны.",
-                "The cryptographic signatures of all signers are valid."
-            )
-        };
-        Ok(crate::signer::VerifyResult {
-            valid: !signers.is_empty() && !revoked,
-            signature_path,
-            content_path,
-            signers,
-            message,
-        })
+        Ok((signers, None))
     }
 
     /// Итог проверки цепочки: доверие Windows и отдельный статус отзыва по CRL.
@@ -1730,6 +1752,22 @@ pub fn verify_signature(
     request: crate::signer::VerifyRequest,
 ) -> Result<crate::signer::VerifyResult, crate::signer::SignerError> {
     ffi::verify_cms(request)
+}
+
+/// Проверка CMS по байтам: используется встроенными подписями PDF.
+pub fn verify_cms_signers(
+    signature: &[u8],
+    content: Option<&[u8]>,
+    detached: bool,
+    check_crl: bool,
+) -> Result<
+    (
+        Vec<crate::signer::VerifySignerInfo>,
+        Option<(u32, u32)>,
+    ),
+    crate::signer::SignerError,
+> {
+    ffi::verify_cms_signers(signature, content, detached, check_crl)
 }
 
 pub fn encrypt_file(

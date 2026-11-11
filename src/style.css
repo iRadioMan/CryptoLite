@@ -276,5 +276,33 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .stamp-summary{display:flex;justify-content:space-between;margin-top:var(--sp-2);color:var(--text-3);font-size:var(--fs-12);line-height:var(--lh-12)}
 .stamp-summary .warning,.stamp-warning{color:var(--danger)}
 
+/* stamp viewer */
+.stamp-canvas-surface.viewer{cursor:default}
+.stamp-zone.signature{cursor:pointer;padding:0;font:inherit;text-align:left;background:rgb(47 109 241 / .1)}
+.stamp-zone.signature.valid{border-color:var(--success);background:rgb(47 158 106 / .14)}
+.stamp-zone.signature.invalid{border-color:var(--danger);background:rgb(212 59 59 / .14)}
+.stamp-zone.signature.selected{border-width:2px;box-shadow:0 0 0 2px var(--ring)}
+.signature-details{margin-top:var(--sp-3);padding:var(--sp-3);border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surface-hover);max-height:260px;overflow:auto}
+.signature-details-head{display:flex;align-items:center;gap:var(--sp-2);min-width:0}
+.signature-details-head b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-14);line-height:var(--lh-14);color:var(--text-1)}
+.signature-state{display:inline-flex;align-items:center;gap:4px;flex:none;padding:2px 8px;border-radius:var(--r-full);font-size:var(--fs-12);line-height:var(--lh-12);font-weight:600;white-space:nowrap}
+.signature-state.valid{background:var(--success-soft);color:var(--success)}
+.signature-state.invalid{background:var(--danger-soft);color:var(--danger)}
+.signature-message{margin:var(--sp-2) 0 0;font-size:var(--fs-12);line-height:var(--lh-16);color:var(--text-2)}
+.signature-meta{display:flex;flex-wrap:wrap;gap:var(--sp-2) var(--sp-4);margin:var(--sp-2) 0 0}
+.signature-meta div{display:flex;gap:6px;min-width:0}
+.signature-meta dt{margin:0;font-size:var(--fs-12);line-height:var(--lh-12);color:var(--text-3)}
+.signature-meta dd{margin:0;font-size:var(--fs-12);line-height:var(--lh-12);color:var(--text-1);overflow-wrap:anywhere}
+.signature-signer{margin-top:var(--sp-2);padding-top:var(--sp-2);border-top:1px solid var(--border)}
+.signature-signer b{display:block;font-size:var(--fs-12);line-height:var(--lh-14);color:var(--text-1);overflow-wrap:anywhere}
+.signature-signer small{display:block;margin-top:2px;font-size:var(--fs-12);line-height:var(--lh-12);color:var(--text-3);overflow-wrap:anywhere}
+.signature-note{margin:var(--sp-2) 0 0;font-size:var(--fs-12);line-height:var(--lh-16);color:var(--text-3)}
+.stamp-viewer-footer{display:grid;grid-template-columns:1fr auto 1fr;align-items:center}
+.stamp-viewer-footer .stamp-viewer-signers{justify-self:start}
+.stamp-viewer-footer .stamp-viewer-valid{justify-self:center;text-align:center}
+.stamp-viewer-footer .sign-button{justify-self:end}
+.stamp-viewer-list{align-items:center;justify-content:flex-start;gap:var(--sp-2);flex-wrap:wrap}
+.stamp-viewer-list .outline-button{height:var(--h-sm);padding:0 var(--sp-2);font-size:var(--fs-12)}
+
 .motion-off *,.motion-off *::before,.motion-off *::after{scroll-behavior:auto!important;animation:none!important;transition:none!important}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}

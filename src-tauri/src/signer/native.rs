@@ -21,6 +21,31 @@ pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerEr
     }
 }
 
+/// Проверка CMS по байтам: используется встроенными подписями PDF.
+///
+/// Возвращает подписантов и номер подписанта, не прошедшего проверку, с кодом Windows.
+pub fn verify_cms_signers(
+    signature: &[u8],
+    content: Option<&[u8]>,
+    detached: bool,
+    check_crl: bool,
+) -> Result<(Vec<crate::signer::VerifySignerInfo>, Option<(u32, u32)>), SignerError> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::verify_cms_signers(
+            signature, content, detached, check_crl,
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (signature, content, detached, check_crl);
+        Err(SignerError::Signing(tr!(
+            "Проверка CMS пока реализована только для Windows",
+            "CMS verification is currently implemented only for Windows"
+        )))
+    }
+}
+
 pub fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, SignerError> {
     #[cfg(target_os = "windows")]
     {

@@ -25,6 +25,7 @@ pub fn run() {
             commands::remove_temp_pdf,
             commands::filter_file_paths,
             commands::verify_signature,
+            commands::verify_pdf,
             commands::encrypt_file,
             commands::decrypt_file
         ])

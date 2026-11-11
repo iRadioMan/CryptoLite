@@ -457,6 +457,23 @@ pub async fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, St
 }
 
 #[tauri::command]
+pub async fn verify_pdf(
+    request: crate::signer::PdfVerifyRequest,
+) -> Result<crate::signer::PdfVerifyResult, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::signer::pades::verify_document(&request.path, request.check_crl)
+    })
+    .await
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить проверку подписей PDF: {error}",
+            "Could not start PDF signature verification: {error}"
+        )
+    })?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::encrypt_file(request))
         .await

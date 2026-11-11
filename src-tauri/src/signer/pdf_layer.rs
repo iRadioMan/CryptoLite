@@ -529,6 +529,465 @@ pub fn signed_content(
     Ok(content)
 }
 
+/// Поле AcroForm с подписью: словарь поля и его объект, если поле косвенное.
+struct SignatureField {
+    id: Option<lopdf::ObjectId>,
+    dictionary: Dictionary,
+}
+
+/// Встроенная подпись PDF: словарь `/V` поля AcroForm с типом `/FT /Sig`.
+pub struct EmbeddedSignature {
+    pub field_name: String,
+    /// Номер страницы с отметкой, считая с нуля.
+    pub page: Option<usize>,
+    /// Прямоугольник отметки в мм от левого верхнего угла видимой стороны страницы.
+    pub rect_mm: Option<(f64, f64, f64, f64)>,
+    pub sub_filter: String,
+    pub signed_at: String,
+    /// Диапазоны `/ByteRange` покрывают файл целиком, кроме поля `/Contents`.
+    pub covers_document: bool,
+    /// Подписанные байты: склейка диапазонов `/ByteRange`.
+    pub content: Option<Vec<u8>>,
+    /// CMS из `/Contents` без нулевого запаса.
+    pub cms: Option<Vec<u8>>,
+    /// Почему подпись нельзя проверить: повреждён словарь, диапазон или CMS.
+    pub problem: Option<String>,
+}
+
+/// Перечисляет подписи документа в порядке полей AcroForm.
+pub fn embedded_signatures(bytes: &[u8]) -> Result<Vec<EmbeddedSignature>, SignerError> {
+    let document = Document::load_mem(bytes).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать PDF: {error}",
+            "could not read the PDF: {error}"
+        ))
+    })?;
+    if document.is_encrypted() {
+        return Err(signing_error(tr!(
+            "PDF защищён паролем: проверка встроенных подписей такого документа пока не поддерживается",
+            "the PDF is password-protected: verification of embedded signatures is not supported yet"
+        )));
+    }
+    let catalog_id = document
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|error| {
+            signing_error(tr!(
+                "не найден каталог PDF: {error}",
+                "PDF catalog not found: {error}"
+            ))
+        })?;
+    let catalog = document.get_dictionary(catalog_id).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать каталог PDF: {error}",
+            "could not read the PDF catalog: {error}"
+        ))
+    })?;
+    let pages_id = catalog
+        .get(b"Pages")
+        .and_then(Object::as_reference)
+        .map_err(|error| {
+            signing_error(tr!(
+                "не найдено дерево страниц PDF: {error}",
+                "PDF page tree not found: {error}"
+            ))
+        })?;
+    let mut page_ids = Vec::new();
+    collect_pages(&document, pages_id, &mut page_ids, 0)?;
+    let mut fields = Vec::new();
+    collect_signature_fields(&document, catalog, None, &mut fields, 0);
+    Ok(fields
+        .iter()
+        .map(|field| read_signature(&document, bytes, pages_id, &page_ids, field))
+        .collect())
+}
+
+/// Обходит `/AcroForm /Fields`, разворачивая `/Kids` полей и виджетов.
+fn collect_signature_fields(
+    document: &Document,
+    catalog: &Dictionary,
+    acroform_ft: Option<Vec<u8>>,
+    out: &mut Vec<SignatureField>,
+    depth: usize,
+) {
+    if depth > 64 {
+        return;
+    }
+    let acroform = match catalog.get(b"AcroForm") {
+        Ok(Object::Reference(id)) => document.get_dictionary(*id).ok().cloned(),
+        Ok(Object::Dictionary(dictionary)) => Some(dictionary.clone()),
+        _ => None,
+    };
+    let Some(acroform) = acroform else {
+        return;
+    };
+    let fields = match acroform.get(b"Fields") {
+        Ok(Object::Array(items)) => items.clone(),
+        Ok(Object::Reference(id)) => document
+            .get_object(*id)
+            .and_then(Object::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let inherited = acroform
+        .get(b"FT")
+        .ok()
+        .and_then(|value| value.as_name().ok())
+        .map(<[u8]>::to_vec)
+        .or(acroform_ft);
+    for item in &fields {
+        walk_signature_field(document, item, inherited.clone(), out, depth + 1);
+    }
+}
+
+fn walk_signature_field(
+    document: &Document,
+    item: &Object,
+    inherited_ft: Option<Vec<u8>>,
+    out: &mut Vec<SignatureField>,
+    depth: usize,
+) {
+    if depth > 64 {
+        return;
+    }
+    let (id, dictionary) = match item {
+        Object::Reference(id) => match document.get_dictionary(*id) {
+            Ok(dictionary) => (Some(*id), dictionary.clone()),
+            Err(_) => return,
+        },
+        Object::Dictionary(dictionary) => (None, dictionary.clone()),
+        _ => return,
+    };
+    let field_type = dictionary
+        .get(b"FT")
+        .ok()
+        .and_then(|value| value.as_name().ok())
+        .map(<[u8]>::to_vec)
+        .or_else(|| inherited_ft.clone());
+    // Терминальное поле подписи хранит и `/V`, и (обычно) `/Rect` виджета.
+    if field_type.as_deref() == Some(b"Sig") && dictionary.get(b"V").is_ok() {
+        out.push(SignatureField { id, dictionary });
+        return;
+    }
+    if let Ok(kids) = dictionary.get(b"Kids").and_then(Object::as_array) {
+        for kid in kids {
+            walk_signature_field(document, kid, field_type.clone(), out, depth + 1);
+        }
+    }
+}
+
+fn read_signature(
+    document: &Document,
+    bytes: &[u8],
+    pages_id: lopdf::ObjectId,
+    page_ids: &[lopdf::ObjectId],
+    field: &SignatureField,
+) -> EmbeddedSignature {
+    let mut signature = EmbeddedSignature {
+        field_name: field_name(document, field),
+        page: None,
+        rect_mm: None,
+        sub_filter: String::new(),
+        signed_at: String::new(),
+        covers_document: false,
+        content: None,
+        cms: None,
+        problem: None,
+    };
+    let Some(value) = resolve_dictionary(document, field.dictionary.get(b"V").ok()) else {
+        signature.problem = Some(tr!(
+            "поле подписи PDF не содержит подпись",
+            "the PDF signature field has no signature"
+        ));
+        return signature;
+    };
+    signature.sub_filter = value
+        .get(b"SubFilter")
+        .and_then(Object::as_name)
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .unwrap_or_default();
+    signature.signed_at = value
+        .get(b"M")
+        .ok()
+        .and_then(string_bytes)
+        .map(|raw| format_pdf_date(&raw))
+        .unwrap_or_default();
+    match value.get(b"Contents").ok().and_then(string_bytes) {
+        Some(contents) => match trim_der(&contents) {
+            Ok(der) => signature.cms = Some(der.to_vec()),
+            Err(error) => signature.problem = Some(error.to_string()),
+        },
+        None => {
+            signature.problem = Some(tr!(
+                "в подписи PDF нет поля /Contents",
+                "the PDF signature has no /Contents field"
+            ))
+        }
+    }
+    match value.get(b"ByteRange").ok().and_then(byte_ranges) {
+        Some(ranges) => {
+            signature.covers_document = covers_document(&ranges, bytes.len());
+            match signed_ranges(bytes, &ranges) {
+                Ok(content) => signature.content = Some(content),
+                Err(error) => signature.problem = Some(error.to_string()),
+            }
+        }
+        None => {
+            signature.problem = Some(tr!(
+                "в подписи PDF нет поля /ByteRange",
+                "the PDF signature has no /ByteRange field"
+            ))
+        }
+    }
+    if let Some((page_id, rect)) = widget_placement(document, field, page_ids) {
+        signature.page = page_ids.iter().position(|id| *id == page_id);
+        if let (Some(rect), Ok((page_x, page_y, page_width, page_height))) =
+            (rect, page_box(document, pages_id, page_id))
+        {
+            let rect = (
+                rect.0 - page_x,
+                rect.1 - page_y,
+                rect.2 - page_x,
+                rect.3 - page_y,
+            );
+            let rotation = page_rotation(document, pages_id, page_id);
+            signature.rect_mm = Some(widget_box_mm(rotation, page_width, page_height, rect));
+        }
+    }
+    signature
+}
+
+fn field_name(document: &Document, field: &SignatureField) -> String {
+    let mut parts = Vec::new();
+    let mut dictionary = Some(field.dictionary.clone());
+    let mut depth = 0;
+    // Полное имя поля складывается из /T всех родителей.
+    while let Some(current) = dictionary {
+        if depth > 16 {
+            break;
+        }
+        if let Some(name) = current.get(b"T").ok().and_then(string_bytes) {
+            parts.push(String::from_utf8_lossy(&name).into_owned());
+        }
+        dictionary = current
+            .get(b"Parent")
+            .and_then(Object::as_reference)
+            .ok()
+            .and_then(|id| document.get_dictionary(id).ok().cloned());
+        depth += 1;
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        tr!("без имени", "unnamed").to_owned()
+    } else {
+        parts.join(".")
+    }
+}
+
+/// Страница и прямоугольник виджета: `/P` поля, виджета в `/Kids` или ссылка в `/Annots`.
+fn widget_placement(
+    document: &Document,
+    field: &SignatureField,
+    page_ids: &[lopdf::ObjectId],
+) -> Option<(lopdf::ObjectId, Option<(f64, f64, f64, f64)>)> {
+    let rect_of = |dictionary: &Dictionary| {
+        dictionary
+            .get(b"Rect")
+            .ok()
+            .and_then(object_box)
+    };
+    if let Some(page) = field
+        .dictionary
+        .get(b"P")
+        .and_then(Object::as_reference)
+        .ok()
+    {
+        return Some((page, rect_of(&field.dictionary)));
+    }
+    if let Ok(kids) = field.dictionary.get(b"Kids").and_then(Object::as_array) {
+        for kid in kids {
+            let Some(kid) = resolve_dictionary(document, Some(kid)) else {
+                continue;
+            };
+            if let Some(page) = kid.get(b"P").and_then(Object::as_reference).ok() {
+                return Some((page, rect_of(&kid)));
+            }
+        }
+    }
+    let target = field.id?;
+    for page_id in page_ids {
+        let Ok(page) = document.get_dictionary(*page_id) else {
+            continue;
+        };
+        let annots = match page.get(b"Annots") {
+            Ok(Object::Array(items)) => items.clone(),
+            Ok(Object::Reference(id)) => document
+                .get_object(*id)
+                .and_then(Object::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            _ => continue,
+        };
+        if annots
+            .iter()
+            .any(|item| item.as_reference().ok() == Some(target))
+        {
+            return Some((*page_id, rect_of(&field.dictionary)));
+        }
+    }
+    None
+}
+
+fn resolve_dictionary(document: &Document, value: Option<&Object>) -> Option<Dictionary> {
+    match value? {
+        Object::Dictionary(dictionary) => Some(dictionary.clone()),
+        Object::Reference(id) => document.get_dictionary(*id).ok().cloned(),
+        _ => None,
+    }
+}
+
+fn string_bytes(value: &Object) -> Option<Vec<u8>> {
+    match value {
+        Object::String(bytes, _) => Some(bytes.clone()),
+        _ => None,
+    }
+}
+
+/// `/Rect` в `(x0, y0, x1, y1)` с сохранением исходного порядка углов.
+fn object_box(value: &Object) -> Option<(f64, f64, f64, f64)> {
+    let items = value.as_array().ok()?;
+    if items.len() < 4 {
+        return None;
+    }
+    let number = |item: &Object| match item {
+        Object::Integer(value) => Some(*value as f64),
+        Object::Real(value) => Some(f64::from(*value)),
+        _ => None,
+    };
+    Some((
+        number(&items[0])?,
+        number(&items[1])?,
+        number(&items[2])?,
+        number(&items[3])?,
+    ))
+}
+
+/// `/ByteRange` — пары «смещение, длина».
+fn byte_ranges(value: &Object) -> Option<Vec<(usize, usize)>> {
+    let items = value.as_array().ok()?;
+    if items.len() < 4 || items.len() % 2 != 0 {
+        return None;
+    }
+    let numbers = items
+        .iter()
+        .map(|item| {
+            item.as_i64()
+                .ok()
+                .and_then(|number| usize::try_from(number).ok())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        numbers
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect(),
+    )
+}
+
+/// Подпись покрывает весь файл: два диапазона, от начала и до конца, с одной дырой.
+fn covers_document(ranges: &[(usize, usize)], length: usize) -> bool {
+    if ranges.len() != 2 {
+        return false;
+    }
+    let (start, first) = ranges[0];
+    let (second_start, second) = ranges[1];
+    start == 0
+        && first > 0
+        && second_start > first
+        && second_start
+            .checked_add(second)
+            .is_some_and(|end| end == length)
+}
+
+fn signed_ranges(bytes: &[u8], ranges: &[(usize, usize)]) -> Result<Vec<u8>, SignerError> {
+    let mut content = Vec::new();
+    for (start, length) in ranges {
+        let end = start.checked_add(*length).ok_or_else(|| {
+            signing_error(tr!(
+                "диапазон подписи PDF переполнен: {start}+{length}",
+                "the PDF signature byte range overflows: {start}+{length}"
+            ))
+        })?;
+        let slice = bytes.get(*start..end).ok_or_else(|| {
+            signing_error(tr!(
+                "диапазон подписи выходит за пределы PDF: {start}+{length} из {} байт",
+                "the signature byte range is outside the PDF: {start}+{length} of {} bytes",
+                bytes.len()
+            ))
+        })?;
+        content.extend_from_slice(slice);
+    }
+    Ok(content)
+}
+
+/// Прямоугольник виджета (pt, координаты страницы) → мм видимой стороны страницы.
+///
+/// Обратное преобразование к [`box_in_page`]: точки страницы переводятся в систему
+/// видимой стороны (`/CropBox` после `/Rotate`), ось Y направлена вниз.
+fn widget_box_mm(
+    rotation: i64,
+    page_width: f64,
+    page_height: f64,
+    rect: (f64, f64, f64, f64),
+) -> (f64, f64, f64, f64) {
+    let (x0, y0, x1, y1) = rect;
+    let x = x0.min(x1);
+    let y = y0.min(y1);
+    let width = (x1 - x0).abs();
+    let height = (y1 - y0).abs();
+    let (left, top, visible_width, visible_height) = match rotation {
+        90 => (y, x, height, width),
+        180 => (page_width - x - width, y, width, height),
+        270 => (
+            page_height - y - height,
+            page_width - x - width,
+            height,
+            width,
+        ),
+        _ => (x, page_height - y - height, width, height),
+    };
+    let mm = |value: f64| value * 25.4 / 72.0;
+    (
+        mm(left),
+        mm(top),
+        mm(visible_width),
+        mm(visible_height),
+    )
+}
+
+/// `D:YYYYMMDDHHmmSS±hh'mm'` из `/M` → `DD.MM.YYYY HH:MM:SS`.
+fn format_pdf_date(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw).trim().to_owned();
+    let digits = text.trim_start_matches("D:").trim();
+    let digits = digits
+        .chars()
+        .take(14)
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.len() < 8 {
+        return text;
+    }
+    let part = |range: std::ops::Range<usize>| digits[range].to_string();
+    let date = format!("{}.{}.{}", part(6..8), part(4..6), part(0..4));
+    if digits.len() >= 14 {
+        format!("{date} {}:{}:{}", part(8..10), part(10..12), part(12..14))
+    } else {
+        date
+    }
+}
+
 /// Записывает `/ByteRange` и CMS в подготовленный файл. Длина файла не меняется:
 /// диапазон и содержимое занимают ровно те места, что и заглушки.
 pub fn assemble_document(
@@ -2189,5 +2648,65 @@ mod tests {
             prepare_bytes(source, &test_stamp(), &test_signer(), &missing_page),
             Err(SignerError::Pdf(_))
         ));
+    }
+
+    #[test]
+    fn widget_box_mm_matches_visible_page_rotation() {
+        let (page_width, page_height) = (595.0, 842.0);
+        // Прямоугольник 100 × 50 pt в левом нижнем углу страницы.
+        let rect = (10.0, 20.0, 110.0, 70.0);
+        let mm = |value: f64| value * 25.4 / 72.0;
+        let expected = [
+            (0, (10.0, 842.0 - 70.0, 100.0, 50.0)),
+            (90, (20.0, 10.0, 50.0, 100.0)),
+            (180, (595.0 - 110.0, 20.0, 100.0, 50.0)),
+            (270, (842.0 - 70.0, 595.0 - 110.0, 50.0, 100.0)),
+        ];
+        for (rotation, (left, top, width, height)) in expected {
+            let (got_left, got_top, got_width, got_height) =
+                widget_box_mm(rotation, page_width, page_height, rect);
+            assert!((got_left - mm(left)).abs() < 1e-9, "left при {rotation}°");
+            assert!((got_top - mm(top)).abs() < 1e-9, "top при {rotation}°");
+            assert!((got_width - mm(width)).abs() < 1e-9, "width при {rotation}°");
+            assert!(
+                (got_height - mm(height)).abs() < 1e-9,
+                "height при {rotation}°"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_coverage_requires_the_whole_file() {
+        assert!(covers_document(&[(0, 100), (140, 60)], 200));
+        assert!(!covers_document(&[(0, 100), (140, 59)], 200));
+        assert!(!covers_document(&[(4, 96), (140, 60)], 200));
+        assert!(!covers_document(&[(0, 100), (100, 100)], 200));
+        assert!(!covers_document(&[(0, 100)], 100));
+    }
+
+    #[test]
+    fn byte_ranges_are_read_from_the_signature_dictionary() {
+        let value = Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(4),
+            Object::Integer(8),
+            Object::Integer(2),
+        ]);
+        let ranges = byte_ranges(&value).expect("ranges");
+        assert_eq!(ranges, vec![(0, 4), (8, 2)]);
+        let bytes = b"0123456789";
+        assert_eq!(signed_ranges(bytes, &ranges).unwrap(), b"012389".to_vec());
+        assert!(byte_ranges(&Object::Array(vec![Object::Integer(0)])).is_none());
+        assert!(signed_ranges(b"short", &[(0, 3), (4, 2)]).is_err());
+    }
+
+    #[test]
+    fn pdf_date_is_formatted_for_the_viewer() {
+        assert_eq!(
+            format_pdf_date(b"D:20261111103512+03'00'"),
+            "11.11.2026 10:35:12"
+        );
+        assert_eq!(format_pdf_date(b"D:20261111"), "11.11.2026");
+        assert_eq!(format_pdf_date(b"garbage"), "garbage");
     }
 }

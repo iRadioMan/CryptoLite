@@ -143,6 +143,53 @@ pub struct PdfSignFinishRequest {
     pub output_path: String,
 }
 
+/// Запрос на проверку встроенных подписей PDF (PAdES-BES, штампы).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfVerifyRequest {
+    pub path: String,
+    /// Проверять отзыв сертификатов по CRL (может использовать сеть).
+    #[serde(default)]
+    pub check_crl: bool,
+}
+
+/// Одна встроенная подпись PDF: поле AcroForm `/FT /Sig` с отметкой на странице.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfSignatureInfo {
+    pub field_name: String,
+    /// Номер страницы с отметкой, считая с нуля; `None` — подпись без видимой области.
+    pub page: Option<usize>,
+    /// Прямоугольник отметки в миллиметрах от левого верхнего угла видимой страницы.
+    pub left_mm: Option<f64>,
+    pub top_mm: Option<f64>,
+    pub width_mm: Option<f64>,
+    pub height_mm: Option<f64>,
+    /// `/SubFilter` подписи: `ETSI.CAdES.detached`, `adbe.pkcs7.detached` и т. п.
+    pub sub_filter: String,
+    /// Время подписи из `/M` в читаемом виде; пустая строка, если его нет.
+    pub signed_at: String,
+    /// Подпись покрывает весь файл, а не только его часть до следующей ревизии.
+    pub covers_document: bool,
+    pub valid: bool,
+    pub message: String,
+    pub signers: Vec<VerifySignerInfo>,
+}
+
+/// Итог проверки подписей PDF: по записи на каждую отметку.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfVerifyResult {
+    pub signatures: Vec<PdfSignatureInfo>,
+    /// Сколько подписей прошло проверку.
+    pub valid_count: usize,
+    /// Всего сертификатов-подписантов во всех CMS документа.
+    pub signer_count: usize,
+    /// PDF в Base64: окно просмотра рисует страницы без повторного чтения файла.
+    pub pdf_base64: String,
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyRequest {
