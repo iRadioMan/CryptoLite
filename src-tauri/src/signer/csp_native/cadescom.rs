@@ -267,6 +267,85 @@ mod ffi {
         Err(tr!("Выбранный сертификат не найден в CAdESCOM CurrentUser store; проверьте установку CryptoPro ЭЦП SDK.", "The selected certificate was not found in the CAdESCOM CurrentUser store; check the CryptoPro EDS SDK installation."))
     }
 
+    /// Объект `CAdESCOM.Certificate` с явно открытым ключом контейнера токена.
+    ///
+    /// Перебираются все найденные варианты: первый может относиться к уже
+    /// отключённому токену, второй — к подключённому.
+    fn token_certificate(certificate_id: &str) -> Result<IDispatch, String> {
+        let mut last_error = None;
+        for details in crate::signer::csp_native::windows::token_details(certificate_id) {
+            let attempt = (|| -> Result<IDispatch, String> {
+                let certificate = create("CAdESCOM.Certificate")?;
+                invoke(
+                    &certificate,
+                    "Import",
+                    vec![VARIANT::from(BSTR::from(base64_encode(&details.der)))],
+                )?;
+                let private_key = create("CAdESCOM.PrivateKey")?;
+                // CAPICOM_CURRENT_USER_STORE=2; bCheckExistence=false: контейнер
+                // открывается только при подписи, когда PIN уже запрошен.
+                invoke(
+                    &private_key,
+                    "Open",
+                    vec![
+                        VARIANT::from(BSTR::from(details.container.as_str())),
+                        VARIANT::from(BSTR::from(details.provider_name.as_str())),
+                        VARIANT::from(details.provider_type as i32),
+                        VARIANT::from(details.key_spec as i32),
+                        VARIANT::from(2i32),
+                        VARIANT::from(false),
+                    ],
+                )?;
+                put(&certificate, "PrivateKey", VARIANT::from(private_key), true)?;
+                Ok(certificate)
+            })();
+            match attempt {
+                Ok(certificate) => return Ok(certificate),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            tr!(
+                "не найдены сведения о контейнере сертификата токена",
+                "no token certificate container details were found"
+            )
+        }))
+    }
+
+    /// Сертификат для подписи CAdES: контейнер токена, затем смарт-карта, затем CurrentUser.
+    ///
+    /// `CADESCOM_CONTAINER_STORE` не используется: он перечисляет все контейнеры,
+    /// включая отсутствующие носители, и провоцирует системные запросы.
+    fn select_signing_certificate(certificate_id: &str) -> Result<IDispatch, String> {
+        if !crate::signer::csp_native::windows::has_token_details(certificate_id) {
+            let store = create("CAdESCOM.Store")?;
+            // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
+            invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
+            return select_certificate(&store, certificate_id);
+        }
+        let token_error = match token_certificate(certificate_id) {
+            Ok(certificate) => return Ok(certificate),
+            Err(error) => error,
+        };
+        let mut last_error = token_error.clone();
+        // CAPICOM_SMART_CARD_USER_STORE=4, затем CAPICOM_CURRENT_USER_STORE=2.
+        for store_type in [4i32, 2i32] {
+            let attempt = (|| -> Result<IDispatch, String> {
+                let store = create("CAdESCOM.Store")?;
+                invoke(&store, "Open", vec![VARIANT::from(store_type)])?;
+                select_certificate(&store, certificate_id)
+            })();
+            match attempt {
+                Ok(certificate) => return Ok(certificate),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(tr!(
+            "Не удалось подготовить сертификат токена для CAdES: {token_error}. Резервный поиск в хранилищах Windows тоже не удался: {last_error}",
+            "Could not prepare the token certificate for CAdES: {token_error}. The fallback search in the Windows stores failed too: {last_error}"
+        ))
+    }
+
     /// Типы подписи CAdES (`CADESCOM_CADES_TYPE`).
     const CADESCOM_CADES_BES: i32 = 0x1;
     /// CAdES-T: CAdES-BES плюс штамп времени RFC 3161 от TSP-сервера.
@@ -380,10 +459,7 @@ mod ffi {
                 "Could not read the source file: {error}"
             )
         })?;
-        let store = create("CAdESCOM.Store")?;
-        // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
-        invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
-        let certificate = select_certificate(&store, &certificate_id)?;
+        let certificate = select_signing_certificate(&certificate_id)?;
         let signer = create("CAdESCOM.CPSigner")?;
         put(&signer, "Certificate", VARIANT::from(certificate), true)?;
         if cades_type == CADESCOM_CADES_T {

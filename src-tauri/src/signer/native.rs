@@ -76,6 +76,21 @@ pub fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, SignerErro
     }
 }
 
+/// Физические токены (Рутокен), обнаруженные CryptoPro CSP.
+///
+/// Ошибка обнаружения не пробрасывается в интерфейс: счётчик в «О программе»
+/// показывает 0, а причина пишется в лог.
+pub fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::list_tokens();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
 pub struct NativeSigner;
 
 impl Signer for NativeSigner {

@@ -2,6 +2,8 @@
 
 pub mod digest;
 
+mod token;
+
 #[allow(unsafe_code)]
 mod ffi {
     use std::ffi::CStr;
@@ -82,6 +84,16 @@ mod ffi {
 
     /// Подпись диапазона PDF и подпись готового хэша (структура из cades.h).
     pub(super) struct ProviderContext(usize);
+
+    impl ProviderContext {
+        pub(super) fn from_handle(handle: usize) -> Self {
+            Self(handle)
+        }
+
+        pub(super) fn handle(&self) -> usize {
+            self.0
+        }
+    }
 
     pub(super) fn acquire_provider(provider_type: u32) -> Result<ProviderContext, u32> {
         let mut handle = 0usize;
@@ -169,6 +181,16 @@ mod ffi {
 
     pub(super) struct CertificateStore(HCERTSTORE);
 
+    impl CertificateStore {
+        pub(super) fn from_handle(store: HCERTSTORE) -> Self {
+            Self(store)
+        }
+
+        pub(super) fn handle(&self) -> HCERTSTORE {
+            self.0
+        }
+    }
+
     impl Drop for CertificateStore {
         fn drop(&mut self) {
             unsafe {
@@ -177,17 +199,39 @@ mod ffi {
         }
     }
 
-    struct CertificateContext(*const CERT_CONTEXT);
+    /// Контекст сертификата; для сертификата с токена дополнительно держит его DER
+    /// и Unicode-строки контейнера, на которые ссылается `CERT_KEY_PROV_INFO`.
+    pub(super) struct CertificateContext {
+        context: *const CERT_CONTEXT,
+        _token_owner: Option<super::token::TokenCertificateDetails>,
+    }
 
     impl Drop for CertificateContext {
         fn drop(&mut self) {
-            unsafe { CertFreeCertificateContext(self.0) };
+            unsafe { CertFreeCertificateContext(self.context) };
         }
     }
 
     impl CertificateContext {
-        fn as_ptr(&self) -> *const CERT_CONTEXT {
-            self.0
+        pub(super) fn new(context: *const CERT_CONTEXT) -> Self {
+            Self {
+                context,
+                _token_owner: None,
+            }
+        }
+
+        pub(super) fn from_token(
+            context: *const CERT_CONTEXT,
+            details: super::token::TokenCertificateDetails,
+        ) -> Self {
+            Self {
+                context,
+                _token_owner: Some(details),
+            }
+        }
+
+        pub(super) fn as_ptr(&self) -> *const CERT_CONTEXT {
+            self.context
         }
     }
 
@@ -202,7 +246,7 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let certificate = find_certificate(&store, certificate_id)?;
+        let certificate = find_certificate_for_signing(&store, certificate_id)?;
         let hash_oid = hash_oid_for_certificate(certificate.as_ptr())?;
         // тот же путь, что у обычной detached-подписи файлов:
         // CryptoAPI сам хэширует `content` и кладёт хэш в messageDigest
@@ -299,7 +343,7 @@ mod ffi {
 
     /// Спецификация ключа для подписи — как в `CryptSignMessage`: сначала `AT_SIGNATURE`,
     /// затем `AT_KEYEXCHANGE`.
-    fn signing_key_spec(provider: usize) -> Result<u32, crate::signer::SignerError> {
+    pub(super) fn signing_key_spec(provider: usize) -> Result<u32, crate::signer::SignerError> {
         if container_has_key(provider, AT_SIGNATURE) {
             return Ok(AT_SIGNATURE);
         }
@@ -313,7 +357,10 @@ mod ffi {
         )))
     }
 
-    unsafe fn read_certificate(context: *const CERT_CONTEXT) -> Option<crate::signer::CertInfo> {
+    pub(super) unsafe fn read_certificate(
+        context: *const CERT_CONTEXT,
+        source: &str,
+    ) -> Option<crate::signer::CertInfo> {
         let context_ref = context.as_ref()?;
         let info = context_ref.pCertInfo.as_ref()?;
         let subject = certificate_name(context, 0);
@@ -353,7 +400,7 @@ mod ffi {
             expires_at,
             expired,
             has_private_key,
-            source: tr!("Windows · Личное хранилище", "Windows · Personal store"),
+            source: source.to_owned(),
             serial_number: hex_upper(&serial_id),
             not_before,
             not_after,
@@ -388,6 +435,7 @@ mod ffi {
     }
 
     pub(super) fn list_personal_certificates(
+        tokens: &[super::token::DetectedToken],
     ) -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
@@ -404,12 +452,54 @@ mod ffi {
             if current.is_null() {
                 break;
             }
-            if let Some(certificate) = unsafe { read_certificate(current) } {
+            // Сертификат мог быть зарегистрирован в Windows с ключом на токене:
+            // тогда источник показывает носитель, а не личное хранилище.
+            let source = unsafe { certificate_container(current) }
+                .and_then(|container| super::token::match_token(&container, tokens))
+                .map(|token| super::token::token_source(&token.model))
+                .unwrap_or_else(|| {
+                    tr!("Windows · Личное хранилище", "Windows · Personal store")
+                });
+            if let Some(certificate) = unsafe { read_certificate(current, &source) } {
                 certificates.push(certificate);
             }
             previous = current;
         }
         Ok(certificates)
+    }
+
+    /// Имя контейнера закрытого ключа сертификата, если свойство задано.
+    unsafe fn certificate_container(context: *const CERT_CONTEXT) -> Option<String> {
+        let mut length = 0u32;
+        let sized = CertGetCertificateContextProperty(
+            context,
+            CERT_KEY_PROV_INFO_PROP_ID,
+            ptr::null_mut(),
+            &mut length,
+        );
+        if sized == 0 || length == 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; length as usize];
+        let read = CertGetCertificateContextProperty(
+            context,
+            CERT_KEY_PROV_INFO_PROP_ID,
+            bytes.as_mut_ptr() as *mut c_void,
+            &mut length,
+        );
+        if read == 0 {
+            return None;
+        }
+        let key_info = bytes.as_ptr() as *const CRYPT_KEY_PROV_INFO;
+        let name = (*key_info).pwszContainerName;
+        if name.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *name.add(len) != 0 {
+            len += 1;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(name, len)))
     }
 
     pub(super) fn sign_cms(
@@ -438,7 +528,7 @@ mod ffi {
         let certificates = request
             .certificate_ids
             .iter()
-            .map(|id| find_certificate(&store, id))
+            .map(|id| find_certificate_for_signing(&store, id))
             .collect::<Result<Vec<_>, _>>()?;
         let hash_oids = certificates
             .iter()
@@ -611,7 +701,7 @@ mod ffi {
                 } // CRYPT_E_NO_SIGNER
                 return Ok((signers, Some((signer_index, code))));
             }
-            let signer_context = CertificateContext(signer);
+            let signer_context = CertificateContext::new(signer);
             if let Some(cert) = unsafe { signer_context.as_ptr().as_ref() }
                 .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             {
@@ -989,14 +1079,39 @@ mod ffi {
                 break;
             }
             if unsafe { certificate_id(current) }.as_deref() == Some(id) {
-                return Ok(CertificateContext(current));
+                return Ok(CertificateContext::new(current));
             }
             previous = current;
         }
-        Err(crate::signer::SignerError::Signing(tr!(
-            "выбранный сертификат больше не найден в Windows Personal",
-            "the selected certificate is no longer present in the Windows Personal store"
-        )))
+        Err(certificate_not_found())
+    }
+
+    /// Сертификат для подписи: сначала контейнеры обнаруженных токенов, затем
+    /// `CurrentUser\MY`, затем повторное сканирование контейнеров (если список
+    /// сертификатов ещё не открывался в этом запуске).
+    fn find_certificate_for_signing(
+        store: &CertificateStore,
+        id: &str,
+    ) -> Result<CertificateContext, crate::signer::SignerError> {
+        for details in super::token::details_for_certificate(id) {
+            if let Ok(context) = details.to_context() {
+                return Ok(context);
+            }
+        }
+        if let Ok(context) = find_certificate(store, id) {
+            return Ok(context);
+        }
+        if let Some(details) = super::token::find_details_by_id(id) {
+            return details.to_context();
+        }
+        Err(certificate_not_found())
+    }
+
+    fn certificate_not_found() -> crate::signer::SignerError {
+        crate::signer::SignerError::Signing(tr!(
+            "выбранный сертификат больше не найден ни в Windows Personal, ни в контейнерах токена",
+            "the selected certificate is no longer present in Windows Personal or in the token containers"
+        ))
     }
 
     unsafe fn certificate_id(context: *const CERT_CONTEXT) -> Option<String> {
@@ -1014,13 +1129,6 @@ mod ffi {
         Some(format!("{issuer}:{serial_id}"))
     }
 
-    fn find_certificate_by_id(
-        store: &CertificateStore,
-        id: &str,
-    ) -> Result<CertificateContext, crate::signer::SignerError> {
-        find_certificate(store, id)
-    }
-
     pub(super) fn pdf_certificate_public_key_oid(
         id: &str,
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
@@ -1031,7 +1139,7 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let certificate = find_certificate_by_id(&store, id)?;
+        let certificate = find_certificate_for_signing(&store, id)?;
         let info = unsafe { certificate.as_ptr().as_ref() }
             .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             .ok_or_else(|| {
@@ -1345,7 +1453,7 @@ mod ffi {
         let recipients = request
             .certificate_ids
             .iter()
-            .map(|id| find_certificate(&store, id))
+            .map(|id| find_certificate_for_signing(&store, id))
             .collect::<Result<Vec<_>, _>>()?;
         let content_encryption_oid = content_encryption_oid_for_certificates(&recipients)?;
         let mut output = encrypt_message(&recipients, &content_encryption_oid, &input)?;
@@ -1381,7 +1489,11 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let output = decrypt_message(&store, &input)?;
+        // Получатель мог быть выбран сертификатом токена: без хранилищ токенов
+        // расшифрование своим ключом было бы недоступно.
+        let mut stores = vec![store];
+        stores.extend(super::token::open_all_token_stores());
+        let output = decrypt_message(&stores, &input)?;
         let final_path = write_result(&request.output_path, &output, ResultFileKind::Decryption)?;
         Ok(crate::signer::DecryptResult {
             output_path: final_path,
@@ -1497,15 +1609,15 @@ mod ffi {
     }
 
     fn decrypt_message(
-        store: &CertificateStore,
+        stores: &[CertificateStore],
         encrypted: &[u8],
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
         let mut parameters = CRYPT_DECRYPT_MESSAGE_PARA::default();
         parameters.cbSize = std::mem::size_of::<CRYPT_DECRYPT_MESSAGE_PARA>() as u32;
         parameters.dwMsgAndCertEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
-        let mut store_handle = store.0;
-        parameters.cCertStore = 1;
-        parameters.rghCertStore = &mut store_handle;
+        let mut handles = stores.iter().map(CertificateStore::handle).collect::<Vec<_>>();
+        parameters.cCertStore = u32::try_from(handles.len()).unwrap_or(u32::MAX);
+        parameters.rghCertStore = handles.as_mut_ptr();
         let encrypted_length = u32::try_from(encrypted.len()).map_err(|_| {
             crate::signer::SignerError::Decryption(tr!(
                 "зашифрованный файл слишком велик для CryptoAPI",
@@ -1720,7 +1832,82 @@ pub fn probe() -> crate::signer::CspStatus {
 }
 
 pub fn list_certificates() -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
-    ffi::list_personal_certificates()
+    let tokens = match token::detect_tokens() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            tracing::warn!(%error, "Rutoken detection failed");
+            Vec::new()
+        }
+    };
+    let mut certificates = ffi::list_personal_certificates(&tokens)?;
+    let collected = token::collect_token_certificates(&tokens);
+    let details = merge_token_certificates(&mut certificates, collected);
+    token::replace_token_details(details);
+    Ok(certificates)
+}
+
+/// Физические токены для счётчика в «О программе».
+///
+/// Ошибка обнаружения не ломает интерфейс: счётчик показывает 0, причина идёт в лог.
+pub fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    match token::detect_tokens() {
+        Ok(tokens) => tokens
+            .into_iter()
+            .map(|token| crate::signer::TokenInfo {
+                reader: token.reader,
+                model: token.model,
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "Rutoken detection failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Добавляет сертификаты контейнеров токенов в список личного хранилища.
+///
+/// Совпадение по `id` не создаёт вторую строку: у существующего сертификата
+/// обновляется источник и объединяется признак закрытого ключа. Возвращает
+/// реестр деталей контейнеров для подписи.
+fn merge_token_certificates(
+    certificates: &mut Vec<crate::signer::CertInfo>,
+    collected: Vec<(crate::signer::CertInfo, Option<token::TokenCertificateDetails>)>,
+) -> std::collections::HashMap<String, Vec<token::TokenCertificateDetails>> {
+    let mut details: std::collections::HashMap<String, Vec<token::TokenCertificateDetails>> =
+        std::collections::HashMap::new();
+    for (info, container) in collected {
+        let id = info.id.clone();
+        match certificates
+            .iter_mut()
+            .find(|certificate| certificate.id == info.id)
+        {
+            Some(existing) => {
+                existing.source = info.source;
+                existing.has_private_key |= info.has_private_key;
+            }
+            None => certificates.push(info),
+        }
+        if let Some(container) = container {
+            details.entry(id).or_default().push(container);
+        }
+    }
+    details
+}
+
+/// Детали контейнеров сертификата для CAdES: из реестра, а при его отсутствии —
+/// повторным перечислением контейнеров токенов.
+pub(super) fn token_details(id: &str) -> Vec<token::TokenCertificateDetails> {
+    let details = token::details_for_certificate(id);
+    if details.is_empty() {
+        token::find_details_by_id(id).into_iter().collect()
+    } else {
+        details
+    }
+}
+
+pub(super) fn has_token_details(id: &str) -> bool {
+    !token_details(id).is_empty()
 }
 
 /// Подпись подписываемого диапазона PDF.
@@ -1817,4 +2004,64 @@ fn filetime_to_date(high: u32, low: u32) -> String {
         year += 1;
     }
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn certificate(id: &str, source: &str, has_private_key: bool) -> crate::signer::CertInfo {
+        crate::signer::CertInfo {
+            id: id.to_owned(),
+            subject: format!("CN={id}"),
+            issuer: "CN=CA".to_owned(),
+            expires_at: "2030-01-01".to_owned(),
+            expired: false,
+            has_private_key,
+            source: source.to_owned(),
+            serial_number: "01".to_owned(),
+            not_before: "2020-01-01".to_owned(),
+            not_after: "2030-01-01".to_owned(),
+            owner_name: id.to_owned(),
+        }
+    }
+
+    fn details(container: &str) -> token::TokenCertificateDetails {
+        token::TokenCertificateDetails {
+            der: vec![0x30, 0x00],
+            container: container.to_owned(),
+            provider_name: "Crypto-Pro GOST R 34.10-2012 Cryptographic Service Provider".to_owned(),
+            provider_type: 80,
+            key_spec: 1,
+        }
+    }
+
+    #[test]
+    fn token_certificate_replaces_source_without_adding_a_duplicate() {
+        let mut certificates = vec![certificate("CN=CA:01", "Windows · Личное хранилище", false)];
+        let collected = vec![(
+            certificate("CN=CA:01", "Windows · Личное хранилище (Рутокен Lite)", true),
+            Some(details("\\\\.\\Aktiv Rutoken lite 0\\a")),
+        )];
+        let registry = merge_token_certificates(&mut certificates, collected);
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].source, "Windows · Личное хранилище (Рутокен Lite)");
+        assert!(certificates[0].has_private_key);
+        assert_eq!(registry["CN=CA:01"].len(), 1);
+    }
+
+    #[test]
+    fn token_certificate_is_appended_when_the_store_does_not_have_it() {
+        let mut certificates = vec![certificate("CN=CA:02", "Windows · Личное хранилище", true)];
+        let collected = vec![(
+            certificate("CN=CA:03", "Windows · Личное хранилище (Рутокен ECP)", true),
+            Some(details("\\\\.\\Aktiv Rutoken ECP 0\\b")),
+        )];
+        let registry = merge_token_certificates(&mut certificates, collected);
+        assert_eq!(certificates.len(), 2);
+        assert_eq!(certificates[1].id, "CN=CA:03");
+        assert_eq!(certificates[0].source, "Windows · Личное хранилище");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry["CN=CA:03"][0].container, "\\\\.\\Aktiv Rutoken ECP 0\\b");
+    }
 }

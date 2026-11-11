@@ -13,8 +13,8 @@ pub use model::{
     AppSettings, CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
     PdfSignFinishRequest, PdfSignPrepareRequest, PdfSignPrepareResult, PdfSignRequest,
     PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyRequest, PdfVerifyResult,
-    PageRotation, SignBatchItemResult, SignRequest, SignResult, VerifyRequest, VerifyResult,
-    VerifySignerInfo,
+    PageRotation, SignBatchItemResult, SignRequest, SignResult, TokenInfo, VerifyRequest,
+    VerifyResult, VerifySignerInfo,
 };
 
 pub trait Signer: Send + Sync {

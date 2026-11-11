@@ -282,6 +282,13 @@ pub async fn list_certs() -> Result<Vec<CertInfo>, String> {
 }
 
 #[tauri::command]
+pub async fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    tokio::task::spawn_blocking(crate::signer::native::list_tokens)
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 pub async fn sign_file(request: SignRequest) -> Result<SignResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::NativeSigner.sign_file(request))
         .await

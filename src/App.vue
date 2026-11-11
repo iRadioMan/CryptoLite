@@ -16,6 +16,7 @@ import { tempDir } from '@tauri-apps/api/path';
 type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; licenseAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
 type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureType: string; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
 type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
+type TokenInfo = { reader: string; model: string };
 type Doc = { path: string; name: string; selected: boolean };
 type SignBatchItemResult = { inputPath: string; outputPath: string; success: boolean; error: string | null };
 type VerifySigner = { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string; revocationStatus: 'notChecked' | 'good' | 'revoked' | 'unknown'; revocationMessage: string };
@@ -40,6 +41,9 @@ const signatureType = ref('detached');
 const fileType = ref('sig');
 const certificateNames = ref<string[]>([]);
 const certificates = ref<CertInfo[]>([]);
+/** Физические токены (Рутокен), обнаруженные CryptoPro CSP. */
+const tokens = ref<TokenInfo[]>([]);
+const tokenCount = computed(() => tokens.value.length);
 const selectedCertIds = ref<string[]>([]);
 const certFilter = ref('');
 const certPickerOpen = ref(false);
@@ -197,6 +201,7 @@ onMounted(async () => {
   await setBackendLanguage(locale.value);
   await initializeSettings();
   await refreshCspStatus();
+  await refreshTokens();
   if (!status.value.available) showAlert.value = true;
 });
 onUnmounted(() => { unlistenDrop?.(); unlistenSystemTheme?.(); });
@@ -235,6 +240,10 @@ watch(cryptoMode, () => {
   // Файлы одной операции непригодны для другой: при смене режима список очищается.
   cryptoFiles.value = [];
 });
+watch(page, (current) => {
+  // Количество токенов обновляется при каждом открытии «О программе».
+  if (current === 'about') void refreshTokens();
+});
 
 function sameStringList(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -245,6 +254,15 @@ async function setBackendLanguage(language: string) {
     await invoke('set_language', { language });
   } catch (error) {
     console.warn('Could not set backend language', error);
+  }
+}
+
+async function refreshTokens() {
+  try {
+    tokens.value = await invoke<TokenInfo[]>('list_tokens');
+  } catch (error) {
+    console.warn('Could not detect tokens', error);
+    tokens.value = [];
   }
 }
 
@@ -897,7 +915,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
         <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.5.9</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
-          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div></dl></section>
+          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div><div><dt>{{ t('about.tokens') }}</dt><dd>{{ tokenCount }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
         </div>
         <section class="card about-license"><div class="card-heading"><h2>{{ t('about.licenseTitle') }}</h2></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
@@ -912,7 +930,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="alert-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="alert-title">{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button class="sign-button" @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
 
-    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else ref="certificateListRef" class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey) }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey)" @change="scrollCertificateListToTop"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }}</small><small class="certificate-key">{{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? t('certPicker.invalid') : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.confirm') }}</button></div></footer></section></div>
+    <div v-if="certPickerOpen" class="modal-backdrop" @click.self="certPickerOpen=false"><section class="certificate-modal" role="dialog" aria-modal="true" aria-labelledby="cert-picker-title"><header class="certificate-header"><div><h2 id="cert-picker-title">{{ certPickerMode==='encryption'?t('certPicker.recipients'):t('certPicker.signing') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="certPickerOpen=false"><AppIcon name="x" :size="20" /></button></header><label class="certificate-search"><AppIcon name="search" :size="16" /><input v-model="certFilter" :placeholder="t('certPicker.filterPlaceholder')" :aria-label="t('certPicker.filterPlaceholder')"/></label><div v-if="certsLoading" class="certificate-empty">{{ t('certPicker.loading') }}</div><div v-else-if="certsError" class="certificate-empty error">{{ certsError }}</div><div v-else-if="!filteredCertificates.length" class="certificate-empty"><div class="empty-certificate-icon"><AppIcon name="file" :size="20" /></div><b>{{ certificates.length ? t('certPicker.notFound') : t('certPicker.storeEmpty') }}</b><p>{{ certificates.length ? t('certPicker.changeFilter') : t('certPicker.storeEmptyHint') }}</p></div><div v-else ref="certificateListRef" class="certificate-list"><label v-for="certificate in filteredCertificates" :key="certificate.id" class="certificate-row" :class="{ expired: certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey) }"><input v-model="pickerDraftCertIds" type="checkbox" :value="certificate.id" :disabled="certificate.expired || (certPickerMode !== 'encryption' && !certificate.hasPrivateKey)" @change="scrollCertificateListToTop"/><div class="certificate-info"><b>{{ certificate.subject }}</b><span>{{ t('certPicker.issuer') }}{{ certificate.issuer }}</span><small>{{ certificate.expired ? t('certPicker.expired') : t('certPicker.validUntil') }} {{ certificate.expiresAt }}</small><small class="certificate-key">{{ certificate.hasPrivateKey ? t('certPicker.keyLinked') : t('certPicker.keyNotLinked') }}</small></div><span class="certificate-source">{{ certificate.expired ? `${certificate.source} · ${t('certPicker.invalid')}` : certificate.source }}</span></label></div><footer class="certificate-footer"><span>{{ t('certPicker.selected') }}{{ pickerDraftCertIds.length }}</span><div><button class="outline-button" @click="pickerDraftCertIds=[]">{{ t('certPicker.reset') }}</button><button class="outline-button" @click="certPickerOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" @click="confirmCertificates">{{ t('certPicker.confirm') }}</button></div></footer></section></div>
 
     <div v-if="signReportOpen" class="modal-backdrop" @click.self="signReportOpen=false"><section class="sign-report-modal" role="dialog" aria-modal="true" aria-labelledby="sign-report-title"><header class="certificate-header"><div><h2 id="sign-report-title">{{ t('signReport.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="signReportOpen=false"><AppIcon name="x" :size="20" /></button></header><div class="sign-report-summary"><div class="sign-report-count success"><b>{{ signSuccessCount }}</b><span>{{ t('signReport.success') }}</span></div><div class="sign-report-count error"><b>{{ signErrorCount }}</b><span>{{ t('signReport.error') }}</span></div></div><div class="sign-report-list"><article v-for="item in signReportItems" :key="item.inputPath" class="sign-report-row" :class="item.success?'success':'error'"><span class="report-status"><AppIcon :name="item.success?'check':'alert'" :size="14" /></span><div class="sign-report-details"><b>{{ item.inputPath.split(/[\\/]/).pop() }}</b><small>{{ item.success ? item.outputPath : item.error }}</small></div></article></div><footer class="certificate-footer"><span>{{ signReportItems.length }} {{ t('signReport.documentsCount') }}</span><button class="sign-button" @click="signReportOpen=false">{{ t('signReport.done') }}</button></footer></section></div>
 

@@ -13,6 +13,16 @@ pub struct CspStatus {
     pub message: String,
 }
 
+/// Физический токен (Рутокен), обнаруженный через CryptoPro CSP.
+///
+/// `model` — короткое имя модели без префикса производителя: `Lite`, `ECP`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenInfo {
+    pub reader: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CertInfo {

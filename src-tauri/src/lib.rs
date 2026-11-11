@@ -17,6 +17,7 @@ pub fn run() {
             commands::load_settings,
             commands::save_settings,
             commands::list_certs,
+            commands::list_tokens,
             commands::sign_file,
             commands::sign_files,
             commands::sign_pdf,
