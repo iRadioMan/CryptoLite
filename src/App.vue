@@ -913,7 +913,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.5.9</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.6.10</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div><div><dt>{{ t('about.tokens') }}</dt><dd>{{ tokenCount }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
