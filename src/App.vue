@@ -729,7 +729,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 </script>
 
 <template>
-  <div class="app-shell" :class="{ 'drag-hover': dragHover && dropEnabled }">
+  <div class="app-shell" :class="{ 'drag-hover': dragHover && dropEnabled }" :inert="signingInProgress">
     <div v-if="dragHover && dropEnabled" class="drop-overlay">
       <span><AppIcon name="upload" :size="24" /></span>
       <b>{{ page==='verify'?t('dropOverlay.verify'):page==='encrypt'?t('dropOverlay.encrypt'):t('dropOverlay.sign') }}</b>
@@ -781,9 +781,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
           <div v-if="stampMode" class="stamp-note"><b>{{ t('signPage.stampNoteTitle') }}</b><span>{{ t('signPage.stampNote') }}</span><label class="field stamp-position"><span>{{ t('signPage.stampPosition') }}</span><input v-model="stampPosition" :placeholder="t('signPage.stampPositionPlaceholder')" maxlength="60"/></label></div>
           <div class="field-row">
             <div class="field wide-field"><span>{{ t('certificates') }}</span>
-              <button class="picker-button" @click="openCertificatePicker('signing')">
+              <button class="picker-button" :disabled="certsLoading" :aria-busy="certsLoading" @click="openCertificatePicker('signing')">
                 <span class="picker-leading"><AppIcon name="file" :size="20" /></span>
-                <span class="picker-copy"><b>{{ certificateNames.length ? certificateNames.join(', ') : t('signPage.selectCerts') }}</b><small>{{ t('signPage.windowsPersonalStore') }}</small></span>
+                <span class="picker-copy"><b>{{ certsLoading ? t('signPage.certificatesLoading') : certificateNames.length ? certificateNames.join(', ') : t('signPage.selectCerts') }}</b><small>{{ t('signPage.windowsPersonalStore') }}</small></span>
                 <span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span>
               </button>
             </div>
@@ -921,6 +921,15 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card about-license"><div class="card-heading"><h2>{{ t('about.licenseTitle') }}</h2></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
       </section>
     </main>
+
+    <Teleport to="body">
+      <div v-if="signingInProgress" class="busy-overlay" role="alertdialog" aria-modal="true" aria-busy="true" :aria-label="t('signPage.signingInProgress')">
+        <div class="busy-card">
+          <span class="busy-spinner" aria-hidden="true"></span>
+          <p>{{ t('signPage.signingInProgress') }}</p>
+        </div>
+      </div>
+    </Teleport>
 
     <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampOpen=false"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" v-model:rotations="stampPageRotations" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
 

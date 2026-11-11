@@ -103,6 +103,8 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 /* pickers */
 .picker-button{width:100%;min-height:var(--h-picker);display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-1) var(--sp-3);border:1px solid var(--border-input);border-radius:var(--r-sm);background:var(--surface);text-align:left;transition:border-color .12s,background-color .12s}
 .picker-button:hover{border-color:var(--text-3);background:var(--surface-hover)}
+.picker-button:disabled{cursor:progress;border-color:var(--border-input);background:var(--surface)}
+.picker-button:disabled .picker-copy b{color:var(--text-3);font-weight:400}
 .picker-leading,.picker-trailing{display:grid;place-items:center;color:var(--text-3)}
 .picker-leading{color:var(--accent-text)}
 .picker-copy{min-width:0;flex:1}
@@ -160,6 +162,12 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 
 /* modals */
 .modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:var(--sp-5);background:var(--scrim)}
+/* Полная блокировка интерфейса на время подписи: выше любой модалки. */
+.busy-overlay{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:var(--sp-5);background:var(--scrim);cursor:progress}
+.busy-card{min-width:220px;display:flex;flex-direction:column;align-items:center;gap:var(--sp-3);padding:var(--sp-5);border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-modal)}
+.busy-card p{margin:0;color:var(--text-1);font-size:var(--fs-14);line-height:var(--lh-14);font-weight:600}
+.busy-spinner{width:28px;height:28px;border:2px solid var(--accent-soft);border-top-color:var(--accent);border-radius:var(--r-full);animation:busy-spin .8s linear infinite}
+@keyframes busy-spin{to{transform:rotate(360deg)}}
 .modal-close{width:var(--h-md);height:var(--h-md);display:grid;place-items:center;border-radius:var(--r-sm);color:var(--text-3)}
 .modal-close:hover{background:var(--surface-hover);color:var(--text-1)}
 .alert-modal{width:min(400px,calc(100vw - 48px));padding:var(--sp-5);border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);box-shadow:var(--shadow-modal);text-align:center}
@@ -209,7 +217,7 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .sign-report-summary{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-3);margin:0 0 var(--sp-4)}
 .sign-report-count{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-4);border-radius:var(--r-sm);background:var(--surface-hover)}
 .sign-report-count b{font-size:var(--fs-24);line-height:var(--lh-24);font-weight:600}
-.sign-report-count span{font-size:var(--fs-12);line-height:var(--lh-12);color:var(--text-3)}
+.sign-report-count span{font-size:var(--fs-14);line-height:var(--lh-12);color:var(--text-3)}
 .sign-report-count.success b{color:var(--success)}
 .sign-report-count.error b{color:var(--danger)}
 .sign-report-list{display:grid;gap:var(--sp-2);flex:1;min-height:0;overflow:auto}
