@@ -134,7 +134,7 @@ impl Signer for NativeSigner {
     fn sign_file(&self, request: SignRequest) -> Result<SignResult, SignerError> {
         #[cfg(target_os = "windows")]
         {
-            if request.standard == "cades-bes" {
+            if matches!(request.standard.as_str(), "cades-bes" | "cades-t") {
                 return super::csp_native::cadescom::sign_file(request);
             }
             super::csp_native::windows::sign_file(request)

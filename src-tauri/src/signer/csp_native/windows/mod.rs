@@ -145,7 +145,7 @@ mod ffi {
 
     use crate::tr;
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::{GetLastError, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE};
     use windows_sys::Win32::Security::Cryptography::{
         CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChain,
         CertFreeCertificateContext, CertGetCertificateChain, CertGetCertificateContextProperty,
@@ -154,10 +154,13 @@ mod ffi {
         CryptEncryptMessage, CryptGetHashParam, CryptGetUserKey, CryptHashData, CryptMsgClose,
         CryptMsgGetParam, CryptMsgOpenToEncode, CryptMsgUpdate,
         CryptVerifyDetachedMessageSignature, CryptVerifyMessageSignature, AT_KEYEXCHANGE,
-        AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
-        CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT,
-        CERT_INFO, CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG,
-        CERT_NAME_SIMPLE_DISPLAY_TYPE, CMSG_CONTENT_PARAM, CMSG_DETACHED_FLAG, CMSG_SIGNED,
+        AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_ELEMENT,
+        CERT_CHAIN_PARA, CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS,
+        CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT, CERT_CHAIN_REVOCATION_CHECK_CHAIN,
+        CERT_CONTEXT, CERT_INFO, CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_REVOCATION_INFO, CERT_SIMPLE_CHAIN,
+        CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_REVOKED,
+        CERT_TRUST_REVOCATION_STATUS_UNKNOWN, CMSG_CONTENT_PARAM, CMSG_DETACHED_FLAG, CMSG_SIGNED,
         CMSG_SIGNED_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO_0,
         CRYPT_ALGORITHM_IDENTIFIER, CRYPT_DECRYPT_MESSAGE_PARA, CRYPT_ENCRYPT_MESSAGE_PARA,
         CRYPT_INTEGER_BLOB, CRYPT_KEY_PROV_INFO, CRYPT_VERIFY_MESSAGE_PARA, HCERTSTORE,
@@ -514,6 +517,7 @@ mod ffi {
             .transpose()?;
         let mut signers = Vec::new();
         let mut signer_index = 0u32;
+        let check_crl = request.check_crl;
         loop {
             let mut signer = ptr::null_mut();
             let valid = if request.detached {
@@ -558,8 +562,7 @@ mod ffi {
             if let Some(cert) = unsafe { signer_context.as_ptr().as_ref() }
                 .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             {
-                let (chain_trusted, chain_message) =
-                    certificate_chain_status(signer_context.as_ptr());
+                let chain = certificate_chain_status(signer_context.as_ptr(), check_crl);
                 signers.push(crate::signer::VerifySignerInfo {
                     subject: unsafe { certificate_name(signer_context.as_ptr(), 0) },
                     issuer: unsafe {
@@ -569,8 +572,10 @@ mod ffi {
                         cert.NotAfter.dwHighDateTime,
                         cert.NotAfter.dwLowDateTime,
                     ),
-                    chain_trusted,
-                    chain_message,
+                    chain_trusted: chain.trusted,
+                    chain_message: chain.message,
+                    revocation_status: chain.revocation_status.to_owned(),
+                    revocation_message: chain.revocation_message,
                 });
             }
             signer_index += 1;
@@ -587,21 +592,208 @@ mod ffi {
                 });
             }
         }
+        let revoked = signers
+            .iter()
+            .any(|signer| signer.revocation_status == "revoked");
+        let message = if revoked {
+            tr!(
+                "Криптографическая подпись верна, но в цепочке есть сертификат, отозванный по CRL.",
+                "The cryptographic signature is valid, but a certificate in the chain is revoked according to the CRL."
+            )
+        } else if check_crl {
+            tr!(
+                "Криптографические подписи всех подписантов верны; проверка отзыва по CRL выполнена.",
+                "The cryptographic signatures of all signers are valid; revocation was checked against the CRL."
+            )
+        } else {
+            tr!(
+                "Криптографические подписи всех подписантов верны.",
+                "The cryptographic signatures of all signers are valid."
+            )
+        };
         Ok(crate::signer::VerifyResult {
-            valid: !signers.is_empty(),
+            valid: !signers.is_empty() && !revoked,
             signature_path,
             content_path,
             signers,
-            message: tr!(
-                "Криптографические подписи всех подписантов верны.",
-                "The cryptographic signatures of all signers are valid."
-            ),
+            message,
         })
     }
 
-    fn certificate_chain_status(certificate: *const CERT_CONTEXT) -> (bool, String) {
+    /// Итог проверки цепочки: доверие Windows и отдельный статус отзыва по CRL.
+    struct ChainStatus {
+        trusted: bool,
+        message: String,
+        revocation_status: &'static str,
+        revocation_message: String,
+    }
+
+    /// Статус отзыва по CRL: элемент 0 — сертификат подписанта, отзыв любого элемента
+    /// цепочки делает подпись недействительной.
+    fn revocation_status(chain: *const CERT_CHAIN_CONTEXT) -> (&'static str, String) {
+        let context = unsafe { &*chain };
+        if context.cChain == 0 || context.rgpChain.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул цепочку для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return a chain for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let simple = unsafe { *context.rgpChain };
+        if simple.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул цепочку для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return a chain for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let simple: &CERT_SIMPLE_CHAIN = unsafe { &*simple };
+        if simple.cElement == 0 || simple.rgpElement.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул элементы цепочки для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return chain elements for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let mut revoked = false;
+        let mut leaf_revoked = false;
+        let mut has_leaf_info = false;
+        let mut leaf_result = None;
+        let mut leaf_unknown = false;
+        let mut leaf_revocation_date = None;
+        for index in 0..simple.cElement as usize {
+            let element = unsafe { *simple.rgpElement.add(index) };
+            if element.is_null() {
+                continue;
+            }
+            let element: &CERT_CHAIN_ELEMENT = unsafe { &*element };
+            let element_revoked =
+                element.TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED != 0;
+            revoked |= element_revoked;
+            if index != 0 {
+                continue;
+            }
+            leaf_revoked = element_revoked;
+            let info = unsafe { element.pRevocationInfo.as_ref() };
+            has_leaf_info = info.is_some();
+            if let Some(info) = info {
+                let info: &CERT_REVOCATION_INFO = info;
+                leaf_result = Some(info.dwRevocationResult);
+                leaf_unknown = element.TrustStatus.dwErrorStatus
+                    & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION)
+                    != 0;
+                if let Some(entry) = unsafe { info.pCrlInfo.as_ref() }.and_then(|crl| unsafe {
+                    crl.pCrlEntry.as_ref()
+                }) {
+                    leaf_revocation_date = Some(super::filetime_to_date(
+                        entry.RevocationDate.dwHighDateTime,
+                        entry.RevocationDate.dwLowDateTime,
+                    ));
+                }
+            }
+        }
+        let code = leaf_result.unwrap_or(0);
+        if revoked {
+            if leaf_revoked {
+                return match leaf_revocation_date {
+                    Some(date) => (
+                        "revoked",
+                        tr!(
+                            "Сертификат подписанта отозван по CRL (дата отзыва {date}).",
+                            "The signer certificate is revoked by the CRL (revocation date {date})."
+                        ),
+                    ),
+                    None => (
+                        "revoked",
+                        tr!(
+                            "Сертификат подписанта отозван по CRL.",
+                            "The signer certificate is revoked by the CRL."
+                        ),
+                    ),
+                };
+            }
+            return (
+                "revoked",
+                tr!(
+                    "В цепочке сертификатов есть отозванный по CRL сертификат.",
+                    "A certificate in the chain is revoked by the CRL."
+                ),
+            );
+        }
+        if !has_leaf_info {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не выполнил проверку CRL для сертификата; статус отзыва неизвестен.",
+                    "Windows did not perform a CRL check for the certificate; the revocation status is unknown."
+                ),
+            );
+        }
+        if leaf_unknown || leaf_result != Some(0) {
+            if leaf_result == Some(CRYPT_E_REVOCATION_OFFLINE as u32) {
+                return (
+                    "unknown",
+                    tr!(
+                        "CRL недоступна или устарела; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "The CRL is unavailable or stale; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            if leaf_result == Some(CRYPT_E_NO_REVOCATION_CHECK as u32) {
+                return (
+                    "unknown",
+                    tr!(
+                        "У сертификата нет доступной точки распространения CRL; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "The certificate has no reachable CRL distribution point; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            if leaf_result != Some(0) {
+                return (
+                    "unknown",
+                    tr!(
+                        "Не удалось проверить CRL; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "Could not check the CRL; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            return (
+                "unknown",
+                tr!(
+                    "Windows не подтвердил проверку CRL; статус отзыва неизвестен.",
+                    "Windows did not confirm the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        (
+            "good",
+            tr!(
+                "По CRL сертификат не отозван.",
+                "The certificate is not revoked according to the CRL."
+            ),
+        )
+    }
+
+    fn certificate_chain_status(
+        certificate: *const CERT_CONTEXT,
+        check_revocation: bool,
+    ) -> ChainStatus {
         let mut chain_parameters = CERT_CHAIN_PARA::default();
         chain_parameters.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+        chain_parameters.dwUrlRetrievalTimeout = if check_revocation { 20_000 } else { 0 };
+        // Без флагов отзыва цепочка строится только по локальному кэшу; с ними Windows
+        // скачивает CRL по адресам из сертификата, поэтому вызову нужна сеть.
+        let flags = if check_revocation {
+            CERT_CHAIN_REVOCATION_CHECK_CHAIN | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT
+        } else {
+            CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
+        };
         let mut chain: *mut CERT_CHAIN_CONTEXT = ptr::null_mut();
         let built = unsafe {
             CertGetCertificateChain(
@@ -610,20 +802,32 @@ mod ffi {
                 ptr::null(),
                 ptr::null_mut(),
                 &chain_parameters,
-                CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL,
+                flags,
                 ptr::null(),
                 &mut chain,
             )
         };
         if built == 0 || chain.is_null() {
             let code = unsafe { GetLastError() };
-            return (
-                false,
-                tr!(
+            return ChainStatus {
+                trusted: false,
+                message: tr!(
                     "Windows не смог построить цепочку сертификата (0x{code:08X}).",
                     "Windows could not build the certificate chain (0x{code:08X})."
                 ),
-            );
+                revocation_status: if check_revocation { "unknown" } else { "notChecked" },
+                revocation_message: if check_revocation {
+                    tr!(
+                        "Не удалось проверить CRL: цепочка не построена (код Windows 0x{code:08X}).",
+                        "Could not check the CRL: the chain was not built (Windows code 0x{code:08X})."
+                    )
+                } else {
+                    tr!(
+                        "Проверка отзыва по CRL не выполнялась.",
+                        "Revocation was not checked against a CRL."
+                    )
+                },
+            };
         }
         let mut policy_parameters = CERT_CHAIN_POLICY_PARA::default();
         policy_parameters.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32;
@@ -637,17 +841,49 @@ mod ffi {
                 &mut policy_status,
             )
         };
-        unsafe { CertFreeCertificateChain(chain) };
-        if checked != 0 && policy_status.dwError == 0 {
-            (
-                true,
-                tr!(
-                    "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.",
-                    "The trust chain was confirmed by Windows; revocation was not checked."
-                ),
-            )
+        // Статус отзыва читается только из живой цепочки; ниже она освобождается.
+        let revocation = if check_revocation {
+            Some(revocation_status(chain))
         } else {
-            (false, tr!("Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.", "Windows did not confirm the trust chain (code 0x{:08X}); revocation was not checked.", policy_status.dwError))
+            None
+        };
+        unsafe { CertFreeCertificateChain(chain) };
+        let trusted = checked != 0 && policy_status.dwError == 0;
+        let message = match (check_revocation, trusted) {
+            (false, true) => tr!(
+                "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.",
+                "The trust chain was confirmed by Windows; revocation was not checked."
+            ),
+            (false, false) => tr!(
+                "Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.",
+                "Windows did not confirm the trust chain (code 0x{:08X}); revocation was not checked.",
+                policy_status.dwError
+            ),
+            (true, true) => tr!(
+                "Цепочка доверия подтверждена Windows; статус отзыва проверен по CRL.",
+                "The trust chain was confirmed by Windows; revocation status was checked against the CRL."
+            ),
+            (true, false) => tr!(
+                "Windows не подтвердил цепочку доверия (код 0x{:08X}); статус отзыва проверен по CRL.",
+                "Windows did not confirm the trust chain (code 0x{:08X}); revocation status was checked against the CRL.",
+                policy_status.dwError
+            ),
+        };
+        let (revocation_status, revocation_message) = match revocation {
+            Some((status, message)) => (status, message),
+            None => (
+                "notChecked",
+                tr!(
+                    "Проверка отзыва по CRL не выполнялась.",
+                    "Revocation was not checked against a CRL."
+                ),
+            ),
+        };
+        ChainStatus {
+            trusted,
+            message,
+            revocation_status,
+            revocation_message,
         }
     }
 

@@ -17,7 +17,7 @@ type AppSettings = { language: string; theme: string; animations: boolean; defau
 type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
 type Doc = { path: string; name: string; selected: boolean };
 type SignBatchItemResult = { inputPath: string; outputPath: string; success: boolean; error: string | null };
-type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string }[]; message: string };
+type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string | null; signers: { subject: string; issuer: string; expiresAt: string; chainTrusted: boolean; chainMessage: string; revocationStatus: 'notChecked' | 'good' | 'revoked' | 'unknown'; revocationMessage: string }[]; message: string };
 type CryptoResult = { outputPath: string; bytesWritten: number };
 const { t, locale } = useI18n();
 const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' : 'en';
@@ -51,6 +51,7 @@ const signReportItems = ref<SignBatchItemResult[]>([]);
 const verifySignaturePath = ref('');
 const verifyContentPath = ref('');
 const verifyDetached = ref(true);
+const verifyCheckCrl = ref(true);
 const verifyBase64 = ref(false);
 const verifyProgress = ref(false);
 const verifyResult = ref<VerifyResult | null>(null);
@@ -124,7 +125,11 @@ const canSign = computed(() => {
     const pdfDocuments = documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name));
     return status.value.signingAvailable && pdfDocuments.length === 1;
   }
-  if (standard.value === 'cades-bes') return status.value.cadesAvailable && selectedCertificates.value.length === 1;
+  if (standard.value === 'cades-bes' || standard.value === 'cades-t') {
+    return status.value.cadesAvailable
+      && selectedCertificates.value.length === 1
+      && (standard.value !== 'cades-t' || appSettings.value.tspServer.trim().length > 0);
+  }
   if (standard.value === 'cms') return status.value.signingAvailable;
   return false;
 });
@@ -352,6 +357,7 @@ async function runVerify() {
       contentPath: verifyContentPath.value || null,
       detached: verifyDetached.value,
       base64: verifyBase64.value,
+      checkCrl: verifyCheckCrl.value,
     } });
   } catch (error) {
     verifyResult.value = { valid: false, signaturePath: verifySignaturePath.value, contentPath: verifyContentPath.value || null, signers: [], message: String(error) };
@@ -556,6 +562,7 @@ async function signSelectedDocument() {
         certificateIds: [...signingIds],
         detached: signatureType.value === 'detached',
         base64: encoding.value === 'base64',
+        tspServer: appSettings.value.tspServer,
       })),
     });
     signReportOpen.value = true;
@@ -690,7 +697,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card">
           <div class="card-heading"><h2>{{ t('signPage.paramsTitle') }}</h2></div>
           <div class="form-grid">
-            <label class="field"><span>{{ t('standard') }}</span><select v-model="standard" :disabled="stampMode"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option><option value="cms">CMS / PKCS#7</option></select></label>
+            <label class="field"><span>{{ t('standard') }}</span><select v-model="standard" :disabled="stampMode"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" :disabled="!status.cadesAvailable">CAdES-T{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cms">CMS / PKCS#7</option></select></label>
             <label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
             <label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
@@ -733,7 +740,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         </section>
         <p v-if="signingMessage" class="form-message" role="alert">{{ signingMessage }}</p>
         <footer class="action-bar">
-          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'?t('signPage.cadesNotConnected'):standard==='cades-bes'&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):standard==='cades-bes'&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
+          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'&&!appSettings.tspServer.trim()?t('signPage.tspRequired'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
         </footer>
       </section>
 
@@ -742,6 +749,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card">
           <div class="card-heading"><h2>{{ t('verifyPage.filesTitle') }}</h2></div>
           <div class="form-grid"><label class="field"><span>{{ t('verifyPage.signatureKind') }}</span><select v-model="verifyDetached" @change="verifyResult=null"><option :value="true">{{ t('detached') }}</option><option :value="false">{{ t('attached') }}</option></select></label><label class="field"><span>{{ t('verifyPage.encoding') }}</span><select v-model="verifyBase64"><option :value="false">{{ t('verifyPage.derBinary') }}</option><option :value="true">{{ t('verifyPage.base64Pem') }}</option></select></label></div>
+          <label class="settings-toggle verify-crl-toggle"><input v-model="verifyCheckCrl" type="checkbox"/><span><b>{{ t('verifyPage.checkCrl') }}</b><small>{{ t('verifyPage.checkCrlHelp') }}</small></span></label>
           <div class="verify-file-field"><span>{{ t('verifyPage.signatureFile') }}</span>
             <button class="picker-button" @click="chooseVerifySignature"><span class="picker-leading"><AppIcon name="file" :size="20" /></span><span class="picker-copy"><b>{{ verifySignaturePath || t('verifyPage.chooseSignature') }}</b><small>{{ t('verifyPage.cmsSupported') }}</small></span><span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span></button>
           </div>
@@ -751,7 +759,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         </section>
         <section v-if="verifyResult" class="verify-result" :class="verifyResult.valid?'valid':'invalid'">
           <header><span class="verify-result-icon"><AppIcon :name="verifyResult.valid?'check':'alert'" :size="20" /></span><div><h2>{{ verifyResult.valid?t('verifyPage.valid'):t('verifyPage.invalid') }}</h2><p>{{ verifyResult.message }}</p></div></header>
-          <div v-if="verifyResult.signers.length" class="verify-signer-list"><article v-for="(signer,index) in verifyResult.signers" :key="index" class="verify-signer"><b>{{ signer.subject || t('verifyPage.signer') }}</b><small>{{ t('verifyPage.issuer') }}{{ signer.issuer }}</small><small>{{ t('verifyPage.validUntil') }}{{ signer.expiresAt }}</small><small class="chain-status" :class="signer.chainTrusted?'trusted':'untrusted'">{{ signer.chainMessage }}</small></article></div>
+          <div v-if="verifyResult.signers.length" class="verify-signer-list"><article v-for="(signer,index) in verifyResult.signers" :key="index" class="verify-signer"><b>{{ signer.subject || t('verifyPage.signer') }}</b><small>{{ t('verifyPage.issuer') }}{{ signer.issuer }}</small><small>{{ t('verifyPage.validUntil') }}{{ signer.expiresAt }}</small><small class="chain-status" :class="signer.chainTrusted?'trusted':'untrusted'">{{ signer.chainMessage }}</small><small class="chain-status" :class="signer.revocationStatus==='good'?'trusted':signer.revocationStatus==='revoked'?'untrusted':'unknown'">{{ signer.revocationMessage }}</small></article></div>
         </section>
         <footer class="action-bar"><button class="sign-button" :disabled="!status.available || !verifySignaturePath || (verifyDetached && !verifyContentPath) || verifyProgress" @click="runVerify">{{ verifyProgress?t('verifyPage.checking'):t('verifyPage.runVerify') }}</button></footer>
       </section>
@@ -803,7 +811,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         <section class="card">
           <div class="card-heading"><h2>{{ t('settings.signingDefaults') }}</h2></div>
           <div class="form-grid settings-grid">
-            <label class="field"><span>{{ t('standard') }}</span><select v-model="appSettings.defaultStandard" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="cms">CMS / PKCS#7</option><option value="cades-bes">CAdES-BES</option><option value="cades-t" disabled>{{ t('signPage.cadesTNote') }}</option></select></label>
+            <label class="field"><span>{{ t('standard') }}</span><select v-model="appSettings.defaultStandard" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="cms">CMS / PKCS#7</option><option value="cades-bes">CAdES-BES</option><option value="cades-t">CAdES-T</option></select></label>
             <label class="field"><span>{{ t('encoding') }}</span><select v-model="appSettings.defaultEncoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="appSettings.defaultSignatureType" @change="appSettings.defaultDetached = appSettings.defaultSignatureType === 'detached'"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
             <label class="field"><span>{{ t('settings.extension') }}</span><select v-model="appSettings.defaultSignatureExtension"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>

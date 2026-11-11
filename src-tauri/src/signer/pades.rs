@@ -244,7 +244,7 @@ mod tests {
         let request = |path: &Path| VerifyRequest {
             signature_path: signature_path.to_string_lossy().into_owned(),
             content_path: Some(path.to_string_lossy().into_owned()),
-            detached: true, base64: false,
+            detached: true, base64: false, check_crl: false,
         };
         let verified = native::verify_signature(request(&content_path))
             .unwrap_or_else(|_| panic!("{route}: verification failed"));
@@ -298,6 +298,7 @@ mod tests {
             input_path: content_path.to_string_lossy().into_owned(),
             output_path: cms_path.to_string_lossy().into_owned(),
             certificate_ids: vec![certificate.id.clone()], detached: true, base64: false,
+            tsp_server: None,
         }).unwrap_or_else(|_| panic!("external: CAdES signing failed"));
         let payload = PdfSignaturePayload {
             cms: std::fs::read(&cms_path).expect("read external CMS"),

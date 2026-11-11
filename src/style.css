@@ -155,6 +155,8 @@ input:not([type=checkbox]):focus-visible,select:focus-visible,textarea:focus-vis
 .verify-signer small{display:block;margin-top:2px;font-size:var(--fs-12);line-height:var(--lh-12);color:var(--text-3);overflow-wrap:anywhere}
 .chain-status.trusted{color:var(--success);font-weight:600}
 .chain-status.untrusted{color:var(--danger);font-weight:600}
+.chain-status.unknown{color:var(--text-2);font-weight:600}
+.verify-crl-toggle{margin-top:var(--sp-4)}
 
 /* modals */
 .modal-backdrop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:var(--sp-5);background:var(--scrim)}

@@ -38,6 +38,9 @@ pub struct SignRequest {
     pub certificate_ids: Vec<String>,
     pub detached: bool,
     pub base64: bool,
+    /// RFC 3161 TSP endpoint, используется только форматом CAdES-T.
+    #[serde(default)]
+    pub tsp_server: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +150,9 @@ pub struct VerifyRequest {
     pub content_path: Option<String>,
     pub detached: bool,
     pub base64: bool,
+    /// Проверять отзыв сертификатов по CRL (может использовать сеть).
+    #[serde(default)]
+    pub check_crl: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +163,9 @@ pub struct VerifySignerInfo {
     pub expires_at: String,
     pub chain_trusted: bool,
     pub chain_message: String,
+    /// "notChecked" | "good" | "revoked" | "unknown".
+    pub revocation_status: String,
+    pub revocation_message: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,6 +1,17 @@
 # CryptoLite — handoff
 
-## Последняя сессия: поворот страниц в разметке штампа (2026-11-10)
+## Последняя сессия: CRL-проверка отзыва и CAdES-T/TSP (2026-11-11)
+
+- `VerifyRequest.check_crl` (по умолчанию `false` — старые вызовы не ходят в сеть) и `VerifySignerInfo.revocation_status`/`revocation_message` (`"notChecked" | "good" | "revoked" | "unknown"`). Экран «Проверка» получил переключатель `verifyCheckCrl` (включён по умолчанию) и отдельную строку статуса CRL у каждого подписанта (`.chain-status.unknown`).
+- `certificate_chain_status(certificate, check_revocation)` в `windows/mod.rs`: с проверкой отзыва строит цепочку с `CERT_CHAIN_REVOCATION_CHECK_CHAIN | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT` и `dwUrlRetrievalTimeout = 20_000`, без неё — прежний `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL`. `revocation_status(chain)` читает первую простую цепочку, отзыв любого элемента даёт `"revoked"`, статус подписанта берётся из элемента 0 (`pRevocationInfo.dwRevocationResult`, `CERT_TRUST_REVOCATION_STATUS_UNKNOWN`, `CERT_TRUST_IS_OFFLINE_REVOCATION`, `pCrlInfo.pCrlEntry.RevocationDate`). Итог `valid` дополнительно ложен при отозванном сертификате в цепочке; неизвестный статус подпись не отменяет.
+- `windows-sys 0.61.2` не отдаёт `CRL_ENTRY.dwCrlReasonCode` (код причины лежит в расширении CRL-записи OID 2.5.29.21), поэтому сообщение об отзыве содержит дату, без кода причины.
+- `SignRequest.tsp_server` + `CADESCOM_CADES_T = 5`: `native::sign_file` отправляет `cades-bes`/`cades-t` в `cadescom`, тип выбирается по `request.standard`, для CAdES-T до чтения файла проверяется адрес (`http://`/`https://`) и в `CPSigner` пишется `TSAAddress` перед `SignCades`. Ошибка `SignCades` для CAdES-T дополняется адресом TSP. UI: CAdES-T доступен на экране подписания и в настройках, `canSign` требует один сертификат и непустой TSP, подсказка кнопки — `signPage.tspRequired`.
+- Машинная проверка CRL (временный ignored-тест, после прогона удалён): CAdES-BES detached по сертификату `ED86D2FD…AC00`, `verify_signature` с `check_crl: true` → `valid=true`, `revocation_status="good"`, «По CRL сертификат не отозван.»; с `check_crl: false` → `notChecked`.
+- CAdES-T на этой машине не подтверждён: `CAdESCOM.SignCades` с типом 5 возвращает `Лицензия на КриптоПро TSP Client истекла или не была введена (0x80020009)` и для `http://pki.tax.gov.ru/tsp/tsp.srf`, и для `http://www.cryptopro.ru/tsp/tsp.srf`. `TSAAddress`/тип 5 принимаются, ошибка приходит от TSP-клиента CSP — нужен действующий лицензионный ключ TSP Client, чтобы доказать успешный CAdES-T и наличие `signature-time-stamp` в CMS.
+- UI (WebView2 CDP): CAdES-T выбирается, кнопка блокируется с «Укажите адрес TSP-сервера в настройках»; неудачный CAdES-T по `http://127.0.0.1:1/tsp` даёт отчёт с адресом TSP и не создаёт файл; CAdES-BES подписал файл, проверка с CRL показала зелёную строку «По CRL сертификат не отозван.», без CRL — «Проверка отзыва по CRL не выполнялась.»; адрес TSP сохраняется в `HKCU\Software\CryptoLite` и читается после перезапуска.
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib` — 32 passed, 1 ignored; `npm run build` проходит.
+
+## Предыдущая сессия: поворот страниц в разметке штампа (2026-11-10)
 
 - UI: в правой части `.stamp-pager` две квадратные кнопки 28×28 (`rotate-left`/`rotate-right`), `margin-left:auto` у `.stamp-rotate-group`, подписи ru/en в `main.ts`. Кнопки поворачивают только текущую страницу и заблокированы, пока она отрисовывается (`rendering`).
 - Предпросмотр: `StampEditor` через `v-model:rotations` хранит абсолютный угол изменённых страниц; `getViewport({ rotation })` получает `(page.rotate + пользовательский поворот) % 360`, исходный `/Rotate` запоминается в `baseRotations`, при возврате к нему запись удаляется. `renderToken` отбрасывает устаревшие отрисовки, а поворот из обработчика передаётся в `render(rotationOverride)` — props обновляются только следующим рендером родителя.
@@ -57,7 +68,7 @@
 
 ## Текущий срез проекта
 
-- Windows: CMS/PKCS#7 и CAdES-BES подпись (в т.ч. параллельная multi-signer подпись несколькими сертификатами в один файл), пакетная подпись, DER/Base64, attached/detached; проверка CMS с несколькими подписантами, chain policy Windows и drag-and-drop; шифрование/расшифрование CMS EnvelopedData для нескольких получателей. Пользователь проверил CAdES-BES подпись, проверку в сторонней программе, multi-signer подпись и шифрование; запуск одного EXE на рабочем ПК также подтверждён.
+- Windows: CMS/PKCS#7, CAdES-BES и CAdES-T/TSP подпись (в т.ч. параллельная multi-signer подпись несколькими сертификатами в один файл), пакетная подпись, DER/Base64, attached/detached; проверка CMS с несколькими подписантами, chain policy Windows и проверка отзыва по CRL (переключатель на экране проверки), drag-and-drop; шифрование/расшифрование CMS EnvelopedData для нескольких получателей. Пользователь проверил CAdES-BES подпись, проверку в сторонней программе, multi-signer подпись и шифрование; запуск одного EXE на рабочем ПК также подтверждён. CAdES-T в UI подключён, но успешный штамп времени не подтверждён: на тестовом ПК истекла лицензия КриптоПро TSP Client (`0x80020009`).
 - Cert picker использует CurrentUser\\MY, показывает статус срока и закрытого ключа. Сертификаты с истёкшим сроком серые и disabled. Поддержка контейнеров/токенов ещё не завершена.
 - Встроенная подпись PDF со штампом (PAdES-BES, вид подписи «Штамп на PDF») работает: подпись открывается и проверяется в Acrobat, multi-signer по PDF проходит. Версия приложения — 0.2.1.
 - Страницы настроек/о программе/шифрования реализованы; детали последних итераций ниже. Linux криптографический backend не реализован.
@@ -77,8 +88,8 @@
 ## Что работает на текущем этапе
 
 1. Создан независимый базовый проект в `CryptoLite/`, не изменяя другие папки workspace.
-2. Экран подписания подключён к Windows CMS/PKCS#7 и CAdES-BES; доступны DER/Base64, attached/detached, `.sig`/`.p7s`, параллельная multi-signer подпись несколькими сертификатами, пакетная обработка, итоговый отчёт, системные file dialogs и drag/drop.
-3. Реализованы проверка CMS с несколькими подписантами и отдельной оценкой Windows chain policy. Сетевой retrieval и проверка отзыва не включены. Пользователь проверил CAdES-BES подпись, multi-signer подпись и их проверку в сторонней программе.
+2. Экран подписания подключён к Windows CMS/PKCS#7, CAdES-BES и CAdES-T (адрес TSP из настроек); доступны DER/Base64, attached/detached, `.sig`/`.p7s`, параллельная multi-signer подпись несколькими сертификатами, пакетная обработка, итоговый отчёт, системные file dialogs и drag/drop.
+3. Реализованы проверка CMS с несколькими подписантами, отдельная оценка Windows chain policy и проверка отзыва по CRL (`check_crl`, флаги `CERT_CHAIN_REVOCATION_CHECK_CHAIN`); без флага цепочка строится только из локального кэша. Экран проверки показывает статус CRL каждого подписанта и считает подпись недействительной при отозванном сертификате. Пользователь проверил CAdES-BES подпись, multi-signer подпись и их проверку в сторонней программе.
 4. Реализованы шифрование/расшифрование CMS EnvelopedData для нескольких получателей (`.enc`, совместимо с КриптоАРМ) с пакетной обработкой и отчётом.
 5. Настройки RU/EN/system, theme light/dark/system, animations, default signing options/certificates, last output folder, remember-last и TSP URL сохраняются в системном каталоге конфигурации. About показывает статус CSP/CAdESCOM, версию CSP при доступности, стек и лицензионную оговорку.
 6. Windows `list_certs` перечисляет сертификаты CurrentUser\\MY, возвращает срок действия и состояние связи с ключом. Просроченные сертификаты disabled. Токены/контейнеры не включены; Linux криптографический backend остаётся незавершённым.
@@ -102,7 +113,7 @@
 
 ## Рекомендуемая последовательность
 
-1. Подключить CAdES-T к сохранённому TSP URL и проверить штамп времени/валидацию; адрес пока только хранится в настройках.
+1. ~~Подключить CAdES-T к сохранённому TSP URL~~ — подключено (`CADESCOM_CADES_T`, `CPSigner.TSAAddress`). Осталось: на машине с действующей лицензией КриптоПро TSP Client подтвердить успешный штамп времени (`signature-time-stamp` в CMS, проверка TST) — сейчас CSP возвращает `0x80020009`.
 2. ~~Реализовать CMS EnvelopedData~~ — сделано (шифрование для нескольких получателей и расшифрование своим ключом; «подписать, затем зашифровать» ещё нет).
 3. ~~Реализовать параллельные multi-signer подписи~~ — сделано для CMS/PKCS#7 (несколько сертификатов в один файл). Осталось multi-signer для CAdES (через CAdESCOM `CPSigners`).
 4. Добавить перечисление контейнеров и сертификатов Рутокен/JaCarta через CSP, обработку недоступного токена и безопасный PIN flow по ТЗ.
