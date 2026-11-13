@@ -245,10 +245,6 @@ watch(selectedCertIds, () => {
     appSettings.value.defaultCertificateIds = [...selectedCertIds.value];
   }
 }, { deep: true });
-watch(() => appSettings.value.defaultSignatureType, (type) => {
-  // Встроенная подпись PDF всегда CAdES-BES: в режиме штампа другие стандарты недоступны.
-  if (type === 'stamp') appSettings.value.defaultStandard = 'cades-bes';
-});
 watch(cryptoMode, () => {
   // Файлы одной операции непригодны для другой: при смене режима список очищается.
   cryptoFiles.value = [];
@@ -321,7 +317,6 @@ function applySigningDefaults() {
   encoding.value = appSettings.value.defaultEncoding;
   signatureType.value = appSettings.value.defaultSignatureType
     || (appSettings.value.defaultDetached ? 'detached' : 'attached');
-  if (signatureType.value === 'stamp') standard.value = 'cades-bes';
   fileType.value = appSettings.value.defaultSignatureExtension;
   outputDir.value = appSettings.value.defaultOutputDirectory;
   // Пока список сертификатов не загружен, фильтровать нельзя: иначе умолчания обнулятся.
@@ -627,11 +622,6 @@ async function signStampDocument() {
 const stampMode = computed(() => signatureType.value === 'stamp');
 const stampDocuments = computed(() => documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name)));
 
-watch(stampMode, (isStamp) => {
-  // Встроенная подпись PDF всегда CAdES-BES.
-  if (isStamp) standard.value = 'cades-bes';
-}, { immediate: true });
-
 async function startStampSigning() {
   if (!stampMode.value || !selectedCertificates.value.length || signingInProgress.value) return;
   const candidates = stampDocuments.value;
@@ -800,9 +790,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
           <div class="card-heading"><h2>{{ t('signPage.paramsTitle') }}</h2></div>
           <div class="form-grid">
             <label class="field"><span>{{ t('standard') }}</span><select v-model="standard" :disabled="stampMode"><option value="cades-bes" :disabled="!status.cadesAvailable">CAdES-BES{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cades-t" :disabled="!status.cadesAvailable">CAdES-T{{ status.cadesAvailable?'':t('signPage.sdkMissing') }}</option><option value="cms">CMS / PKCS#7</option></select></label>
-            <label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
+            <label class="field"><span>{{ t('encoding') }}</span><select v-model="encoding" :disabled="stampMode"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="signatureType"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
-            <label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
+            <label class="field"><span>{{ t('fileType') }}</span><select v-model="fileType" :disabled="stampMode"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
           </div>
           <div v-if="stampMode" class="stamp-note"><b>{{ t('signPage.stampNoteTitle') }}</b><span>{{ t('signPage.stampNote') }}</span><label class="field stamp-position"><span>{{ t('signPage.stampPosition') }}</span><input v-model="stampPosition" :placeholder="t('signPage.stampPositionPlaceholder')" maxlength="60"/></label></div>
           <div class="field-row">
@@ -842,7 +832,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         </section>
         <p v-if="signingMessage" class="form-message" role="alert">{{ signingMessage }}</p>
         <footer class="action-bar">
-          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):standard==='cades-t'&&!appSettings.tspServer.trim()?t('signPage.tspRequired'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
+          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):!stampMode&&standard==='cades-t'&&!appSettings.tspServer.trim()?t('signPage.tspRequired'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
         </footer>
       </section>
 
@@ -920,9 +910,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
           <div class="card-heading"><h2>{{ t('settings.signingDefaults') }}</h2></div>
           <div class="form-grid settings-grid">
             <label class="field"><span>{{ t('standard') }}</span><select v-model="appSettings.defaultStandard" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="cms">CMS / PKCS#7</option><option value="cades-bes">CAdES-BES</option><option value="cades-t">CAdES-T</option></select></label>
-            <label class="field"><span>{{ t('encoding') }}</span><select v-model="appSettings.defaultEncoding"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
+            <label class="field"><span>{{ t('encoding') }}</span><select v-model="appSettings.defaultEncoding" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="der">{{ t('signPage.derBinary') }}</option><option value="base64">Base64</option></select></label>
             <label class="field"><span>{{ t('signatureType') }}</span><select v-model="appSettings.defaultSignatureType" @change="appSettings.defaultDetached = appSettings.defaultSignatureType === 'detached'"><option value="detached">{{ t('detached') }}</option><option value="attached">{{ t('attached') }}</option><option value="stamp">{{ t('stamp') }}</option></select></label>
-            <label class="field"><span>{{ t('settings.extension') }}</span><select v-model="appSettings.defaultSignatureExtension"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
+            <label class="field"><span>{{ t('settings.extension') }}</span><select v-model="appSettings.defaultSignatureExtension" :disabled="appSettings.defaultSignatureType === 'stamp'"><option value="sig">.sig</option><option value="p7s">.p7s</option></select></label>
             <label class="field settings-output"><span>{{ t('settings.outputFolder') }}</span><input v-model="appSettings.defaultOutputDirectory" :placeholder="t('settings.outputPlaceholder')"/></label>
           </div>
           <label class="settings-toggle remember-toggle"><input v-model="appSettings.saveLastSigningSettings" type="checkbox"/><span><b>{{ t('settings.remember') }}</b><small>{{ t('settings.rememberHelp') }}</small></span></label>
