@@ -1,7 +1,5 @@
 #![deny(unsafe_code)]
 
-pub mod digest;
-
 mod token;
 
 #[allow(unsafe_code)]
@@ -1816,6 +1814,7 @@ pub fn probe() -> crate::signer::CspStatus {
             // встроена в носитель ключа, а окончательную проверку даёт сама операция подписи.
             signing_available: true,
             license_available,
+            license_supported: true,
             provider_type: Some(provider_type),
             version: csp_version,
             message: tr!(

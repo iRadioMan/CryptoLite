@@ -13,7 +13,8 @@ import type { IconName } from './components/icons';
 import { forgetStampRects, type StampRect } from './signing';
 import { tempDir } from '@tauri-apps/api/path';
 
-type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; licenseAvailable: boolean; providerType?: number | null; version?: string | null; message: string };
+type CspStatus = { available: boolean; cadesAvailable: boolean; signingAvailable: boolean; licenseAvailable: boolean; licenseSupported: boolean; providerType?: number | null; version?: string | null; message: string };
+type EnvironmentInfo = { platform: string; distroSupported: boolean; distroName: string; distroVersion: string };
 type AppSettings = { language: string; theme: string; animations: boolean; defaultStandard: string; defaultEncoding: string; defaultDetached: boolean; defaultSignatureType: string; defaultSignatureExtension: string; defaultCertificateIds: string[]; defaultOutputDirectory: string; saveLastSigningSettings: boolean; tspServer: string };
 type CertInfo = { id: string; subject: string; issuer: string; expiresAt: string; expired: boolean; hasPrivateKey: boolean; source: string; serialNumber: string; notBefore: string; notAfter: string; ownerName: string };
 type TokenInfo = { reader: string; model: string };
@@ -29,7 +30,10 @@ const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' 
 const page = ref('sign');
 const navIcons: Record<string, IconName> = { sign: 'pen', encrypt: 'lock', verify: 'shield', settings: 'sliders', about: 'info' };
 const documents = ref<Doc[]>([]);
-const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, message: t('checkingCsp') });
+const status = ref<CspStatus>({ available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, licenseSupported: false, message: t('checkingCsp') });
+const environment = ref<EnvironmentInfo>({ platform: 'windows', distroSupported: true, distroName: '', distroVersion: '' });
+const showDistroWarning = ref(false);
+const isLinux = computed(() => environment.value.platform === 'linux');
 const appSettings = ref<AppSettings>({ language: 'system', theme: 'system', animations: true, defaultStandard: 'cms', defaultEncoding: 'der', defaultDetached: true, defaultSignatureType: 'detached', defaultSignatureExtension: 'sig', defaultCertificateIds: [], defaultOutputDirectory: '', saveLastSigningSettings: true, tspServer: '' });
 const settingsLoaded = ref(false);
 const settingsSaveState = ref<'saving' | 'saved' | ''>('');
@@ -51,6 +55,8 @@ const certPickerMode = ref<'signing' | 'defaults' | 'encryption'>('signing');
 const pickerDraftCertIds = ref<string[]>([]);
 const certificateListRef = ref<HTMLElement | null>(null);
 const certsLoading = ref(false);
+/** Статус CSP ещё не получен: до ответа провайдера нельзя показывать «не найден». */
+const statusLoading = ref(true);
 const certsError = ref('');
 const signingInProgress = ref(false);
 const signingMessage = ref('');
@@ -199,10 +205,17 @@ onMounted(async () => {
     console.warn('Не удалось подключить обработчик drag-and-drop', error);
   }
   await setBackendLanguage(locale.value);
-  await initializeSettings();
+  // Статус CSP и версия дистрибутива не ждут перечисления сертификатов: на Рутокене
+  // list_certs идёт десятки секунд, а провайдер отвечает сразу.
+  const settingsTask = initializeSettings();
+  await refreshEnvironment();
   await refreshCspStatus();
+  // На неподдерживаемом дистрибутиве сначала показывается предупреждение о версии;
+  // состояние CSP остаётся видно в сайдбаре и в «О программе».
+  if (!environment.value.distroSupported) showDistroWarning.value = true;
+  else if (!status.value.available) showAlert.value = true;
+  await settingsTask;
   await refreshTokens();
-  if (!status.value.available) showAlert.value = true;
 });
 onUnmounted(() => { unlistenDrop?.(); unlistenSystemTheme?.(); });
 
@@ -266,11 +279,24 @@ async function refreshTokens() {
   }
 }
 
+async function refreshEnvironment() {
+  try {
+    environment.value = await invoke<EnvironmentInfo>('environment_info');
+  } catch (error) {
+    // Без сведений о дистрибутиве предупреждение не показывается: на Windows команда не нужна.
+    console.warn('Could not read the distribution version', error);
+    environment.value = { platform: 'windows', distroSupported: true, distroName: '', distroVersion: '' };
+  }
+}
+
 async function refreshCspStatus() {
+  statusLoading.value = true;
   try {
     status.value = await invoke<CspStatus>('csp_status');
   } catch (error) {
-    status.value = { available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, message: String(error) };
+    status.value = { available: false, cadesAvailable: false, signingAvailable: false, licenseAvailable: false, licenseSupported: false, message: String(error) };
+  } finally {
+    statusLoading.value = false;
   }
 }
 
@@ -756,7 +782,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
       <div class="sidebar-bottom">
         <div class="csp-status" :title="status.message">
           <span class="status-dot" :class="{ connected: status.available }"></span>
-          <span>{{ status.available ? `${t('cspFound')}${status.version ? ' ' + status.version : ''}` : t('disconnected') }}</span>
+          <span>{{ statusLoading ? t('checkingCsp') : status.available ? `${t('cspFound')}${status.version ? ' ' + status.version : ''}` : t('disconnected') }}</span>
         </div>
         <div class="sidebar-actions">
           <button class="icon-button" :aria-label="isDark?t('a11y.themeLight'):t('a11y.themeDark')" :title="isDark?t('a11y.themeLight'):t('a11y.themeDark')" @click="toggleTheme">
@@ -783,7 +809,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
             <div class="field wide-field"><span>{{ t('certificates') }}</span>
               <button class="picker-button" :disabled="certsLoading" :aria-busy="certsLoading" @click="openCertificatePicker('signing')">
                 <span class="picker-leading"><AppIcon name="file" :size="20" /></span>
-                <span class="picker-copy"><b>{{ certsLoading ? t('signPage.certificatesLoading') : certificateNames.length ? certificateNames.join(', ') : t('signPage.selectCerts') }}</b><small>{{ t('signPage.windowsPersonalStore') }}</small></span>
+                <span class="picker-copy"><b>{{ certsLoading ? t('signPage.certificatesLoading') : certificateNames.length ? certificateNames.join(', ') : t('signPage.selectCerts') }}</b><small>{{ t('signPage.storeLabel', { os: isLinux ? 'Linux' : 'Windows' }) }}</small></span>
                 <span class="picker-trailing"><AppIcon name="chevron-right" :size="16" /></span>
               </button>
             </div>
@@ -913,9 +939,9 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.6.10</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.7.11</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
-          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing') }}</dd></div><div><dt>{{ t('about.tokens') }}</dt><dd>{{ tokenCount }}</dd></div></dl></section>
+          <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseSupported ? (status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing')) : t('about.licenseNotChecked') }}</dd></div><div><dt>{{ t('about.tokens') }}</dt><dd>{{ tokenCount }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
         </div>
         <section class="card about-license"><div class="card-heading"><h2>{{ t('about.licenseTitle') }}</h2></div><p>{{ t('about.disclaimer') }}</p><span class="license-name">{{ t('about.licenseLink') }}</span></section>
@@ -936,6 +962,8 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
     <div v-if="stampViewerOpen" class="modal-backdrop" @click.self="stampViewerOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-viewer-title"><header class="certificate-header"><div><h2 id="stamp-viewer-title">{{ t('stampViewer.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampViewerOpen=false"><AppIcon name="x" :size="20" /></button></header><StampViewer :pdf-base64="stampViewerPdf" :signatures="stampViewerSignatures"/><footer class="certificate-footer stamp-viewer-footer"><span class="stamp-viewer-signers">{{ t('stampViewer.signers', { count: stampViewerSigners }) }}</span><span class="stamp-viewer-valid" :class="{ 'stamp-warning': stampViewerValid !== stampViewerSignatures.length }">{{ t('stampViewer.valid', { valid: stampViewerValid, total: stampViewerSignatures.length }) }}</span><button class="sign-button" @click="stampViewerOpen=false">{{ t('stampViewer.close') }}</button></footer></section></div>
 
     <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><div class="alert-icon"><AppIcon name="info" :size="20" /></div><h2 id="confirm-title">{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="outline-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
+
+    <div v-if="showDistroWarning" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="distro-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="distro-title">{{ t('distroWarning.title') }}</h2><p>{{ t('distroWarning.body') }}</p><div class="alert-detail">{{ environment.distroName }}{{ environment.distroVersion && !environment.distroName.includes(environment.distroVersion) ? ' ' + environment.distroVersion : '' }}</div><button class="sign-button" @click="showDistroWarning=false">{{ t('dismiss') }}</button></section></div>
 
     <div v-if="showAlert" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="alert-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="alert-title">{{ t('dialogTitle') }}</h2><p>{{ t('unavailable') }}</p><div class="alert-detail">{{ status.message }}</div><button class="sign-button" @click="showAlert=false">{{ t('dismiss') }}</button></section></div>
 

@@ -5,7 +5,7 @@
 //! модуль ведёт последовательность: подготовка поля `/Sig` → подпись диапазона → вписывание CMS.
 
 use crate::signer::csp_native;
-use crate::signer::csp_native::windows::digest;
+use crate::signer::csp_native::digest;
 use crate::signer::pdf_layer::{self, PreparedDocument};
 use crate::signer::{PageRotation, PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyResult, SignResult, SignerError};
 use crate::tr;
@@ -50,7 +50,7 @@ pub fn prepare(
     stamp: &PdfStampSpec,
     page_rotations: &[PageRotation],
 ) -> Result<PreparedDocument, SignerError> {
-    let public_key_oid = csp_native::windows::pdf_certificate_public_key_oid(certificate_id)?;
+    let public_key_oid = csp_native::platform::pdf_certificate_public_key_oid(certificate_id)?;
     let (_, algorithm) = digest::hash_for_public_key(&public_key_oid).map_err(signing_error)?;
     pdf_layer::prepare(
         std::path::Path::new(input_path),
@@ -72,7 +72,7 @@ pub fn sign_prepared(
 ) -> Result<PdfSignaturePayload, SignerError> {
     let (document, contents_at, contents_end) = pdf_layer::with_byte_range(&prepared.bytes)?;
     let content = pdf_layer::signed_content(&document, contents_at, contents_end)?;
-    let cms = csp_native::windows::sign_pdf_range(certificate_id, &content)?;
+    let cms = csp_native::platform::sign_pdf_range(certificate_id, &content)?;
     Ok(PdfSignaturePayload {
         cms,
         contents_at: prepared.contents_at,
@@ -219,7 +219,7 @@ fn check_signature(signature: pdf_layer::EmbeddedSignature, check_crl: bool) -> 
     info
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::signer::native::{self, NativeSigner};
@@ -230,6 +230,19 @@ mod tests {
     fn required_env(name: &str) -> String {
         std::env::var(name).ok().filter(|s| !s.is_empty())
             .unwrap_or_else(|| panic!("required environment variable missing: {name}"))
+    }
+
+    /// Внешняя нитка подписи PDF требует CAdES: CAdESCOM на Windows, `cryptcp`
+    /// с компонентом CAdES (`libcades`) на Linux.
+    fn cades_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::signer::csp_native::linux::cades_available()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            true
+        }
     }
 
     fn selected_certificate<'a>(certificates: &'a [CertInfo], serial: &str) -> Result<&'a CertInfo, &'static str> {
@@ -403,6 +416,14 @@ mod tests {
         sign_document(&input.to_string_lossy(), &direct.to_string_lossy(), &certificate.id, &stamp, &[])
             .unwrap_or_else(|_| panic!("direct: signing failed"));
         verify_route("direct", &direct, &directory);
+
+        if !cades_available() {
+            // Внешняя нитка подписывает CAdES: без компонента CAdES её не проверить.
+            assert!(std::fs::read(&input).expect("reread source") == original, "source PDF changed");
+            println!("external: the CAdES component is not installed, the route is skipped");
+            println!("results: {}", directory.display());
+            return;
+        }
 
         let prepared = prepare(&input.to_string_lossy(), &certificate.id, &stamp, &[])
             .unwrap_or_else(|_| panic!("external: preparation failed"));

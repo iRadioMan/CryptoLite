@@ -8,6 +8,8 @@ pub struct CspStatus {
     pub cades_available: bool,
     pub signing_available: bool,
     pub license_available: bool,
+    /// Лицензия вообще проверяется этой версией CSP (на Linux `PP_LICENSE` может быть не поддержан).
+    pub license_supported: bool,
     pub provider_type: Option<u32>,
     pub version: Option<String>,
     pub message: String,
@@ -310,6 +312,7 @@ impl CspStatus {
             cades_available: false,
             signing_available: false,
             license_available: false,
+            license_supported: false,
             provider_type: None,
             version: None,
             message: message.into(),
