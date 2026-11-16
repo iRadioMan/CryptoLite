@@ -5,9 +5,9 @@
 //! модуль ведёт последовательность: подготовка поля `/Sig` → подпись диапазона → вписывание CMS.
 
 use crate::signer::csp_native;
-use crate::signer::csp_native::windows::digest;
+use crate::signer::csp_native::digest;
 use crate::signer::pdf_layer::{self, PreparedDocument};
-use crate::signer::{PageRotation, PdfSignaturePayload, PdfStampSpec, SignResult, SignerError};
+use crate::signer::{PageRotation, PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyResult, SignResult, SignerError};
 use crate::tr;
 
 fn signing_error(message: impl Into<String>) -> SignerError {
@@ -50,7 +50,7 @@ pub fn prepare(
     stamp: &PdfStampSpec,
     page_rotations: &[PageRotation],
 ) -> Result<PreparedDocument, SignerError> {
-    let public_key_oid = csp_native::windows::pdf_certificate_public_key_oid(certificate_id)?;
+    let public_key_oid = csp_native::platform::pdf_certificate_public_key_oid(certificate_id)?;
     let (_, algorithm) = digest::hash_for_public_key(&public_key_oid).map_err(signing_error)?;
     pdf_layer::prepare(
         std::path::Path::new(input_path),
@@ -72,7 +72,7 @@ pub fn sign_prepared(
 ) -> Result<PdfSignaturePayload, SignerError> {
     let (document, contents_at, contents_end) = pdf_layer::with_byte_range(&prepared.bytes)?;
     let content = pdf_layer::signed_content(&document, contents_at, contents_end)?;
-    let cms = csp_native::windows::sign_pdf_range(certificate_id, &content)?;
+    let cms = csp_native::platform::sign_pdf_range(certificate_id, &content)?;
     Ok(PdfSignaturePayload {
         cms,
         contents_at: prepared.contents_at,
@@ -101,7 +101,125 @@ pub fn sign_document(
     finish_signed(&prepared, &payload, output_path)
 }
 
-#[cfg(all(test, target_os = "windows"))]
+/// Проверка встроенных подписей PDF (PAdES-BES, штампы).
+///
+/// Каждая подпись проверяется по своему `/ByteRange`, а CMS — тем же CryptoAPI, что и
+/// отдельный файл подписи; цепочка и отзыв считаются для сертификата каждого подписанта.
+pub fn verify_document(path: &str, check_crl: bool) -> Result<PdfVerifyResult, SignerError> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        signing_error(tr!(
+            "не удалось прочитать PDF: {error}",
+            "could not read the PDF: {error}"
+        ))
+    })?;
+    let embedded = pdf_layer::embedded_signatures(&bytes)?;
+    let signatures = embedded
+        .into_iter()
+        .map(|signature| check_signature(signature, check_crl))
+        .collect::<Vec<_>>();
+    let valid_count = signatures.iter().filter(|signature| signature.valid).count();
+    let signer_count = signatures
+        .iter()
+        .map(|signature| signature.signers.len())
+        .sum();
+    let message = if signatures.is_empty() {
+        tr!(
+            "В документе нет встроенных подписей.",
+            "The document has no embedded signatures."
+        )
+    } else if valid_count == signatures.len() {
+        tr!("Все подписи PDF верны.", "All PDF signatures are valid.")
+    } else {
+        tr!(
+            "Часть подписей PDF не подтверждена.",
+            "Some PDF signatures are not confirmed."
+        )
+    };
+    Ok(PdfVerifyResult {
+        signatures,
+        valid_count,
+        signer_count,
+        pdf_base64: {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        },
+        message,
+    })
+}
+
+/// Проверяет одну встроенную подпись и описывает её для окна просмотра.
+fn check_signature(signature: pdf_layer::EmbeddedSignature, check_crl: bool) -> PdfSignatureInfo {
+    let (left_mm, top_mm, width_mm, height_mm) = match signature.rect_mm {
+        Some((left, top, width, height)) => (Some(left), Some(top), Some(width), Some(height)),
+        None => (None, None, None, None),
+    };
+    let mut info = PdfSignatureInfo {
+        field_name: signature.field_name,
+        page: signature.page,
+        left_mm,
+        top_mm,
+        width_mm,
+        height_mm,
+        sub_filter: signature.sub_filter,
+        signed_at: signature.signed_at,
+        covers_document: signature.covers_document,
+        valid: false,
+        message: String::new(),
+        signers: Vec::new(),
+    };
+    if let Some(problem) = signature.problem {
+        info.message = problem;
+        return info;
+    }
+    let (Some(cms), Some(content)) = (signature.cms, signature.content) else {
+        info.message = tr!(
+            "подпись PDF неполна: нет CMS или диапазона байт",
+            "the PDF signature is incomplete: no CMS or byte range"
+        )
+        .to_owned();
+        return info;
+    };
+    // Отсоединённая CMS (`ETSI.CAdES.detached`, `adbe.pkcs7.detached`) проверяется по
+    // диапазону файла; присоединённая несёт содержимое внутри себя.
+    let detached = info.sub_filter.ends_with("detached");
+    match crate::signer::native::verify_cms_signers(
+        &cms,
+        if detached { Some(&content) } else { None },
+        detached,
+        check_crl,
+    ) {
+        Ok((signers, failure)) => {
+            let revoked = signers
+                .iter()
+                .any(|signer| signer.revocation_status == "revoked");
+            info.valid = failure.is_none() && !revoked && !signers.is_empty();
+            info.message = match failure {
+                Some((index, code)) => tr!(
+                    "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
+                    "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
+                    index + 1
+                ),
+                None if revoked => tr!(
+                    "Криптографическая подпись верна, но сертификат отозван по CRL.",
+                    "The cryptographic signature is valid, but the certificate is revoked according to the CRL."
+                ),
+                None if check_crl => tr!(
+                    "Криптографическая подпись верна; проверка отзыва по CRL выполнена.",
+                    "The cryptographic signature is valid; revocation was checked against the CRL."
+                ),
+                None => tr!(
+                    "Криптографическая подпись верна.",
+                    "The cryptographic signature is valid."
+                ),
+            };
+            info.signers = signers;
+        }
+        Err(error) => info.message = error.to_string(),
+    }
+    info
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 mod tests {
     use super::*;
     use crate::signer::native::{self, NativeSigner};
@@ -112,6 +230,19 @@ mod tests {
     fn required_env(name: &str) -> String {
         std::env::var(name).ok().filter(|s| !s.is_empty())
             .unwrap_or_else(|| panic!("required environment variable missing: {name}"))
+    }
+
+    /// Внешняя нитка подписи PDF требует CAdES: CAdESCOM на Windows, `cryptcp`
+    /// с компонентом CAdES (`libcades`) на Linux.
+    fn cades_available() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::signer::csp_native::linux::cades_available()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            true
+        }
     }
 
     fn selected_certificate<'a>(certificates: &'a [CertInfo], serial: &str) -> Result<&'a CertInfo, &'static str> {
@@ -244,7 +375,7 @@ mod tests {
         let request = |path: &Path| VerifyRequest {
             signature_path: signature_path.to_string_lossy().into_owned(),
             content_path: Some(path.to_string_lossy().into_owned()),
-            detached: true, base64: false,
+            detached: true, base64: false, check_crl: false,
         };
         let verified = native::verify_signature(request(&content_path))
             .unwrap_or_else(|_| panic!("{route}: verification failed"));
@@ -286,6 +417,14 @@ mod tests {
             .unwrap_or_else(|_| panic!("direct: signing failed"));
         verify_route("direct", &direct, &directory);
 
+        if !cades_available() {
+            // Внешняя нитка подписывает CAdES: без компонента CAdES её не проверить.
+            assert!(std::fs::read(&input).expect("reread source") == original, "source PDF changed");
+            println!("external: the CAdES component is not installed, the route is skipped");
+            println!("results: {}", directory.display());
+            return;
+        }
+
         let prepared = prepare(&input.to_string_lossy(), &certificate.id, &stamp, &[])
             .unwrap_or_else(|_| panic!("external: preparation failed"));
         let exported = pdf_layer::export_prepared(prepared).expect("export preparation");
@@ -298,6 +437,7 @@ mod tests {
             input_path: content_path.to_string_lossy().into_owned(),
             output_path: cms_path.to_string_lossy().into_owned(),
             certificate_ids: vec![certificate.id.clone()], detached: true, base64: false,
+            tsp_server: None,
         }).unwrap_or_else(|_| panic!("external: CAdES signing failed"));
         let payload = PdfSignaturePayload {
             cms: std::fs::read(&cms_path).expect("read external CMS"),

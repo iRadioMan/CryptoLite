@@ -46,8 +46,8 @@ impl fmt::Display for SignerError {
                 f,
                 "{}",
                 tr!(
-                    "Не удалось прочитать личное хранилище сертификатов Windows: {detail}",
-                    "Could not read the Windows personal certificate store: {detail}"
+                    "Не удалось прочитать личное хранилище сертификатов: {detail}",
+                    "Could not read the personal certificate store: {detail}"
                 )
             ),
             Self::Signing(detail) => write!(

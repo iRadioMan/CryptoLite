@@ -267,6 +267,90 @@ mod ffi {
         Err(tr!("Выбранный сертификат не найден в CAdESCOM CurrentUser store; проверьте установку CryptoPro ЭЦП SDK.", "The selected certificate was not found in the CAdESCOM CurrentUser store; check the CryptoPro EDS SDK installation."))
     }
 
+    /// Объект `CAdESCOM.Certificate` с явно открытым ключом контейнера токена.
+    ///
+    /// Перебираются все найденные варианты: первый может относиться к уже
+    /// отключённому токену, второй — к подключённому.
+    fn token_certificate(certificate_id: &str) -> Result<IDispatch, String> {
+        let mut last_error = None;
+        for details in crate::signer::csp_native::windows::token_details(certificate_id) {
+            let attempt = (|| -> Result<IDispatch, String> {
+                let certificate = create("CAdESCOM.Certificate")?;
+                invoke(
+                    &certificate,
+                    "Import",
+                    vec![VARIANT::from(BSTR::from(base64_encode(&details.der)))],
+                )?;
+                let private_key = create("CAdESCOM.PrivateKey")?;
+                // CAPICOM_CURRENT_USER_STORE=2; bCheckExistence=false: контейнер
+                // открывается только при подписи, когда PIN уже запрошен.
+                invoke(
+                    &private_key,
+                    "Open",
+                    vec![
+                        VARIANT::from(BSTR::from(details.container.as_str())),
+                        VARIANT::from(BSTR::from(details.provider_name.as_str())),
+                        VARIANT::from(details.provider_type as i32),
+                        VARIANT::from(details.key_spec as i32),
+                        VARIANT::from(2i32),
+                        VARIANT::from(false),
+                    ],
+                )?;
+                put(&certificate, "PrivateKey", VARIANT::from(private_key), true)?;
+                Ok(certificate)
+            })();
+            match attempt {
+                Ok(certificate) => return Ok(certificate),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            tr!(
+                "не найдены сведения о контейнере сертификата токена",
+                "no token certificate container details were found"
+            )
+        }))
+    }
+
+    /// Сертификат для подписи CAdES: контейнер токена, затем смарт-карта, затем CurrentUser.
+    ///
+    /// `CADESCOM_CONTAINER_STORE` не используется: он перечисляет все контейнеры,
+    /// включая отсутствующие носители, и провоцирует системные запросы.
+    fn select_signing_certificate(certificate_id: &str) -> Result<IDispatch, String> {
+        if !crate::signer::csp_native::windows::has_token_details(certificate_id) {
+            let store = create("CAdESCOM.Store")?;
+            // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
+            invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
+            return select_certificate(&store, certificate_id);
+        }
+        let token_error = match token_certificate(certificate_id) {
+            Ok(certificate) => return Ok(certificate),
+            Err(error) => error,
+        };
+        let mut last_error = token_error.clone();
+        // CAPICOM_SMART_CARD_USER_STORE=4, затем CAPICOM_CURRENT_USER_STORE=2.
+        for store_type in [4i32, 2i32] {
+            let attempt = (|| -> Result<IDispatch, String> {
+                let store = create("CAdESCOM.Store")?;
+                invoke(&store, "Open", vec![VARIANT::from(store_type)])?;
+                select_certificate(&store, certificate_id)
+            })();
+            match attempt {
+                Ok(certificate) => return Ok(certificate),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(tr!(
+            "Не удалось подготовить сертификат токена для CAdES: {token_error}. Резервный поиск в хранилищах Windows тоже не удался: {last_error}",
+            "Could not prepare the token certificate for CAdES: {token_error}. The fallback search in the Windows stores failed too: {last_error}"
+        ))
+    }
+
+    /// Типы подписи CAdES (`CADESCOM_CADES_TYPE`).
+    const CADESCOM_CADES_BES: i32 = 0x1;
+    /// CAdES-T: CAdES-BES плюс штамп времени RFC 3161 от TSP-сервера.
+    const CADESCOM_CADES_T: i32 = 0x5;
+
     /// Хэш-алгоритм CAdESCOM (`CADESCOM_HASH_ALGORITHM`) по ключу сертификата.
     ///
     /// В числовых значениях перечисления Стрибог-2012-256 = 1, Стрибог-2012-512 = 2
@@ -333,9 +417,34 @@ mod ffi {
     ) -> Result<crate::signer::SignResult, String> {
         if request.certificate_ids.len() != 1 {
             return Err(tr!(
-                "CAdES-BES пока поддерживает подпись ровно одним сертификатом; для нескольких подписантов выберите CMS / PKCS#7",
-                "CAdES-BES currently supports signing with exactly one certificate; for multiple signers, choose CMS / PKCS#7"
+                "Форматы CAdES-BES и CAdES-T поддерживают подпись ровно одним сертификатом; для нескольких подписантов выберите CMS / PKCS#7",
+                "CAdES-BES and CAdES-T support signing with exactly one certificate; for multiple signers, choose CMS / PKCS#7"
             ));
+        }
+        let cades_type = match request.standard.as_str() {
+            "cades-bes" => CADESCOM_CADES_BES,
+            "cades-t" => CADESCOM_CADES_T,
+            other => {
+                return Err(tr!(
+                    "Неизвестный формат подписи CAdES: {other}",
+                    "Unknown CAdES signature format: {other}"
+                ))
+            }
+        };
+        let tsp_server = request.tsp_server.as_deref().map(str::trim).unwrap_or_default();
+        if cades_type == CADESCOM_CADES_T {
+            if tsp_server.is_empty() {
+                return Err(tr!(
+                    "Укажите адрес TSP-сервера в настройках для подписи CAdES-T.",
+                    "Set the TSP server address in Settings to create a CAdES-T signature."
+                ));
+            }
+            if !tsp_server.starts_with("http://") && !tsp_server.starts_with("https://") {
+                return Err(tr!(
+                    "Адрес TSP-сервера должен начинаться с http:// или https://.",
+                    "The TSP server address must start with http:// or https://."
+                ));
+            }
         }
         let certificate_id = request.certificate_ids.first().cloned().ok_or_else(|| {
             tr!(
@@ -350,12 +459,13 @@ mod ffi {
                 "Could not read the source file: {error}"
             )
         })?;
-        let store = create("CAdESCOM.Store")?;
-        // CAPICOM_CURRENT_USER_STORE=2; Open accepts additional parameters as optional.
-        invoke(&store, "Open", vec![VARIANT::from(2i32)])?;
-        let certificate = select_certificate(&store, &certificate_id)?;
+        let certificate = select_signing_certificate(&certificate_id)?;
         let signer = create("CAdESCOM.CPSigner")?;
         put(&signer, "Certificate", VARIANT::from(certificate), true)?;
+        if cades_type == CADESCOM_CADES_T {
+            // RFC 3161 endpoint: CAdESCOM запрашивает штамп времени сам.
+            put(&signer, "TSAAddress", VARIANT::from(BSTR::from(tsp_server)), false)?;
+        }
         let signed_data = create("CAdESCOM.CadesSignedData")?;
         // CryptoPro documents CADESCOM_BASE64_TO_BINARY=1 for exact binary file content.
         put(&signed_data, "ContentEncoding", VARIANT::from(1i32), false)?;
@@ -371,10 +481,20 @@ mod ffi {
             vec![
                 VARIANT::from(0i32), // CAPICOM_ENCODE_BASE64. Convert to DER ourselves if requested.
                 VARIANT::from(request.detached),
-                VARIANT::from(1i32), // CADESCOM_CADES_BES
+                VARIANT::from(cades_type),
                 VARIANT::from(signer),
             ],
-        )?;
+        )
+        .map_err(|error| {
+            if cades_type == CADESCOM_CADES_T {
+                tr!(
+                    "Не удалось создать подпись CAdES-T через TSP {tsp_server}: {error}. Проверьте адрес TSP-сервера и доступность службы.",
+                    "Could not create a CAdES-T signature via TSP {tsp_server}: {error}. Check the TSP server address and service availability."
+                )
+            } else {
+                error
+            }
+        })?;
         let signature_b64 = as_string(&signature_variant)?;
         let output = if request.base64 {
             signature_b64.into_bytes()
@@ -385,8 +505,8 @@ mod ffi {
         let final_path =
             crate::signer::output::write_unique(&requested, &output).map_err(|error| {
                 tr!(
-                    "Не удалось записать результат CAdES-BES ({}): {error}",
-                    "Could not write the CAdES-BES result ({}): {error}",
+                    "Не удалось записать результат CAdES ({}): {error}",
+                    "Could not write the CAdES result ({}): {error}",
                     requested.display()
                 )
             })?;

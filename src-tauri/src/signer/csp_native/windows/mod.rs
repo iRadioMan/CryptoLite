@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-pub mod digest;
+mod token;
 
 #[allow(unsafe_code)]
 mod ffi {
@@ -83,6 +83,16 @@ mod ffi {
     /// Подпись диапазона PDF и подпись готового хэша (структура из cades.h).
     pub(super) struct ProviderContext(usize);
 
+    impl ProviderContext {
+        pub(super) fn from_handle(handle: usize) -> Self {
+            Self(handle)
+        }
+
+        pub(super) fn handle(&self) -> usize {
+            self.0
+        }
+    }
+
     pub(super) fn acquire_provider(provider_type: u32) -> Result<ProviderContext, u32> {
         let mut handle = 0usize;
         let acquired = unsafe {
@@ -145,7 +155,7 @@ mod ffi {
 
     use crate::tr;
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::{GetLastError, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE};
     use windows_sys::Win32::Security::Cryptography::{
         CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChain,
         CertFreeCertificateContext, CertGetCertificateChain, CertGetCertificateContextProperty,
@@ -154,10 +164,13 @@ mod ffi {
         CryptEncryptMessage, CryptGetHashParam, CryptGetUserKey, CryptHashData, CryptMsgClose,
         CryptMsgGetParam, CryptMsgOpenToEncode, CryptMsgUpdate,
         CryptVerifyDetachedMessageSignature, CryptVerifyMessageSignature, AT_KEYEXCHANGE,
-        AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
-        CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT,
-        CERT_INFO, CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG,
-        CERT_NAME_SIMPLE_DISPLAY_TYPE, CMSG_CONTENT_PARAM, CMSG_DETACHED_FLAG, CMSG_SIGNED,
+        AT_SIGNATURE, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_ELEMENT,
+        CERT_CHAIN_PARA, CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS,
+        CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT, CERT_CHAIN_REVOCATION_CHECK_CHAIN,
+        CERT_CONTEXT, CERT_INFO, CERT_KEY_PROV_INFO_PROP_ID, CERT_NAME_ISSUER_FLAG,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_REVOCATION_INFO, CERT_SIMPLE_CHAIN,
+        CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_REVOKED,
+        CERT_TRUST_REVOCATION_STATUS_UNKNOWN, CMSG_CONTENT_PARAM, CMSG_DETACHED_FLAG, CMSG_SIGNED,
         CMSG_SIGNED_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO, CMSG_SIGNER_ENCODE_INFO_0,
         CRYPT_ALGORITHM_IDENTIFIER, CRYPT_DECRYPT_MESSAGE_PARA, CRYPT_ENCRYPT_MESSAGE_PARA,
         CRYPT_INTEGER_BLOB, CRYPT_KEY_PROV_INFO, CRYPT_VERIFY_MESSAGE_PARA, HCERTSTORE,
@@ -165,6 +178,16 @@ mod ffi {
     };
 
     pub(super) struct CertificateStore(HCERTSTORE);
+
+    impl CertificateStore {
+        pub(super) fn from_handle(store: HCERTSTORE) -> Self {
+            Self(store)
+        }
+
+        pub(super) fn handle(&self) -> HCERTSTORE {
+            self.0
+        }
+    }
 
     impl Drop for CertificateStore {
         fn drop(&mut self) {
@@ -174,17 +197,39 @@ mod ffi {
         }
     }
 
-    struct CertificateContext(*const CERT_CONTEXT);
+    /// Контекст сертификата; для сертификата с токена дополнительно держит его DER
+    /// и Unicode-строки контейнера, на которые ссылается `CERT_KEY_PROV_INFO`.
+    pub(super) struct CertificateContext {
+        context: *const CERT_CONTEXT,
+        _token_owner: Option<super::token::TokenCertificateDetails>,
+    }
 
     impl Drop for CertificateContext {
         fn drop(&mut self) {
-            unsafe { CertFreeCertificateContext(self.0) };
+            unsafe { CertFreeCertificateContext(self.context) };
         }
     }
 
     impl CertificateContext {
-        fn as_ptr(&self) -> *const CERT_CONTEXT {
-            self.0
+        pub(super) fn new(context: *const CERT_CONTEXT) -> Self {
+            Self {
+                context,
+                _token_owner: None,
+            }
+        }
+
+        pub(super) fn from_token(
+            context: *const CERT_CONTEXT,
+            details: super::token::TokenCertificateDetails,
+        ) -> Self {
+            Self {
+                context,
+                _token_owner: Some(details),
+            }
+        }
+
+        pub(super) fn as_ptr(&self) -> *const CERT_CONTEXT {
+            self.context
         }
     }
 
@@ -199,7 +244,7 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let certificate = find_certificate(&store, certificate_id)?;
+        let certificate = find_certificate_for_signing(&store, certificate_id)?;
         let hash_oid = hash_oid_for_certificate(certificate.as_ptr())?;
         // тот же путь, что у обычной detached-подписи файлов:
         // CryptoAPI сам хэширует `content` и кладёт хэш в messageDigest
@@ -296,7 +341,7 @@ mod ffi {
 
     /// Спецификация ключа для подписи — как в `CryptSignMessage`: сначала `AT_SIGNATURE`,
     /// затем `AT_KEYEXCHANGE`.
-    fn signing_key_spec(provider: usize) -> Result<u32, crate::signer::SignerError> {
+    pub(super) fn signing_key_spec(provider: usize) -> Result<u32, crate::signer::SignerError> {
         if container_has_key(provider, AT_SIGNATURE) {
             return Ok(AT_SIGNATURE);
         }
@@ -310,7 +355,10 @@ mod ffi {
         )))
     }
 
-    unsafe fn read_certificate(context: *const CERT_CONTEXT) -> Option<crate::signer::CertInfo> {
+    pub(super) unsafe fn read_certificate(
+        context: *const CERT_CONTEXT,
+        source: &str,
+    ) -> Option<crate::signer::CertInfo> {
         let context_ref = context.as_ref()?;
         let info = context_ref.pCertInfo.as_ref()?;
         let subject = certificate_name(context, 0);
@@ -350,7 +398,7 @@ mod ffi {
             expires_at,
             expired,
             has_private_key,
-            source: tr!("Windows · Личное хранилище", "Windows · Personal store"),
+            source: source.to_owned(),
             serial_number: hex_upper(&serial_id),
             not_before,
             not_after,
@@ -385,6 +433,7 @@ mod ffi {
     }
 
     pub(super) fn list_personal_certificates(
+        tokens: &[super::token::DetectedToken],
     ) -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
         let store = unsafe { open_personal_store() }.ok_or_else(|| {
             let code = unsafe { GetLastError() };
@@ -401,12 +450,54 @@ mod ffi {
             if current.is_null() {
                 break;
             }
-            if let Some(certificate) = unsafe { read_certificate(current) } {
+            // Сертификат мог быть зарегистрирован в Windows с ключом на токене:
+            // тогда источник показывает носитель, а не личное хранилище.
+            let source = unsafe { certificate_container(current) }
+                .and_then(|container| super::token::match_token(&container, tokens))
+                .map(|token| super::token::token_source(&token.model))
+                .unwrap_or_else(|| {
+                    tr!("Windows · Личное хранилище", "Windows · Personal store")
+                });
+            if let Some(certificate) = unsafe { read_certificate(current, &source) } {
                 certificates.push(certificate);
             }
             previous = current;
         }
         Ok(certificates)
+    }
+
+    /// Имя контейнера закрытого ключа сертификата, если свойство задано.
+    unsafe fn certificate_container(context: *const CERT_CONTEXT) -> Option<String> {
+        let mut length = 0u32;
+        let sized = CertGetCertificateContextProperty(
+            context,
+            CERT_KEY_PROV_INFO_PROP_ID,
+            ptr::null_mut(),
+            &mut length,
+        );
+        if sized == 0 || length == 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; length as usize];
+        let read = CertGetCertificateContextProperty(
+            context,
+            CERT_KEY_PROV_INFO_PROP_ID,
+            bytes.as_mut_ptr() as *mut c_void,
+            &mut length,
+        );
+        if read == 0 {
+            return None;
+        }
+        let key_info = bytes.as_ptr() as *const CRYPT_KEY_PROV_INFO;
+        let name = (*key_info).pwszContainerName;
+        if name.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *name.add(len) != 0 {
+            len += 1;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(name, len)))
     }
 
     pub(super) fn sign_cms(
@@ -435,7 +526,7 @@ mod ffi {
         let certificates = request
             .certificate_ids
             .iter()
-            .map(|id| find_certificate(&store, id))
+            .map(|id| find_certificate_for_signing(&store, id))
             .collect::<Result<Vec<_>, _>>()?;
         let hash_oids = certificates
             .iter()
@@ -486,7 +577,69 @@ mod ffi {
             })?),
             None => None,
         };
-        if request.detached && content.is_none() {
+        let (signers, failure) = verify_cms_signers(
+            &signature,
+            content.as_deref(),
+            request.detached,
+            request.check_crl,
+        )?;
+        if let Some((signer_index, code)) = failure {
+            return Ok(crate::signer::VerifyResult {
+                valid: false,
+                signature_path,
+                content_path,
+                signers,
+                message: tr!(
+                    "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
+                    "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
+                    signer_index + 1
+                ),
+            });
+        }
+        let revoked = signers
+            .iter()
+            .any(|signer| signer.revocation_status == "revoked");
+        let message = if revoked {
+            tr!(
+                "Криптографическая подпись верна, но в цепочке есть сертификат, отозванный по CRL.",
+                "The cryptographic signature is valid, but a certificate in the chain is revoked according to the CRL."
+            )
+        } else if request.check_crl {
+            tr!(
+                "Криптографические подписи всех подписантов верны; проверка отзыва по CRL выполнена.",
+                "The cryptographic signatures of all signers are valid; revocation was checked against the CRL."
+            )
+        } else {
+            tr!(
+                "Криптографические подписи всех подписантов верны.",
+                "The cryptographic signatures of all signers are valid."
+            )
+        };
+        Ok(crate::signer::VerifyResult {
+            valid: !signers.is_empty() && !revoked,
+            signature_path,
+            content_path,
+            signers,
+            message,
+        })
+    }
+
+    /// Проверка CMS по байтам: встроенные подписи PDF проверяются этой функцией.
+    ///
+    /// Возвращает подписантов и номер подписанта, не прошедшего проверку, с кодом Windows.
+    pub(super) fn verify_cms_signers(
+        signature: &[u8],
+        content: Option<&[u8]>,
+        detached: bool,
+        check_crl: bool,
+    ) -> Result<
+        (
+            Vec<crate::signer::VerifySignerInfo>,
+            Option<(u32, u32)>,
+        ),
+        crate::signer::SignerError,
+    > {
+        if detached && content.is_none() {
             return Err(crate::signer::SignerError::Signing(tr!(
                 "для отсоединённой подписи выберите исходный документ",
                 "select the source document for a detached signature"
@@ -502,7 +655,6 @@ mod ffi {
         parameters.cbSize = std::mem::size_of::<CRYPT_VERIFY_MESSAGE_PARA>() as u32;
         parameters.dwMsgAndCertEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
         let content_bytes = content
-            .as_ref()
             .map(|bytes| {
                 u32::try_from(bytes.len()).map_err(|_| {
                     crate::signer::SignerError::Signing(tr!(
@@ -516,8 +668,8 @@ mod ffi {
         let mut signer_index = 0u32;
         loop {
             let mut signer = ptr::null_mut();
-            let valid = if request.detached {
-                let bytes = content.as_ref().expect("checked above");
+            let valid = if detached {
+                let bytes = content.expect("checked above");
                 let content_ptr = bytes.as_ptr();
                 unsafe {
                     CryptVerifyDetachedMessageSignature(
@@ -535,7 +687,7 @@ mod ffi {
                 verify_attached_signer(
                     &parameters,
                     signer_index,
-                    &signature,
+                    signature,
                     signature_len,
                     &mut signer,
                 )
@@ -545,21 +697,13 @@ mod ffi {
                 if code == 0x8009_200E && signer_index > 0 {
                     break;
                 } // CRYPT_E_NO_SIGNER
-                return Ok(crate::signer::VerifyResult {
-                    valid: false, signature_path, content_path, signers,
-                    message: tr!(
-                        "Подпись подписанта №{} не прошла криптографическую проверку (код Windows 0x{code:08X}).",
-                        "The signature of signer #{} failed cryptographic verification (Windows code 0x{code:08X}).",
-                        signer_index + 1
-                    ),
-                });
+                return Ok((signers, Some((signer_index, code))));
             }
-            let signer_context = CertificateContext(signer);
+            let signer_context = CertificateContext::new(signer);
             if let Some(cert) = unsafe { signer_context.as_ptr().as_ref() }
                 .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             {
-                let (chain_trusted, chain_message) =
-                    certificate_chain_status(signer_context.as_ptr());
+                let chain = certificate_chain_status(signer_context.as_ptr(), check_crl);
                 signers.push(crate::signer::VerifySignerInfo {
                     subject: unsafe { certificate_name(signer_context.as_ptr(), 0) },
                     issuer: unsafe {
@@ -569,39 +713,197 @@ mod ffi {
                         cert.NotAfter.dwHighDateTime,
                         cert.NotAfter.dwLowDateTime,
                     ),
-                    chain_trusted,
-                    chain_message,
+                    chain_trusted: chain.trusted,
+                    chain_message: chain.message,
+                    revocation_status: chain.revocation_status.to_owned(),
+                    revocation_message: chain.revocation_message,
                 });
             }
             signer_index += 1;
             if signer_index >= 128 {
-                return Ok(crate::signer::VerifyResult {
-                    valid: false,
-                    signature_path,
-                    content_path,
-                    signers,
-                    message: tr!(
-                        "В CMS найдено больше 127 подписантов; проверка остановлена.",
-                        "More than 127 signers were found in the CMS; verification stopped."
-                    ),
-                });
+                return Err(crate::signer::SignerError::Signing(tr!(
+                    "В CMS найдено больше 127 подписантов; проверка остановлена.",
+                    "More than 127 signers were found in the CMS; verification stopped."
+                )));
             }
         }
-        Ok(crate::signer::VerifyResult {
-            valid: !signers.is_empty(),
-            signature_path,
-            content_path,
-            signers,
-            message: tr!(
-                "Криптографические подписи всех подписантов верны.",
-                "The cryptographic signatures of all signers are valid."
-            ),
-        })
+        Ok((signers, None))
     }
 
-    fn certificate_chain_status(certificate: *const CERT_CONTEXT) -> (bool, String) {
+    /// Итог проверки цепочки: доверие Windows и отдельный статус отзыва по CRL.
+    struct ChainStatus {
+        trusted: bool,
+        message: String,
+        revocation_status: &'static str,
+        revocation_message: String,
+    }
+
+    /// Статус отзыва по CRL: элемент 0 — сертификат подписанта, отзыв любого элемента
+    /// цепочки делает подпись недействительной.
+    fn revocation_status(chain: *const CERT_CHAIN_CONTEXT) -> (&'static str, String) {
+        let context = unsafe { &*chain };
+        if context.cChain == 0 || context.rgpChain.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул цепочку для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return a chain for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let simple = unsafe { *context.rgpChain };
+        if simple.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул цепочку для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return a chain for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let simple: &CERT_SIMPLE_CHAIN = unsafe { &*simple };
+        if simple.cElement == 0 || simple.rgpElement.is_null() {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не вернул элементы цепочки для проверки CRL; статус отзыва неизвестен.",
+                    "Windows did not return chain elements for the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        let mut revoked = false;
+        let mut leaf_revoked = false;
+        let mut has_leaf_info = false;
+        let mut leaf_result = None;
+        let mut leaf_unknown = false;
+        let mut leaf_revocation_date = None;
+        for index in 0..simple.cElement as usize {
+            let element = unsafe { *simple.rgpElement.add(index) };
+            if element.is_null() {
+                continue;
+            }
+            let element: &CERT_CHAIN_ELEMENT = unsafe { &*element };
+            let element_revoked =
+                element.TrustStatus.dwErrorStatus & CERT_TRUST_IS_REVOKED != 0;
+            revoked |= element_revoked;
+            if index != 0 {
+                continue;
+            }
+            leaf_revoked = element_revoked;
+            let info = unsafe { element.pRevocationInfo.as_ref() };
+            has_leaf_info = info.is_some();
+            if let Some(info) = info {
+                let info: &CERT_REVOCATION_INFO = info;
+                leaf_result = Some(info.dwRevocationResult);
+                leaf_unknown = element.TrustStatus.dwErrorStatus
+                    & (CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION)
+                    != 0;
+                if let Some(entry) = unsafe { info.pCrlInfo.as_ref() }.and_then(|crl| unsafe {
+                    crl.pCrlEntry.as_ref()
+                }) {
+                    leaf_revocation_date = Some(super::filetime_to_date(
+                        entry.RevocationDate.dwHighDateTime,
+                        entry.RevocationDate.dwLowDateTime,
+                    ));
+                }
+            }
+        }
+        let code = leaf_result.unwrap_or(0);
+        if revoked {
+            if leaf_revoked {
+                return match leaf_revocation_date {
+                    Some(date) => (
+                        "revoked",
+                        tr!(
+                            "Сертификат подписанта отозван по CRL (дата отзыва {date}).",
+                            "The signer certificate is revoked by the CRL (revocation date {date})."
+                        ),
+                    ),
+                    None => (
+                        "revoked",
+                        tr!(
+                            "Сертификат подписанта отозван по CRL.",
+                            "The signer certificate is revoked by the CRL."
+                        ),
+                    ),
+                };
+            }
+            return (
+                "revoked",
+                tr!(
+                    "В цепочке сертификатов есть отозванный по CRL сертификат.",
+                    "A certificate in the chain is revoked by the CRL."
+                ),
+            );
+        }
+        if !has_leaf_info {
+            return (
+                "unknown",
+                tr!(
+                    "Windows не выполнил проверку CRL для сертификата; статус отзыва неизвестен.",
+                    "Windows did not perform a CRL check for the certificate; the revocation status is unknown."
+                ),
+            );
+        }
+        if leaf_unknown || leaf_result != Some(0) {
+            if leaf_result == Some(CRYPT_E_REVOCATION_OFFLINE as u32) {
+                return (
+                    "unknown",
+                    tr!(
+                        "CRL недоступна или устарела; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "The CRL is unavailable or stale; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            if leaf_result == Some(CRYPT_E_NO_REVOCATION_CHECK as u32) {
+                return (
+                    "unknown",
+                    tr!(
+                        "У сертификата нет доступной точки распространения CRL; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "The certificate has no reachable CRL distribution point; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            if leaf_result != Some(0) {
+                return (
+                    "unknown",
+                    tr!(
+                        "Не удалось проверить CRL; статус отзыва неизвестен (код Windows 0x{code:08X}).",
+                        "Could not check the CRL; the revocation status is unknown (Windows code 0x{code:08X})."
+                    ),
+                );
+            }
+            return (
+                "unknown",
+                tr!(
+                    "Windows не подтвердил проверку CRL; статус отзыва неизвестен.",
+                    "Windows did not confirm the CRL check; the revocation status is unknown."
+                ),
+            );
+        }
+        (
+            "good",
+            tr!(
+                "По CRL сертификат не отозван.",
+                "The certificate is not revoked according to the CRL."
+            ),
+        )
+    }
+
+    fn certificate_chain_status(
+        certificate: *const CERT_CONTEXT,
+        check_revocation: bool,
+    ) -> ChainStatus {
         let mut chain_parameters = CERT_CHAIN_PARA::default();
         chain_parameters.cbSize = std::mem::size_of::<CERT_CHAIN_PARA>() as u32;
+        chain_parameters.dwUrlRetrievalTimeout = if check_revocation { 20_000 } else { 0 };
+        // Без флагов отзыва цепочка строится только по локальному кэшу; с ними Windows
+        // скачивает CRL по адресам из сертификата, поэтому вызову нужна сеть.
+        let flags = if check_revocation {
+            CERT_CHAIN_REVOCATION_CHECK_CHAIN | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT
+        } else {
+            CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL
+        };
         let mut chain: *mut CERT_CHAIN_CONTEXT = ptr::null_mut();
         let built = unsafe {
             CertGetCertificateChain(
@@ -610,20 +912,32 @@ mod ffi {
                 ptr::null(),
                 ptr::null_mut(),
                 &chain_parameters,
-                CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL,
+                flags,
                 ptr::null(),
                 &mut chain,
             )
         };
         if built == 0 || chain.is_null() {
             let code = unsafe { GetLastError() };
-            return (
-                false,
-                tr!(
+            return ChainStatus {
+                trusted: false,
+                message: tr!(
                     "Windows не смог построить цепочку сертификата (0x{code:08X}).",
                     "Windows could not build the certificate chain (0x{code:08X})."
                 ),
-            );
+                revocation_status: if check_revocation { "unknown" } else { "notChecked" },
+                revocation_message: if check_revocation {
+                    tr!(
+                        "Не удалось проверить CRL: цепочка не построена (код Windows 0x{code:08X}).",
+                        "Could not check the CRL: the chain was not built (Windows code 0x{code:08X})."
+                    )
+                } else {
+                    tr!(
+                        "Проверка отзыва по CRL не выполнялась.",
+                        "Revocation was not checked against a CRL."
+                    )
+                },
+            };
         }
         let mut policy_parameters = CERT_CHAIN_POLICY_PARA::default();
         policy_parameters.cbSize = std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32;
@@ -637,17 +951,49 @@ mod ffi {
                 &mut policy_status,
             )
         };
-        unsafe { CertFreeCertificateChain(chain) };
-        if checked != 0 && policy_status.dwError == 0 {
-            (
-                true,
-                tr!(
-                    "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.",
-                    "The trust chain was confirmed by Windows; revocation was not checked."
-                ),
-            )
+        // Статус отзыва читается только из живой цепочки; ниже она освобождается.
+        let revocation = if check_revocation {
+            Some(revocation_status(chain))
         } else {
-            (false, tr!("Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.", "Windows did not confirm the trust chain (code 0x{:08X}); revocation was not checked.", policy_status.dwError))
+            None
+        };
+        unsafe { CertFreeCertificateChain(chain) };
+        let trusted = checked != 0 && policy_status.dwError == 0;
+        let message = match (check_revocation, trusted) {
+            (false, true) => tr!(
+                "Цепочка доверия подтверждена Windows; проверка отзыва не выполнялась.",
+                "The trust chain was confirmed by Windows; revocation was not checked."
+            ),
+            (false, false) => tr!(
+                "Windows не подтвердил цепочку доверия (код 0x{:08X}); проверка отзыва не выполнялась.",
+                "Windows did not confirm the trust chain (code 0x{:08X}); revocation was not checked.",
+                policy_status.dwError
+            ),
+            (true, true) => tr!(
+                "Цепочка доверия подтверждена Windows; статус отзыва проверен по CRL.",
+                "The trust chain was confirmed by Windows; revocation status was checked against the CRL."
+            ),
+            (true, false) => tr!(
+                "Windows не подтвердил цепочку доверия (код 0x{:08X}); статус отзыва проверен по CRL.",
+                "Windows did not confirm the trust chain (code 0x{:08X}); revocation status was checked against the CRL.",
+                policy_status.dwError
+            ),
+        };
+        let (revocation_status, revocation_message) = match revocation {
+            Some((status, message)) => (status, message),
+            None => (
+                "notChecked",
+                tr!(
+                    "Проверка отзыва по CRL не выполнялась.",
+                    "Revocation was not checked against a CRL."
+                ),
+            ),
+        };
+        ChainStatus {
+            trusted,
+            message,
+            revocation_status,
+            revocation_message,
         }
     }
 
@@ -731,14 +1077,39 @@ mod ffi {
                 break;
             }
             if unsafe { certificate_id(current) }.as_deref() == Some(id) {
-                return Ok(CertificateContext(current));
+                return Ok(CertificateContext::new(current));
             }
             previous = current;
         }
-        Err(crate::signer::SignerError::Signing(tr!(
-            "выбранный сертификат больше не найден в Windows Personal",
-            "the selected certificate is no longer present in the Windows Personal store"
-        )))
+        Err(certificate_not_found())
+    }
+
+    /// Сертификат для подписи: сначала контейнеры обнаруженных токенов, затем
+    /// `CurrentUser\MY`, затем повторное сканирование контейнеров (если список
+    /// сертификатов ещё не открывался в этом запуске).
+    fn find_certificate_for_signing(
+        store: &CertificateStore,
+        id: &str,
+    ) -> Result<CertificateContext, crate::signer::SignerError> {
+        for details in super::token::details_for_certificate(id) {
+            if let Ok(context) = details.to_context() {
+                return Ok(context);
+            }
+        }
+        if let Ok(context) = find_certificate(store, id) {
+            return Ok(context);
+        }
+        if let Some(details) = super::token::find_details_by_id(id) {
+            return details.to_context();
+        }
+        Err(certificate_not_found())
+    }
+
+    fn certificate_not_found() -> crate::signer::SignerError {
+        crate::signer::SignerError::Signing(tr!(
+            "выбранный сертификат больше не найден ни в Windows Personal, ни в контейнерах токена",
+            "the selected certificate is no longer present in Windows Personal or in the token containers"
+        ))
     }
 
     unsafe fn certificate_id(context: *const CERT_CONTEXT) -> Option<String> {
@@ -756,13 +1127,6 @@ mod ffi {
         Some(format!("{issuer}:{serial_id}"))
     }
 
-    fn find_certificate_by_id(
-        store: &CertificateStore,
-        id: &str,
-    ) -> Result<CertificateContext, crate::signer::SignerError> {
-        find_certificate(store, id)
-    }
-
     pub(super) fn pdf_certificate_public_key_oid(
         id: &str,
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
@@ -773,7 +1137,7 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let certificate = find_certificate_by_id(&store, id)?;
+        let certificate = find_certificate_for_signing(&store, id)?;
         let info = unsafe { certificate.as_ptr().as_ref() }
             .and_then(|context| unsafe { context.pCertInfo.as_ref() })
             .ok_or_else(|| {
@@ -1087,7 +1451,7 @@ mod ffi {
         let recipients = request
             .certificate_ids
             .iter()
-            .map(|id| find_certificate(&store, id))
+            .map(|id| find_certificate_for_signing(&store, id))
             .collect::<Result<Vec<_>, _>>()?;
         let content_encryption_oid = content_encryption_oid_for_certificates(&recipients)?;
         let mut output = encrypt_message(&recipients, &content_encryption_oid, &input)?;
@@ -1123,7 +1487,11 @@ mod ffi {
                 "Windows code 0x{code:08X}"
             ))
         })?;
-        let output = decrypt_message(&store, &input)?;
+        // Получатель мог быть выбран сертификатом токена: без хранилищ токенов
+        // расшифрование своим ключом было бы недоступно.
+        let mut stores = vec![store];
+        stores.extend(super::token::open_all_token_stores());
+        let output = decrypt_message(&stores, &input)?;
         let final_path = write_result(&request.output_path, &output, ResultFileKind::Decryption)?;
         Ok(crate::signer::DecryptResult {
             output_path: final_path,
@@ -1239,15 +1607,15 @@ mod ffi {
     }
 
     fn decrypt_message(
-        store: &CertificateStore,
+        stores: &[CertificateStore],
         encrypted: &[u8],
     ) -> Result<Vec<u8>, crate::signer::SignerError> {
         let mut parameters = CRYPT_DECRYPT_MESSAGE_PARA::default();
         parameters.cbSize = std::mem::size_of::<CRYPT_DECRYPT_MESSAGE_PARA>() as u32;
         parameters.dwMsgAndCertEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
-        let mut store_handle = store.0;
-        parameters.cCertStore = 1;
-        parameters.rghCertStore = &mut store_handle;
+        let mut handles = stores.iter().map(CertificateStore::handle).collect::<Vec<_>>();
+        parameters.cCertStore = u32::try_from(handles.len()).unwrap_or(u32::MAX);
+        parameters.rghCertStore = handles.as_mut_ptr();
         let encrypted_length = u32::try_from(encrypted.len()).map_err(|_| {
             crate::signer::SignerError::Decryption(tr!(
                 "зашифрованный файл слишком велик для CryptoAPI",
@@ -1446,6 +1814,7 @@ pub fn probe() -> crate::signer::CspStatus {
             // встроена в носитель ключа, а окончательную проверку даёт сама операция подписи.
             signing_available: true,
             license_available,
+            license_supported: true,
             provider_type: Some(provider_type),
             version: csp_version,
             message: tr!(
@@ -1462,7 +1831,82 @@ pub fn probe() -> crate::signer::CspStatus {
 }
 
 pub fn list_certificates() -> Result<Vec<crate::signer::CertInfo>, crate::signer::SignerError> {
-    ffi::list_personal_certificates()
+    let tokens = match token::detect_tokens() {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            tracing::warn!(%error, "Rutoken detection failed");
+            Vec::new()
+        }
+    };
+    let mut certificates = ffi::list_personal_certificates(&tokens)?;
+    let collected = token::collect_token_certificates(&tokens);
+    let details = merge_token_certificates(&mut certificates, collected);
+    token::replace_token_details(details);
+    Ok(certificates)
+}
+
+/// Физические токены для счётчика в «О программе».
+///
+/// Ошибка обнаружения не ломает интерфейс: счётчик показывает 0, причина идёт в лог.
+pub fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    match token::detect_tokens() {
+        Ok(tokens) => tokens
+            .into_iter()
+            .map(|token| crate::signer::TokenInfo {
+                reader: token.reader,
+                model: token.model,
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "Rutoken detection failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Добавляет сертификаты контейнеров токенов в список личного хранилища.
+///
+/// Совпадение по `id` не создаёт вторую строку: у существующего сертификата
+/// обновляется источник и объединяется признак закрытого ключа. Возвращает
+/// реестр деталей контейнеров для подписи.
+fn merge_token_certificates(
+    certificates: &mut Vec<crate::signer::CertInfo>,
+    collected: Vec<(crate::signer::CertInfo, Option<token::TokenCertificateDetails>)>,
+) -> std::collections::HashMap<String, Vec<token::TokenCertificateDetails>> {
+    let mut details: std::collections::HashMap<String, Vec<token::TokenCertificateDetails>> =
+        std::collections::HashMap::new();
+    for (info, container) in collected {
+        let id = info.id.clone();
+        match certificates
+            .iter_mut()
+            .find(|certificate| certificate.id == info.id)
+        {
+            Some(existing) => {
+                existing.source = info.source;
+                existing.has_private_key |= info.has_private_key;
+            }
+            None => certificates.push(info),
+        }
+        if let Some(container) = container {
+            details.entry(id).or_default().push(container);
+        }
+    }
+    details
+}
+
+/// Детали контейнеров сертификата для CAdES: из реестра, а при его отсутствии —
+/// повторным перечислением контейнеров токенов.
+pub(super) fn token_details(id: &str) -> Vec<token::TokenCertificateDetails> {
+    let details = token::details_for_certificate(id);
+    if details.is_empty() {
+        token::find_details_by_id(id).into_iter().collect()
+    } else {
+        details
+    }
+}
+
+pub(super) fn has_token_details(id: &str) -> bool {
+    !token_details(id).is_empty()
 }
 
 /// Подпись подписываемого диапазона PDF.
@@ -1494,6 +1938,22 @@ pub fn verify_signature(
     request: crate::signer::VerifyRequest,
 ) -> Result<crate::signer::VerifyResult, crate::signer::SignerError> {
     ffi::verify_cms(request)
+}
+
+/// Проверка CMS по байтам: используется встроенными подписями PDF.
+pub fn verify_cms_signers(
+    signature: &[u8],
+    content: Option<&[u8]>,
+    detached: bool,
+    check_crl: bool,
+) -> Result<
+    (
+        Vec<crate::signer::VerifySignerInfo>,
+        Option<(u32, u32)>,
+    ),
+    crate::signer::SignerError,
+> {
+    ffi::verify_cms_signers(signature, content, detached, check_crl)
 }
 
 pub fn encrypt_file(
@@ -1543,4 +2003,64 @@ fn filetime_to_date(high: u32, low: u32) -> String {
         year += 1;
     }
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn certificate(id: &str, source: &str, has_private_key: bool) -> crate::signer::CertInfo {
+        crate::signer::CertInfo {
+            id: id.to_owned(),
+            subject: format!("CN={id}"),
+            issuer: "CN=CA".to_owned(),
+            expires_at: "2030-01-01".to_owned(),
+            expired: false,
+            has_private_key,
+            source: source.to_owned(),
+            serial_number: "01".to_owned(),
+            not_before: "2020-01-01".to_owned(),
+            not_after: "2030-01-01".to_owned(),
+            owner_name: id.to_owned(),
+        }
+    }
+
+    fn details(container: &str) -> token::TokenCertificateDetails {
+        token::TokenCertificateDetails {
+            der: vec![0x30, 0x00],
+            container: container.to_owned(),
+            provider_name: "Crypto-Pro GOST R 34.10-2012 Cryptographic Service Provider".to_owned(),
+            provider_type: 80,
+            key_spec: 1,
+        }
+    }
+
+    #[test]
+    fn token_certificate_replaces_source_without_adding_a_duplicate() {
+        let mut certificates = vec![certificate("CN=CA:01", "Windows · Личное хранилище", false)];
+        let collected = vec![(
+            certificate("CN=CA:01", "Windows · Личное хранилище (Рутокен Lite)", true),
+            Some(details("\\\\.\\Aktiv Rutoken lite 0\\a")),
+        )];
+        let registry = merge_token_certificates(&mut certificates, collected);
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].source, "Windows · Личное хранилище (Рутокен Lite)");
+        assert!(certificates[0].has_private_key);
+        assert_eq!(registry["CN=CA:01"].len(), 1);
+    }
+
+    #[test]
+    fn token_certificate_is_appended_when_the_store_does_not_have_it() {
+        let mut certificates = vec![certificate("CN=CA:02", "Windows · Личное хранилище", true)];
+        let collected = vec![(
+            certificate("CN=CA:03", "Windows · Личное хранилище (Рутокен ECP)", true),
+            Some(details("\\\\.\\Aktiv Rutoken ECP 0\\b")),
+        )];
+        let registry = merge_token_certificates(&mut certificates, collected);
+        assert_eq!(certificates.len(), 2);
+        assert_eq!(certificates[1].id, "CN=CA:03");
+        assert_eq!(certificates[0].source, "Windows · Личное хранилище");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry["CN=CA:03"][0].container, "\\\\.\\Aktiv Rutoken ECP 0\\b");
+    }
 }

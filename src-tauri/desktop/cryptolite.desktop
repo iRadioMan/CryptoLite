@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=Utility;Security;
+Comment=Подписание и шифрование документов через КриптоПро CSP
+Exec=cryptolite
+StartupWMClass=cryptolite
+Icon=cryptolite
+Name=КриптоЛайт
+Name[en]=CryptoLite
+Terminal=false
+Type=Application

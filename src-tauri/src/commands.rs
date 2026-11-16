@@ -282,6 +282,13 @@ pub async fn list_certs() -> Result<Vec<CertInfo>, String> {
 }
 
 #[tauri::command]
+pub async fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    tokio::task::spawn_blocking(crate::signer::native::list_tokens)
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 pub async fn sign_file(request: SignRequest) -> Result<SignResult, String> {
     tokio::task::spawn_blocking(move || crate::signer::native::NativeSigner.sign_file(request))
         .await
@@ -454,6 +461,23 @@ pub async fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, St
             )
         })?
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn verify_pdf(
+    request: crate::signer::PdfVerifyRequest,
+) -> Result<crate::signer::PdfVerifyResult, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::signer::pades::verify_document(&request.path, request.check_crl)
+    })
+    .await
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить проверку подписей PDF: {error}",
+            "Could not start PDF signature verification: {error}"
+        )
+    })?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

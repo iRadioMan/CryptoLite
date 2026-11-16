@@ -3,7 +3,7 @@ use crate::signer::{
     CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult, SignRequest,
     SignResult, Signer, SignerError, VerifyRequest, VerifyResult,
 };
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use crate::tr;
 
 pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerError> {
@@ -11,12 +11,47 @@ pub fn verify_signature(request: VerifyRequest) -> Result<VerifyResult, SignerEr
     {
         return super::csp_native::windows::verify_signature(request);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        return super::csp_native::linux::verify_signature(request);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = request;
         Err(SignerError::Signing(tr!(
-            "Проверка CMS пока реализована только для Windows",
-            "CMS verification is currently implemented only for Windows"
+            "Проверка CMS пока реализована только для Windows и Linux",
+            "CMS verification is currently implemented only for Windows and Linux"
+        )))
+    }
+}
+
+/// Проверка CMS по байтам: используется встроенными подписями PDF.
+///
+/// Возвращает подписантов и номер подписанта, не прошедшего проверку, с кодом ошибки CSP.
+pub fn verify_cms_signers(
+    signature: &[u8],
+    content: Option<&[u8]>,
+    detached: bool,
+    check_crl: bool,
+) -> Result<(Vec<crate::signer::VerifySignerInfo>, Option<(u32, u32)>), SignerError> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::verify_cms_signers(
+            signature, content, detached, check_crl,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return super::csp_native::linux::verify_cms_signers(
+            signature, content, detached, check_crl,
+        );
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (signature, content, detached, check_crl);
+        Err(SignerError::Signing(tr!(
+            "Проверка CMS пока реализована только для Windows и Linux",
+            "CMS verification is currently implemented only for Windows and Linux"
         )))
     }
 }
@@ -26,12 +61,16 @@ pub fn encrypt_file(request: EncryptRequest) -> Result<EncryptResult, SignerErro
     {
         return super::csp_native::windows::encrypt_file(request);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        return super::csp_native::linux::encrypt_file(request);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = request;
         Err(SignerError::Encryption(tr!(
-            "Шифрование пока реализовано только для Windows",
-            "Encryption is currently implemented only for Windows"
+            "Шифрование пока реализовано только для Windows и Linux",
+            "Encryption is currently implemented only for Windows and Linux"
         )))
     }
 }
@@ -41,13 +80,36 @@ pub fn decrypt_file(request: DecryptRequest) -> Result<DecryptResult, SignerErro
     {
         return super::csp_native::windows::decrypt_file(request);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        return super::csp_native::linux::decrypt_file(request);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = request;
         Err(SignerError::Decryption(tr!(
-            "Расшифрование пока реализовано только для Windows",
-            "Decryption is currently implemented only for Windows"
+            "Расшифрование пока реализовано только для Windows и Linux",
+            "Decryption is currently implemented only for Windows and Linux"
         )))
+    }
+}
+
+/// Физические токены (Рутокен), обнаруженные CryptoPro CSP.
+///
+/// Ошибка обнаружения не пробрасывается в интерфейс: счётчик в «О программе»
+/// показывает 0, а причина пишется в лог.
+pub fn list_tokens() -> Vec<crate::signer::TokenInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::csp_native::windows::list_tokens();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return super::csp_native::linux::list_tokens();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Vec::new()
     }
 }
 
@@ -62,47 +124,7 @@ impl Signer for NativeSigner {
 
         #[cfg(target_os = "linux")]
         {
-            let mut directories = vec![
-                std::path::PathBuf::from("/opt/cprocsp/lib/amd64"),
-                std::path::PathBuf::from("/usr/lib64"),
-                std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu"),
-            ];
-            if let Some(directory) = std::env::var_os("CPSIGNER_CSP_LIB_DIR") {
-                directories.insert(0, std::path::PathBuf::from(directory));
-            }
-            let names = [
-                "libcapi20.so",
-                "libcapi20.so.4",
-                "libcapi10.so",
-                "libcades.so",
-                "libcades.so.2",
-            ];
-            let found = directories
-                .iter()
-                .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-                .filter(|path| path.is_file())
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>();
-            if found.is_empty() {
-                CspStatus::unavailable(tr!(
-                    "Библиотеки КриптоПро CSP не найдены. Для проверки нестандартного каталога задайте CPSIGNER_CSP_LIB_DIR.",
-                    "CryptoPro CSP libraries not found. Set CPSIGNER_CSP_LIB_DIR to check a non-standard directory."
-                ))
-            } else {
-                CspStatus {
-                    available: true,
-                    cades_available: found.iter().any(|path| path.contains("cades")),
-                    signing_available: false,
-                    license_available: false,
-                    provider_type: None,
-                    version: None,
-                    message: tr!(
-                        "Обнаружены библиотеки, но интеграция API ещё не подключена: {}",
-                        "Libraries were found, but the API integration is not connected yet: {}",
-                        found.join(", ")
-                    ),
-                }
-            }
+            return super::csp_native::linux::probe();
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -122,7 +144,7 @@ impl Signer for NativeSigner {
 
         #[cfg(target_os = "linux")]
         {
-            Err(crate::signer::SignerError::CertificateEnumerationUnsupported)
+            super::csp_native::linux::list_certificates()
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -134,18 +156,26 @@ impl Signer for NativeSigner {
     fn sign_file(&self, request: SignRequest) -> Result<SignResult, SignerError> {
         #[cfg(target_os = "windows")]
         {
-            if request.standard == "cades-bes" {
+            if matches!(request.standard.as_str(), "cades-bes" | "cades-t") {
                 return super::csp_native::cadescom::sign_file(request);
             }
             super::csp_native::windows::sign_file(request)
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        {
+            if matches!(request.standard.as_str(), "cades-bes" | "cades-t") {
+                return super::csp_native::linux::cryptcp::sign_file(request);
+            }
+            super::csp_native::linux::sign_file(request)
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let _ = request;
             Err(SignerError::Signing(tr!(
-                "CMS-подписание пока реализовано только для Windows",
-                "CMS signing is currently implemented only for Windows"
+                "CMS-подписание пока реализовано только для Windows и Linux",
+                "CMS signing is currently implemented only for Windows and Linux"
             )))
         }
     }
