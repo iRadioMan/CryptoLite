@@ -1,6 +1,12 @@
 # CryptoLite — handoff
 
-## Последняя сессия: Linux-бэкенд и Astra Linux Special Edition 1.8 (2026-11-13)
+## Последняя сессия: серые выпадающие списки в Linux (2026-11-16)
+
+- Причина: WebKitGTK рисует `<select>` нативным GTK-виджетом (`appearance: menulist`) и игнорирует авторский `background-color`; фон берётся из темы GTK (Adwaita — серый), поэтому все списки выглядели неактивными. В WebView2 (Windows) это обычный Chromium, и CSS применялся.
+- Исправление в `src/style.css`: для `.field select` добавлены `-webkit-appearance:none; appearance:none`, стрелка нарисована data-URI SVG (`#656d79` в светлой теме, `#9aa2ae` в `:root.dark`), `padding-right:34px`; добавлен `.field select:disabled` с `--surface-hover`/`--text-3`, иначе после отключения нативной отрисовки disabled-состояние стало бы незаметным.
+- Проверено: `npm run build` (vue-tsc + vite) проходит; в живом WebKit-движке computed style даёт `appearance:none`, `background-color: rgb(255,255,255)`, SVG-стрелку; скриншоты светлой и тёмной темы — списки белые/тёмные, стрелка видна.
+
+## Предыдущая сессия: Linux-бэкенд и Astra Linux Special Edition 1.8 (2026-11-13)
 
 - Коммит `ff10e72 Add ALSE 1.8 support`, версия 0.7.11. Linux-криптография повторяет Windows-ветку на CryptoAPI 2.0 КриптоПро (`libcapi20`/`libcapi10`), CAdES-BES/T — через штатный `cryptcp`, потому что аналога CAdESCOM и вызываемого API `libcades` на Linux нет. Windows-ветка не менялась, кроме `csp_native::platform` и `license_supported: true`; `digest` перенесён из `windows` в `csp_native`.
 - `csp_native/mod.rs`: `pub use windows as platform` / `linux as platform`; `native.rs` направляет `csp_status`, `list_certs`, `sign_file` (CAdES → `linux::cryptcp`, CMS → `linux`), verify/encrypt/decrypt/list_tokens в Linux-модуль. Для прочих ОС тексты теперь «только для Windows и Linux».
