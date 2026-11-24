@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 mod csp_native;
+pub mod document;
 mod embed_font;
 mod error;
 mod model;
@@ -10,11 +11,11 @@ pub mod pades;
 pub mod pdf_layer;
 pub use error::SignerError;
 pub use model::{
-    AppSettings, CertInfo, CspStatus, DecryptRequest, DecryptResult, EncryptRequest, EncryptResult,
-    PdfSignFinishRequest, PdfSignPrepareRequest, PdfSignPrepareResult, PdfSignRequest,
-    PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyRequest, PdfVerifyResult,
-    PageRotation, SignBatchItemResult, SignRequest, SignResult, TokenInfo, VerifyRequest,
-    VerifyResult, VerifySignerInfo,
+    AppSettings, CertInfo, ConvertedPdf, CspStatus, DecryptRequest, DecryptResult, EncryptRequest,
+    EncryptResult, PdfSignFinishRequest, PdfSignPrepareRequest, PdfSignPrepareResult,
+    PdfSignRequest, PdfSignatureInfo, PdfSignaturePayload, PdfStampSpec, PdfVerifyRequest,
+    PdfVerifyResult, PageRotation, SignBatchItemResult, SignRequest, SignResult, TokenInfo,
+    VerifyRequest, VerifyResult, VerifySignerInfo,
 };
 
 pub trait Signer: Send + Sync {

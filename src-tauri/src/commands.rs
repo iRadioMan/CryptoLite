@@ -389,6 +389,22 @@ pub async fn filter_file_paths(paths: Vec<String>) -> Result<Vec<String>, String
 }
 
 #[tauri::command]
+pub async fn convert_document_to_pdf(
+    input_path: String,
+) -> Result<crate::signer::ConvertedPdf, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::signer::document::convert_to_pdf(std::path::Path::new(&input_path))
+    })
+    .await
+    .map_err(|error| {
+        tr!(
+            "Не удалось запустить преобразование в PDF: {error}",
+            "Could not start PDF conversion: {error}"
+        )
+    })?
+}
+
+#[tauri::command]
 pub async fn sign_pdf(request: crate::signer::PdfSignRequest) -> Result<SignResult, String> {
     tokio::task::spawn_blocking(move || {
         crate::signer::pades::sign_document(

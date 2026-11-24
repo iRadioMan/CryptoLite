@@ -25,6 +25,7 @@ type VerifyResult = { valid: boolean; signaturePath: string; contentPath: string
 type PdfSignatureInfo = { fieldName: string; page: number | null; leftMm: number | null; topMm: number | null; widthMm: number | null; heightMm: number | null; subFilter: string; signedAt: string; coversDocument: boolean; valid: boolean; message: string; signers: VerifySigner[] };
 type PdfVerifyResult = { signatures: PdfSignatureInfo[]; validCount: number; signerCount: number; pdfBase64: string; message: string };
 type CryptoResult = { outputPath: string; bytesWritten: number };
+type ConvertedPdf = { pdfPath: string; pdfBase64: string; bytes: number };
 const { t, locale } = useI18n();
 const systemLanguage = navigator.language.toLowerCase().startsWith('ru') ? 'ru' : 'en';
 const page = ref('sign');
@@ -87,16 +88,25 @@ const cryptoReportOpen = ref(false);
 const multiCertConfirmMode = ref<'signing' | 'encryption' | null>(null);
 const multiCertConfirmNames = ref<string[]>([]);
 const stampDocumentPath = ref('');
+/** PDF, который реально подписывается: исходный PDF или результат конвертации DOC/DOCX. */
+const stampPdfPath = ref('');
 const stampPdfBase64 = ref('');
 const stampRects = ref<StampRect[]>([]);
 /** Абсолютные повороты страниц из предпросмотра: попадут в PDF при подписании. */
 const stampPageRotations = ref<Record<number, number>>({});
 const stampOpen = ref(false);
 const stampLoading = ref(false);
+/** В модальном окне идёт преобразование DOC/DOCX в PDF. */
+const stampConverting = ref(false);
 const stampMessage = ref('');
 const stampPosition = ref('');
 const stampPdfBytes = ref(0);
+const conversionConfirmOpen = ref(false);
+const conversionConfirmName = ref('');
+/** Открытие редактора: поздние ответы конвертации не должны менять новое состояние. */
+let stampLoadToken = 0;
 let multiCertConfirmResolver: ((confirmed: boolean) => void) | null = null;
+let conversionConfirmResolver: ((confirmed: boolean) => void) | null = null;
 
 function askMultiCertificateConfirmation(mode: 'signing' | 'encryption', ids: string[]): Promise<boolean> {
   if (ids.length < 2) return Promise.resolve(true);
@@ -110,6 +120,21 @@ function settleMultiCertConfirm(confirmed: boolean) {
   multiCertConfirmResolver = null;
   multiCertConfirmMode.value = null;
   multiCertConfirmNames.value = [];
+  resolver?.(confirmed);
+}
+/** DOC/DOCX подтверждается отдельно: рядом появится PDF, исходник не меняется. */
+function askConversionConfirmation(name: string): Promise<boolean> {
+  if (!isStampConvertible(name)) return Promise.resolve(true);
+  settleConversionConfirm(false);
+  conversionConfirmName.value = name;
+  conversionConfirmOpen.value = true;
+  return new Promise<boolean>((resolve) => { conversionConfirmResolver = resolve; });
+}
+function settleConversionConfirm(confirmed: boolean) {
+  const resolver = conversionConfirmResolver;
+  conversionConfirmResolver = null;
+  conversionConfirmOpen.value = false;
+  conversionConfirmName.value = '';
   resolver?.(confirmed);
 }
 const cryptoReportItems = ref<{ inputPath: string; outputPath: string; success: boolean; error: string | null }[]>([]);
@@ -136,6 +161,7 @@ const stampSignerLabels = computed<Record<string, string>>(() => Object.fromEntr
 ));
 const stampDocument = computed(() => documents.value.find((document) => document.path === stampDocumentPath.value) ?? null);
 const stampReady = computed(() => !!stampDocument
+  && !!stampPdfPath.value
   && stampRects.value.length === selectedCertificates.value.length
   && stampRects.value.every((rect) => selectedCertificates.value.filter((certificate) => certificate.id === rect.certificateId).length === 1));
 const defaultCertificateNames = computed(() => certificates.value.filter((certificate) => appSettings.value.defaultCertificateIds.includes(certificate.id) && certificateMatches(certificate, 'defaults')).map((certificate) => certificate.subject));
@@ -143,9 +169,8 @@ const canSign = computed(() => {
   if (!status.value.available || !selectedCount.value || signingInProgress.value) return false;
   if (!selectedCertificates.value.length) return false;
   if (stampMode.value) {
-    // Встроенная подпись PDF: CryptoAPI, один документ, по области на каждого подписанта.
-    const pdfDocuments = documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name));
-    return status.value.signingAvailable && pdfDocuments.length === 1;
+    // Встроенная подпись PDF: один документ (PDF, DOC или DOCX), по области на каждого подписанта.
+    return status.value.signingAvailable && stampCandidates.value.length === 1;
   }
   if (standard.value === 'cades-bes' || standard.value === 'cades-t') {
     return status.value.cadesAvailable
@@ -518,26 +543,56 @@ function base64FromBytes(contents: Uint8Array): string {
 }
 
 async function openStampEditor(file: Doc) {
+  const token = ++stampLoadToken;
   stampDocumentPath.value = file.path;
+  stampPdfPath.value = '';
   stampPdfBase64.value = '';
   stampPdfBytes.value = 0;
   stampRects.value = [];
   stampPageRotations.value = {};
   stampOpen.value = true;
   stampLoading.value = true;
+  stampConverting.value = isStampConvertible(file.name);
   stampMessage.value = '';
   try {
-    const contents = await readFile(file.path);
-    stampPdfBytes.value = contents.byteLength;
-    stampPdfBase64.value = base64FromBytes(contents);
+    if (isStampConvertible(file.name)) {
+      const converted = await invoke<ConvertedPdf>('convert_document_to_pdf', { inputPath: file.path });
+      if (token !== stampLoadToken || !stampOpen.value) return;
+      stampPdfPath.value = converted.pdfPath;
+      stampPdfBytes.value = converted.bytes;
+      stampPdfBase64.value = converted.pdfBase64;
+    } else {
+      const contents = await readFile(file.path);
+      if (token !== stampLoadToken || !stampOpen.value) return;
+      stampPdfPath.value = file.path;
+      stampPdfBytes.value = contents.byteLength;
+      stampPdfBase64.value = base64FromBytes(contents);
+    }
     // Разметка прошлого открытия не переносится: области всегда рисуются заново.
-    forgetStampRects(file.path, contents.byteLength);
+    forgetStampRects(file.path, stampPdfBytes.value);
     stampRects.value = [];
   } catch (error) {
+    if (token !== stampLoadToken) return;
     stampMessage.value = String(error);
   } finally {
-    stampLoading.value = false;
+    if (token === stampLoadToken) {
+      stampLoading.value = false;
+      stampConverting.value = false;
+    }
   }
+}
+
+/** Закрытие редактора отменяет незавершённое чтение или конвертацию. */
+function closeStampEditor() {
+  stampLoadToken += 1;
+  stampOpen.value = false;
+  stampLoading.value = false;
+  stampConverting.value = false;
+  stampPdfBase64.value = '';
+  stampPdfPath.value = '';
+  stampDocumentPath.value = '';
+  stampRects.value = [];
+  stampPageRotations.value = {};
 }
 
 /** Signing order: certificates in display order, each with its own rectangle. */
@@ -550,11 +605,12 @@ function stampOrder(): { certificateId: string; rect: StampRect }[] {
 
 async function signStampDocument() {
   const source = stampDocument.value;
-  if (!source || !stampReady.value || signingInProgress.value) return;
+  const inputPdf = stampPdfPath.value;
+  if (!source || !inputPdf || !stampReady.value || signingInProgress.value) return;
   const separator = Math.max(source.path.lastIndexOf('/'), source.path.lastIndexOf('\\'));
   const folder = outputDir.value || source.path.slice(0, separator);
   const slash = source.path.includes('\\') ? '\\' : '/';
-  const baseName = source.name.replace(/\.pdf$/i, '');
+  const baseName = source.name.replace(/\.(pdf|docx?)$/i, '');
   const order = stampOrder();
   // Абсолютные углы страниц передаются на каждом шаге: ревизия получает /Rotate,
   // а повторная подпись не накапливает поворот.
@@ -573,7 +629,7 @@ async function signStampDocument() {
       console.warn('Не удалось удалить промежуточный PDF', error);
     }
   }
-  let currentInput = source.path;
+  let currentInput = inputPdf;
   let output = '';
   try {
     for (const [index, item] of order.entries()) {
@@ -602,7 +658,7 @@ async function signStampDocument() {
       output = result.outputPath;
       if (!isLast) tempFiles.add(result.outputPath);
       // Вход этого шага больше не нужен: удаляем промежуточный файл сразу после успеха.
-      if (currentInput !== source.path) await discardTemp(currentInput);
+      if (currentInput !== inputPdf) await discardTemp(currentInput);
       currentInput = result.outputPath;
     }
     signReportItems.value = [{ inputPath: source.path, outputPath: currentInput, success: true, error: null }];
@@ -612,23 +668,32 @@ async function signStampDocument() {
   } finally {
     // Остатки удаляются и после ошибки на любом шаге.
     for (const path of [...tempFiles]) await discardTemp(path);
-    stampOpen.value = false;
+    closeStampEditor();
     signReportOpen.value = true;
     signingInProgress.value = false;
   }
 }
 
-/** Режим «Штамп на PDF»: подписывается один выбранный PDF, область отмечается в предпросмотре. */
+/** Режим «Штамп на PDF»: подписывается один выбранный PDF, DOC или DOCX, область отмечается в предпросмотре. */
 const stampMode = computed(() => signatureType.value === 'stamp');
-const stampDocuments = computed(() => documents.value.filter((document) => document.selected && /\.pdf$/i.test(document.name)));
+const stampCandidates = computed(() => documents.value.filter(
+  (document) => document.selected && /\.(pdf|docx?)$/i.test(document.name),
+));
+
+/** DOC/DOCX перед штампом преобразуются в PDF. */
+function isStampConvertible(name: string) {
+  return /\.docx?$/i.test(name);
+}
 
 async function startStampSigning() {
   if (!stampMode.value || !selectedCertificates.value.length || signingInProgress.value) return;
-  const candidates = stampDocuments.value;
+  const candidates = stampCandidates.value;
   if (!candidates.length) { signingMessage.value = t('signPage.stampOnlyPdf'); return; }
   if (candidates.length > 1) { signingMessage.value = t('signPage.stampSingleDoc'); return; }
+  const candidate = candidates[0];
+  if (!(await askConversionConfirmation(candidate.name))) return;
   if (!(await askMultiCertificateConfirmation('signing', selectedCertificates.value.map((certificate) => certificate.id)))) return;
-  await openStampEditor(candidates[0]);
+  await openStampEditor(candidate);
 }
 
 async function signSelectedDocument() {
@@ -832,7 +897,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
         </section>
         <p v-if="signingMessage" class="form-message" role="alert">{{ signingMessage }}</p>
         <footer class="action-bar">
-          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampDocuments.length!==1?t('signPage.stampSingleDoc'):!stampMode&&standard==='cades-t'&&!appSettings.tspServer.trim()?t('signPage.tspRequired'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
+          <button class="sign-button" :disabled="!canSign" :title="!status.available?t('unavailable'):stampMode&&stampCandidates.length===0?t('signPage.stampOnlyPdf'):stampMode&&stampCandidates.length>1?t('signPage.stampSingleDoc'):!stampMode&&standard==='cades-t'&&!appSettings.tspServer.trim()?t('signPage.tspRequired'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&!status.cadesAvailable?t('signPage.cadesSdkTitle'):selectedCount===0?t('signPage.chooseDocs'):!selectedCertificates.length?t('signPage.chooseCerts'):(standard==='cades-bes'||standard==='cades-t')&&!stampMode&&selectedCertificates.length>1?t('signPage.cadesSingleCert'):''" @click="signSelectedDocument">{{ signingInProgress ? t('signPage.signingInProgress') : stampMode ? t('signPage.placeStamps') : t('sign') }}</button>
         </footer>
       </section>
 
@@ -929,7 +994,7 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
 
       <section v-else-if="page==='about'" class="content-view">
         <div class="page-heading"><div><h1>{{ t('nav.about') }}</h1><p>{{ t('about.intro') }}</p></div></div>
-        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.7.11</span><p><span>© {{ t('about.author') }}</span></p></div></section>
+        <section class="about-hero"><div><h2>{{ t('brandName') }}</h2><p>{{ t('about.description') }}</p><span>{{ t('about.version') }} 0.8.11</span><p><span>© {{ t('about.author') }}</span></p></div></section>
         <div class="about-grid">
           <section class="card"><div class="card-heading"><h2>{{ t('about.provider') }}</h2></div><dl class="about-details"><div><dt>{{ t('cspFound') }}</dt><dd>{{ status.available ? (status.version || `${t('about.providerType')} ${status.providerType ?? '—'}`) : t('about.providerMissing') }}</dd></div><div><dt>{{ t('about.cades') }}</dt><dd>{{ status.cadesAvailable ? t('about.available') : t('about.missing') }}</dd></div><div><dt>{{ t('about.cspLicense') }}</dt><dd>{{ status.licenseSupported ? (status.licenseAvailable ? t('about.licenseValid') : t('about.licenseMissing')) : t('about.licenseNotChecked') }}</dd></div><div><dt>{{ t('about.tokens') }}</dt><dd>{{ tokenCount }}</dd></div></dl></section>
           <section class="card"><div class="card-heading"><h2>{{ t('about.technologies') }}</h2></div><ul class="technology-list"><li>Rust · Tauri 2</li><li>Vue 3 · TypeScript</li><li>Tailwind CSS · Vue I18n</li><li>{{ t('about.crypto') }}</li></ul></section>
@@ -947,11 +1012,23 @@ function stripEncryptedExtension(name: string, folder: string, slash: string): s
       </div>
     </Teleport>
 
-    <div v-if="stampOpen" class="modal-backdrop" @click.self="stampOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampOpen=false"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" v-model:rotations="stampPageRotations" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="stampOpen=false">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
+    <div v-if="stampOpen" class="modal-backdrop" @click.self="closeStampEditor()"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-title"><header class="certificate-header"><div><h2 id="stamp-title">{{ t('stampEditor.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="closeStampEditor()"><AppIcon name="x" :size="20" /></button></header><div v-if="stampLoading" class="certificate-empty">{{ stampConverting ? t('stampEditor.converting') : t('stampEditor.loading') }}</div><div v-else-if="stampMessage" class="certificate-empty error">{{ stampMessage }}</div><StampEditor v-else v-model:rects="stampRects" v-model:rotations="stampPageRotations" :pdf-base64="stampPdfBase64" :signer-ids="selectedCertificates.map((certificate) => certificate.id)" :signer-labels="stampSignerLabels"/><footer class="certificate-footer"><span :class="{ 'stamp-warning': !stampReady }">{{ stampReady ? t('stampEditor.ready') : t('stampEditor.notReady') }}</span><div><button class="outline-button" @click="closeStampEditor()">{{ t('certPicker.cancel') }}</button><button class="sign-button" :disabled="!stampReady || signingInProgress" @click="signStampDocument">{{ signingInProgress ? t('signPage.signingInProgress') : t('signPage.stampSign') }}</button></div></footer></section></div>
 
     <div v-if="stampViewerOpen" class="modal-backdrop" @click.self="stampViewerOpen=false"><section class="stamp-modal" role="dialog" aria-modal="true" aria-labelledby="stamp-viewer-title"><header class="certificate-header"><div><h2 id="stamp-viewer-title">{{ t('stampViewer.title') }}</h2></div><button class="modal-close" :aria-label="t('a11y.close')" @click="stampViewerOpen=false"><AppIcon name="x" :size="20" /></button></header><StampViewer :pdf-base64="stampViewerPdf" :signatures="stampViewerSignatures"/><footer class="certificate-footer stamp-viewer-footer"><span class="stamp-viewer-signers">{{ t('stampViewer.signers', { count: stampViewerSigners }) }}</span><span class="stamp-viewer-valid" :class="{ 'stamp-warning': stampViewerValid !== stampViewerSignatures.length }">{{ t('stampViewer.valid', { valid: stampViewerValid, total: stampViewerSignatures.length }) }}</span><button class="sign-button" @click="stampViewerOpen=false">{{ t('stampViewer.close') }}</button></footer></section></div>
 
     <div v-if="multiCertConfirmMode" class="modal-backdrop"><section class="alert-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><div class="alert-icon"><AppIcon name="info" :size="20" /></div><h2 id="confirm-title">{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryptionTitle') : t('multiCertConfirm.signingTitle') }}</h2><p>{{ multiCertConfirmMode==='encryption' ? t('multiCertConfirm.encryption') : t('multiCertConfirm.signing') }}</p><ul class="confirm-cert-list"><li v-for="name in multiCertConfirmNames" :key="name">{{ name }}</li></ul><div class="confirm-actions"><button class="outline-button" @click="settleMultiCertConfirm(false)">{{ t('multiCertConfirm.no') }}</button><button class="sign-button" @click="settleMultiCertConfirm(true)">{{ t('multiCertConfirm.yes') }}</button></div></section></div>
+
+    <div v-if="conversionConfirmOpen" class="modal-backdrop">
+      <section class="alert-modal confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="convert-title">
+        <div class="alert-icon"><AppIcon name="info" :size="20" /></div>
+        <h2 id="convert-title">{{ t('stampConvert.title') }}</h2>
+        <p>{{ t('stampConvert.message', { name: conversionConfirmName }) }}</p>
+        <div class="confirm-actions">
+          <button class="outline-button" @click="settleConversionConfirm(false)">{{ t('stampConvert.no') }}</button>
+          <button class="sign-button" @click="settleConversionConfirm(true)">{{ t('stampConvert.yes') }}</button>
+        </div>
+      </section>
+    </div>
 
     <div v-if="showDistroWarning" class="modal-backdrop"><section class="alert-modal" role="alertdialog" aria-modal="true" aria-labelledby="distro-title"><div class="alert-icon"><AppIcon name="alert" :size="20" /></div><h2 id="distro-title">{{ t('distroWarning.title') }}</h2><p>{{ t('distroWarning.body') }}</p><div class="alert-detail">{{ environment.distroName }}{{ environment.distroVersion && !environment.distroName.includes(environment.distroVersion) ? ' ' + environment.distroVersion : '' }}</div><button class="sign-button" @click="showDistroWarning=false">{{ t('dismiss') }}</button></section></div>
 

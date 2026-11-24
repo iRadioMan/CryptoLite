@@ -62,6 +62,15 @@ pub struct SignResult {
     pub bytes_written: usize,
 }
 
+/// Результат преобразования DOC/DOCX в PDF: путь, содержимое в Base64 и размер.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvertedPdf {
+    pub pdf_path: String,
+    pub pdf_base64: String,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignBatchItemResult {

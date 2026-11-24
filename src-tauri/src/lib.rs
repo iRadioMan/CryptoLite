@@ -46,6 +46,7 @@ pub fn run() {
             commands::sign_file,
             commands::sign_files,
             commands::sign_pdf,
+            commands::convert_document_to_pdf,
             commands::sign_pdf_prepare,
             commands::sign_pdf_finish,
             commands::remove_temp_pdf,
