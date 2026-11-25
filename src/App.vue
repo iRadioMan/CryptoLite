@@ -610,7 +610,7 @@ async function signStampDocument() {
   const separator = Math.max(source.path.lastIndexOf('/'), source.path.lastIndexOf('\\'));
   const folder = outputDir.value || source.path.slice(0, separator);
   const slash = source.path.includes('\\') ? '\\' : '/';
-  const baseName = source.name.replace(/\.(pdf|docx?)$/i, '');
+  const baseName = source.name.replace(/\.(pdf|docx?|odt)$/i, '');
   const order = stampOrder();
   // Абсолютные углы страниц передаются на каждом шаге: ревизия получает /Rotate,
   // а повторная подпись не накапливает поворот.
@@ -674,15 +674,15 @@ async function signStampDocument() {
   }
 }
 
-/** Режим «Штамп на PDF»: подписывается один выбранный PDF, DOC или DOCX, область отмечается в предпросмотре. */
+/** Режим «Штамп на PDF»: подписывается один выбранный PDF, DOC, DOCX или ODT, область отмечается в предпросмотре. */
 const stampMode = computed(() => signatureType.value === 'stamp');
 const stampCandidates = computed(() => documents.value.filter(
-  (document) => document.selected && /\.(pdf|docx?)$/i.test(document.name),
+  (document) => document.selected && /\.(pdf|docx?|odt)$/i.test(document.name),
 ));
 
-/** DOC/DOCX перед штампом преобразуются в PDF. */
+/** DOC/DOCX/ODT перед штампом преобразуются в PDF. */
 function isStampConvertible(name: string) {
-  return /\.docx?$/i.test(name);
+  return /\.(docx?|odt)$/i.test(name);
 }
 
 async function startStampSigning() {

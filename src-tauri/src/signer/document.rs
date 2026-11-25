@@ -1,5 +1,5 @@
 #![deny(unsafe_code)]
-//! Преобразование DOC/DOCX в PDF: Microsoft Word через COM на Windows, LibreOffice на Linux.
+//! Преобразование DOC/DOCX/ODT в PDF: Microsoft Word через COM на Windows, LibreOffice на Linux.
 //!
 //! Исходный документ не изменяется: PDF создаётся рядом с ним через
 //! [`crate::signer::output::write_unique`] и не перезаписывает занятое имя.
@@ -60,16 +60,16 @@ pub(crate) fn truncated(text: &str) -> String {
     text.trim().chars().take(2000).collect()
 }
 
-/// Преобразует DOC/DOCX в PDF и возвращает путь к нему вместе с содержимым в Base64.
+/// Преобразует DOC/DOCX/ODT в PDF и возвращает путь к нему вместе с содержимым в Base64.
 pub fn convert_to_pdf(input: &Path) -> Result<ConvertedPdf, String> {
     let extension = input
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if extension != "doc" && extension != "docx" {
+    if !matches!(extension.as_str(), "doc" | "docx" | "odt") {
         return Err(tr!(
-            "Преобразование в PDF поддерживается только для файлов DOC и DOCX",
-            "Only DOC and DOCX files can be converted to PDF"
+            "Преобразование в PDF поддерживается только для файлов DOC, DOCX и ODT",
+            "Only DOC, DOCX and ODT files can be converted to PDF"
         ));
     }
     if !input.is_file() {
@@ -88,8 +88,8 @@ pub fn convert_to_pdf(input: &Path) -> Result<ConvertedPdf, String> {
     {
         let _ = &temp;
         return Err(tr!(
-            "Преобразование DOC/DOCX в PDF поддерживается только на Windows и Linux",
-            "DOC/DOCX to PDF conversion is supported only on Windows and Linux"
+            "Преобразование DOC/DOCX/ODT в PDF поддерживается только на Windows и Linux",
+            "DOC/DOCX/ODT to PDF conversion is supported only on Windows and Linux"
         ));
     }
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -102,8 +102,8 @@ pub fn convert_to_pdf(input: &Path) -> Result<ConvertedPdf, String> {
         })?;
         if bytes.is_empty() {
             return Err(tr!(
-                "Word-документ преобразован в пустой PDF",
-                "The Word document produced an empty PDF"
+                "Документ преобразован в пустой PDF",
+                "The document produced an empty PDF"
             ));
         }
         let directory = input

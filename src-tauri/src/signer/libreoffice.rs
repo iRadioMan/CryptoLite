@@ -1,5 +1,5 @@
 #![deny(unsafe_code)]
-//! Преобразование DOC/DOCX в PDF через LibreOffice в headless-режиме.
+//! Преобразование DOC/DOCX/ODT в PDF через LibreOffice в headless-режиме.
 
 use crate::signer::document::truncated;
 use crate::tr;
